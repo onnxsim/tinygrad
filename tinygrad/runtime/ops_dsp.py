@@ -130,9 +130,35 @@ class DSPAllocator(Allocator['DSPDevice']):
   def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
   def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset)
 
+def _find_libgcc() -> str:
+  # Every kernel this backend has ever compiled before HEXSIM/float32 support (uint8/int8/int32
+  # GEMM/conv/elementwise) never needed a real scalar float divide, so this was never hit: DSPCompiler's
+  # `-nostdlib -ffreestanding` build has no libc or compiler-rt at all. Scalar Hexagon float division
+  # (`float / float`, and transitively anything sigmoid/softmax-shaped that needs it) is NOT always a
+  # native instruction sequence -- it depends on the clang/LLVM version: clang>=19 inlines a native
+  # Newton-Raphson sequence (sfrecipa/sffixupn/sffixupd/sfmpy:lib), but clang 15/17 emit a call to
+  # `__hexagon_divsf3` instead, which then fails to link (`undefined symbol`) with nothing providing it.
+  # Hexagon's own toolchain ships these soft-float routines in libgcc.a (a plain static archive -- only
+  # symbols actually referenced get pulled in, so this is a costless no-op for every kernel that doesn't
+  # need it, uint8/int8/int32 or otherwise). Best-effort: silently skip if the SDK isn't discoverable,
+  # so environments without HEXAGON_TOOLCHAIN/HEXAGON_SDK_ROOT set see no behavior change.
+  root = getenv("HEXAGON_TOOLCHAIN", "") or getenv("HEXAGON_SDK_ROOT", "")
+  if not root: return ""
+  libdir = pathlib.Path(root) / "target" / "hexagon" / "lib"
+  if not libdir.is_dir(): return ""
+  # No v65-specific archive is shipped in some SDK snapshots (oldest available may be v68+); the
+  # Hexagon scalar ISA these soft-float routines target has been stable across v65-v81, so the
+  # lowest available version is used as a compatible fallback. Not verified on real v65 hardware here
+  # (only under MOCKDSP=1/qemu) -- flagged in the README as a caveat for whoever verifies this next.
+  for arch in ["v65", "v66", "v67", "v68", "v69", "v71", "v73", "v75", "v77", "v79", "v81"]:
+    candidate = libdir / arch / "libgcc.a"
+    if candidate.exists(): return str(candidate)
+  return ""
+
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
     self.mock, compiler_args = mock, "--target=hexagon -mcpu=hexagonv65 -fuse-ld=lld -nostdlib -mhvx=v65 -mhvx-length=128b"
+    self.libgcc = _find_libgcc()
     if mock: self.args = f"-static {compiler_args}"
     else:
       # Generate link script to pass into clang. Aligning all used sections to 4k fixes invoke problem.
@@ -154,7 +180,7 @@ class DSPCompiler(Compiler):
     # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
     with tempfile.NamedTemporaryFile(delete=True) as f:
       system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -fno-stack-protector -x c -fPIC " +
-             f"-ffreestanding -nostdlib - -o {f.name}", input=src.encode())
+             f"-ffreestanding -nostdlib - -o {f.name}" + (f" -x none {self.libgcc}" if self.libgcc else ""), input=src.encode())
       return pathlib.Path(f.name).read_bytes()
 
   def disassemble(self, lib:bytes): return cpu_objdump(lib, "llvm-objdump")
