@@ -1,7 +1,7 @@
 from __future__ import annotations
-import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct
+import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
 assert sys.platform != 'win32'
-from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF
+from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
@@ -112,7 +112,7 @@ class DSPBuffer:
 
 class DSPAllocator(Allocator['DSPDevice']):
   def _alloc(self, size:int, options:BufferSpec):
-    if getenv("MOCKDSP"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
+    if getenv("MOCKDSP") or getenv("HEXSIM"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
     else:
       b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
       fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
@@ -162,7 +162,8 @@ class DSPCompiler(Compiler):
 
 class DSPDevice(Compiled):
   def __init__(self, device:str=""):
-    if getenv("MOCKDSP"): super().__init__(device, DSPAllocator(self), [MockDSPRenderer], MockDSPProgram)
+    if getenv("HEXSIM"): super().__init__(device, DSPAllocator(self), [HexagonSimRenderer], HexagonSimProgram)
+    elif getenv("MOCKDSP"): super().__init__(device, DSPAllocator(self), [MockDSPRenderer], MockDSPProgram)
     else:
       self.ion_fd = os.open('/dev/ion', os.O_RDONLY)
       super().__init__(device, DSPAllocator(self), [DSPRenderer], DSPProgram)
@@ -325,3 +326,144 @@ class MockDSPProgram(Program[DSPDevice]):
       offset += x.size
     assert offset == len(proc.stdout)
     return struct.unpack("I", proc.stdout[0:4])[0] / 1e9  # pretend it's 1 Ghz, but this is an inscount, not a time
+
+# ***** hexagon-sim DSP (BEAM-search timing via Qualcomm's own instruction-set simulator) *****
+#
+# MOCKDSP's qemu-hexagon-static path times candidates via QEMU's inscount() pseudo-register --
+# a raw instruction count, not remotely cycle-accurate, and blind to Hexagon-specific pipeline,
+# vector-unit, or memory-hierarchy effects (see scripts/android/tinygrad_hexagon_bridge/README.md
+# in the onnx-simplifier repo's "Removing TVM as a transport dependency"/qemu-vs-hexagon-sim note
+# for the motivating case: real-hardware speed for a fixed kernel *shape* flipped between faster
+# and slower than a baseline purely from cache/channel-count effects instruction count can't see).
+#
+# hexagon-sim is Qualcomm's own instruction-set simulator (ships in the Hexagon SDK's
+# HEXAGON_Tools/*/Tools/bin/hexagon-sim) with a PMU-derived total-cycle count ("Pcycles=", printed
+# once at process exit). Its default mode is a fast functional-only estimate not meaningfully
+# better than instruction counting, but its `--timing` mode (used below) is a real
+# pipeline/dual-issue/cache-hierarchy model: confirmed empirically (see the README section this
+# lands with) to report an ~28x cycle difference between two kernels with the IDENTICAL
+# instruction count, differing only in whether their memory access pattern stays cache-resident
+# or not -- exactly the class of effect raw instruction counting is structurally blind to.
+#
+# Reading a cycle-counter register live from inside a standalone-sim binary doesn't work (the
+# PCYCLE control register pair reads back 0 in this mode -- confirmed empirically in this
+# project's separate hexagon_sim_harness.py work), so cycles are measured the same way that
+# harness does: compile the SAME kernel wrapper twice, once calling the kernel body once and once
+# calling it twice (REPEAT=1 vs REPEAT=2), run both under hexagon-sim, and take the *difference*
+# in each run's total Pcycles. The simulator is deterministic, so this exactly isolates the cost
+# of one kernel invocation and cancels the fixed process-startup/tear-down overhead.
+#
+# Kernel *inputs* are zero-initialized static buffers, not real data copied from the caller's
+# DSPBuffers: cycle count for a fixed-control-flow kernel (no data-dependent branches -- true of
+# every kernel this project generates, conv/gemm with static loop bounds) doesn't depend on the
+# data values, only on the shapes/loop-bounds already baked into the generated source. This lets
+# HexagonSimCompiler.compile() do the (expensive, ~1s) real hexagon-clang + hexagon-sim round trip
+# once per distinct kernel source and cache it via the normal Compiler.compile_cached() path,
+# instead of re-running the simulator on every __call__.
+
+HEXSIM_ARCH = getenv("HEXSIM_ARCH", "v73")  # matches this project's real device (Snapdragon/Hexagon v73), not DSPCompiler's v65 baseline
+HEXSIM_CLOCK_HZ = 1_000_000_000  # placeholder nominal clock (Hexagon v73 cDSP is close to 1 GHz) -- only the *relative* ranking of
+                                  # returned times matters for BEAM; this scales Pcycles into a plausible-looking float, nothing more.
+
+class HexagonSimRenderer(DSPRenderer):
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, HexagonSimCompiler(), tc.hexagon_v65
+  def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
+  def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
+    # Plain hosted main() (hexagon-sim's standalone-OS mode has real libc) -- no raw trap0 dance
+    # needed, unlike MockDSPRenderer's qemu-bare-metal entry. Buffers are static, zero-filled,
+    # 128B-aligned (HVX vector width) arrays sized from the UOp shapes the renderer already knows
+    # at render time; see the module docstring above for why real data isn't needed here.
+    # `write()`-ing one byte of each output buffer at the end forces the compiler to treat the
+    # whole kernel body as having an externally-observable side effect -- without this, -O1 sees
+    # no consumer of the static buffers this synthetic main() writes and dead-code-eliminates the
+    # entire kernel call (confirmed empirically: timings came back as exactly 0 without it).
+    msrc = ['#include <unistd.h>', '#ifndef REPEAT\n#define REPEAT 1\n#endif', 'int main(void) {']
+    global_idxs = []
+    for i,b in enumerate(bufs):
+      if b[1][0].addrspace == AddrSpace.GLOBAL:
+        sz = max(b[1][0].max_numel()*b[1][0].dtype.itemsize, 1)
+        msrc.append(f"static unsigned char buf{i}[{sz}] __attribute__((aligned(128)));")
+        global_idxs.append(i)
+      else:
+        msrc.append(f"{self._render_dtype(b[1][0].dtype)} val{i} = 0;")
+    params = [(f'(void*)buf{i}' if b[1][0].addrspace == AddrSpace.GLOBAL else f'val{i}') for i,b in enumerate(bufs)]
+    msrc.append(f"for (int r = 0; r < REPEAT; r++) {{ {function_name}({', '.join(params)}); }}")
+    for i in global_idxs: msrc.append(f"write(1, buf{i}, 1);")
+    msrc.append('return 0; }')
+    return '\n'.join(msrc)
+
+def _hexsim_tools_dir() -> pathlib.Path:
+  root = getenv("HEXAGON_TOOLS", "") or getenv("HEXAGON_TOOLCHAIN", "")
+  if not root: raise RuntimeError("HEXSIM=1 needs HEXAGON_TOOLS (or HEXAGON_TOOLCHAIN) set to a Hexagon SDK Tools/ dir with hexagon-sim")
+  path = pathlib.Path(root)
+  if not (path/"bin"/"hexagon-clang").exists() or not (path/"bin"/"hexagon-sim").exists():
+    raise RuntimeError(f"{path} does not look like a Hexagon Tools dir (missing bin/hexagon-clang or bin/hexagon-sim)")
+  return path
+
+def _hexsim_env(tools:pathlib.Path, workdir:pathlib.Path) -> dict[str,str]:
+  # hexagon-sim links libncurses.so.5, which modern distros only ship as .so.6 (same ABI for
+  # this use) -- symlink a shim dir onto LD_LIBRARY_PATH, matching hexagon_sim_harness.py's fix.
+  env = dict(os.environ)
+  sim = tools/"bin"/"hexagon-sim"
+  probe = subprocess.run(["ldd", str(sim)], capture_output=True, text=True, check=False)
+  if "not found" not in probe.stdout: return env
+  shim = workdir/"shim"
+  shim.mkdir(exist_ok=True)
+  for name in ("ncurses", "tinfo"):
+    link = shim/f"lib{name}.so.5"
+    if link.exists(): continue
+    for lib_dir in ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "/usr/lib64"):
+      source = pathlib.Path(lib_dir)/f"lib{name}.so.6"
+      if source.exists():
+        with contextlib.suppress(FileExistsError): link.symlink_to(source)  # benign race under parallel BEAM workers
+        break
+  env["LD_LIBRARY_PATH"] = f"{shim}:{env.get('LD_LIBRARY_PATH', '')}"
+  return env
+
+class HexagonSimCompiler(Compiler):
+  def __init__(self): super().__init__("compile_hexsim")
+
+  def _compile_one(self, tools:pathlib.Path, src:str, repeat:int) -> bytes:
+    with tempfile.TemporaryDirectory() as d:
+      workdir = pathlib.Path(d)
+      (workdir/"k.c").write_text(src)
+      elf = workdir/"k.elf"
+      cmd = [str(tools/"bin"/"hexagon-clang"), f"-m{HEXSIM_ARCH}", "-mhvx", "-mhvx-length=128B", "-O1",
+             f"-DREPEAT={repeat}", str(workdir/"k.c"), "-o", str(elf), "-lm"]
+      result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+      if result.returncode: raise CompileError(f"hexagon-clang failed:\n{result.stderr}")
+      return elf.read_bytes()
+
+  def compile(self, src:str) -> bytes:
+    tools = _hexsim_tools_dir()
+    elf1, elf2 = self._compile_one(tools, src, 1), self._compile_one(tools, src, 2)
+    return struct.pack("<Q", len(elf1)) + elf1 + elf2
+
+class HexagonSimProgram(Program[DSPDevice]):
+  def __init__(self, dev:DSPDevice, obj:TinyELF):
+    n = struct.unpack("<Q", obj.lib[:8])[0]
+    self.elf1, self.elf2 = obj.lib[8:8+n], obj.lib[8+n:]
+
+  def _run_pcycles(self, tools:pathlib.Path, elf_bytes:bytes) -> int:
+    with tempfile.NamedTemporaryFile(suffix=".elf") as f:
+      f.write(elf_bytes)
+      f.flush()
+      os.chmod(f.name, 0o755)
+      env = _hexsim_env(tools, pathlib.Path(f.name).parent)
+      # --timing enables hexagon-sim's cycle-accurate pipeline/dual-issue/cache-hierarchy model
+      # (confirmed to change the reported Pcycles vs. the default fast functional-only mode --
+      # see the README section this lands with); the default mode's Pcycles is a coarser,
+      # instruction-scheduling-blind estimate much closer to plain instruction counting.
+      result = subprocess.run(
+        [str(tools/"bin"/"hexagon-sim"), f"-m{HEXSIM_ARCH}", "--timing", "--simulated_returnval", f.name],
+        capture_output=True, text=True, env=env, timeout=900, check=False)
+      output = result.stdout + result.stderr
+      if result.returncode != 0: raise RuntimeError(f"hexagon-sim exit {result.returncode}:\n{output}")
+      m = re.search(r"Pcycles=(\d+)", output)
+      if m is None: raise RuntimeError(f"hexagon-sim output has no Pcycles= line:\n{output}")
+      return int(m.group(1))
+
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    tools = _hexsim_tools_dir()
+    base, twice = self._run_pcycles(tools, self.elf1), self._run_pcycles(tools, self.elf2)
+    return max(twice - base, 0) / HEXSIM_CLOCK_HZ
