@@ -5,7 +5,8 @@ from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, 
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
-from tinygrad.renderer.cstyle import ClangRenderer
+from tinygrad.renderer.cstyle import ClangRenderer, wmma_args
+from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
 if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-import
 
@@ -24,7 +25,33 @@ class DSPRenderer(ClangRenderer):
   type_map = { **ClangRenderer.type_map, dtypes.uint64: "unsigned long long", dtypes.int64: "long long" }
   code_for_op = {k:v for k,v in ClangRenderer.code_for_op.items() if k != Ops.SQRT}
 
-  def __init__(self, target:Target): self.target, self.compiler = target, DSPCompiler()
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), tc.hexagon_v65
+
+  # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32
+  # groups of 4)) in one instruction -- no warp/lane cooperation needed (tensor_cores' threads=1), unlike
+  # every other backend's WMMA. The accumulator-add form always needs a real HVX_Vector C; a plain (not
+  # "_acc") vrmpy variant only exists for the from-zero case, so we always pass C through.
+  #
+  # KNOWN PERFORMANCE ISSUE: correct but currently slower than plain scalar code on real hardware,
+  # because devectorizer2's do_stack_wmma (codegen/__init__.py) unconditionally decomposes every WMMA's
+  # accumulator into per-element scalar loads/stores before rendering -- the right behavior for every
+  # other backend (each GPU thread only ever holds a few scalar elements of a warp-distributed
+  # fragment), but wrong here: Hexagon's "32 elements" is one HVX vector register that a single thread
+  # (threads=1, no warp) processes atomically, and it should stay vector-resident across the reduction
+  # loop instead of being rebuilt from 32 scalar reads on every accumulate call. A real fix needs the
+  # generic devectorizer (or the accumulator's axis-ordering/layout in postrange.py's _apply_tc_opt) to
+  # recognize single-thread/vector-native tensor cores as a distinct case -- out of scope here.
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    prefix = list(prefix or [])
+    for name, _, dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
+      dstr_a, dstr_b, dstr_c = (self._render_dtype(dt, sz, AddrSpace.REG) for dt, sz in
+                                 zip([dtype_in, dtype_in, dtype_out], upcast_sizes))
+      builtin = "__builtin_HEXAGON_V6_vrmpyub_acc_128B" if dtype_in == dtypes.uint8 else "__builtin_HEXAGON_V6_vrmpybusv_acc_128B"
+      prefix.append(f"""static inline {dstr_c} __{name}({dstr_a} a, {dstr_b} b, {dstr_c} c) {{
+  unsigned int a_scalar; __builtin_memcpy(&a_scalar, &a, 4);
+  return {builtin}(c, b, a_scalar);
+}}""")
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   def _render_defines(self, uops) -> list[str]:
     return ['''/* DSP boilerplate */ struct dcvs_v2_req { int type; int _pad; _Bool dcvs_enable; char dcvs_option; _Bool set_latency; int latency;
@@ -259,7 +286,7 @@ static void *mmap2(void *addr, unsigned int length, int prot, int flags, int fd,
 return (void*)syscall((long)addr, length, prot, flags, fd, offset, 222); }}'''
 
 class MockDSPRenderer(DSPRenderer):
-  def __init__(self, target:Target): self.target, self.compiler = target, DSPCompiler(mock=True)
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), tc.hexagon_v65
   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     # https://gpages.juszkiewicz.com.pl/syscalls-table/syscalls.html

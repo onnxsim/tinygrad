@@ -36,7 +36,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if szs:
           # set it to the replaced range
           rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
-      if (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
+      # attempt to local N -- only for backends that support locals (e.g. Hexagon's vrmpy tensor core is a
+      # single-instruction, single-thread op with no warp/lane cooperation, so it has no LOCAL axis to use)
+      if tk.ren is not None and tk.ren.has_local and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]):
         tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
       return tk
 

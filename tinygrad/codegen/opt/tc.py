@@ -180,3 +180,18 @@ metal = [TensorCore(dims=(8,8,8), threads=32, elements_per_thread=(2,2,2), dtype
            (('l0', 'r0', 'r1', 'l3', 'r2'), ('u0',), ('l1', 'l2', 'l4'))))
   for di,do in [(dtypes.float,dtypes.float),(dtypes.half,dtypes.float),
                 (dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
+
+# ***** Qualcomm Hexagon HVX *****
+
+# https://developer.qualcomm.com/downloads/hexagon-v66-programmer-s-reference-manual (V6_vrmpyub / V6_vrmpybusv)
+# D (int32x32) = C (int32x32) + dot4(A (uint8x4, broadcast scalar), B (uint8x128, 32 groups of 4))
+# One HVX vector instruction, single-threaded (no warp/lane cooperation -- unlike every other backend's
+# TensorCore, which all assume warp-level thread cooperation): dims=(N,M,K)=(32,1,4), threads=1 means
+# local_axes=0 (2**0 threads), so all 5 axis-doubling opts needed for N=32=2**5 are upcast ("u0") opts,
+# and M=1 needs none. elements_per_thread=(4,128,32): A is the full K=4 reduction (M contributes nothing
+# since M=1), B is all 5 upcast bits x the K=4 reduction (32*4=128), C is all 5 upcast bits (32).
+hexagon_v65 = [TensorCore(dims=(32,1,4), threads=1, elements_per_thread=(4,128,32), dtype_in=di, dtype_out=dtypes.int32,
+  opts=("u0","u0","u0","u0","u0"),
+  swizzle=(((), ('u0','u1','u2','u3','u4'), ('r0','r1')),
+           ((), ('u0','u1','u2','u3','u4'), ('r0','r1'))))
+  for di in [dtypes.uint8, dtypes.int8]]
