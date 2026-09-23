@@ -3,7 +3,7 @@ import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, s
 assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import Ops, UOp, GroupOp
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args
 from tinygrad.codegen.opt import tc
@@ -13,6 +13,52 @@ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-i
 from tinygrad.uop.ops import PatternMatcher, UPat
 
 HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
+# HVX ISA the DSP code is compiled for. v65 (the default) has no HVX float at all; from v68 on, float vector math is
+# qfloat (qf32), since v68/v69 HVX has no IEEE fp32 -- see HVX_QF_OPS below. The Snapdragon 8+ Gen 1 test phone is v69.
+HVX_ARCH = getenv("HVX_ARCH", "v65")
+HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
+
+# ***** qfloat lowering (v68+) *****
+# Each float32 vector add/sub/mul is one qf32 HVX op followed by an explicit qf32->sf conversion. The empty asm stops
+# LLVM from folding that conversion into the next qfloat op: left alone, it chains qf32 x qf32 without renormalizing,
+# which is hundreds of ulp off (the NMS kernel's finding). Only vectors of whole HVX registers (multiples of 32 lanes);
+# smaller float vectors are left to LLVM. NEG is an exact sign-bit flip.
+HVX_QF_OPS = {Ops.MUL: "vmpy_qf32_sf"}
+
+def _computed(u:UOp) -> bool:
+  # a value LLVM may be holding as qf32 (an ALU result), as opposed to IEEE sf straight from memory or a constant
+  while u.op in (Ops.STACK, Ops.CAST, Ops.BITCAST) and len(u.src) >= 1 and all(s is u.src[0] for s in u.src): u = u.src[0]
+  return u.op in GroupOp.ALU
+
+def _qf_vec(x:UOp) -> bool:
+  return HVX_QFLOAT and x.op in HVX_QF_OPS and x.dtype == dtypes.float32 and x._shape is not None and \
+    (n:=x.max_numel()) >= 32 and n % 32 == 0 and all(_computed(s) for s in x.src)
+
+def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
+  used = sorted({(x.op.name, x.max_numel()) for x in uops if _qf_vec(x)})
+  if not used: return []
+  # everything stays in registers: wider vectors are split into / rebuilt from whole HVX registers with shufflevector
+  # (going through `((__hvx_v*)&a)[i]` instead forces a stack round trip per register -- measured 10x slower)
+  out = ["typedef int __hvx_v __attribute__((vector_size(128)));",
+         "typedef float __hvx_f __attribute__((ext_vector_type(32)));",
+         "static inline __attribute__((unused)) __hvx_f __hvx_sf(__hvx_v q) { __hvx_v r = __builtin_HEXAGON_V6_vconv_sf_qf32_128B(q); "
+         "__asm__(\"\" : \"+v\"(r)); return (__hvx_f)r; }",
+         "static inline __attribute__((unused)) __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }"]
+  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
+  for name, n in used:
+    t, k = vec_type(n), n // 32
+    parts = []
+    for i in range(k):
+      ai = "a" if k == 1 else f"__builtin_shufflevector(a, a, {lanes(32*i, 32)})"
+      bi = "b" if k == 1 else f"__builtin_shufflevector(b, b, {lanes(32*i, 32)})"
+      parts.append(f"__hvx_mulsf({ai}, {bi})")
+    # concatenate registers pairwise back up to n lanes
+    while len(parts) > 1:
+      w = 32 * (k // len(parts))
+      parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
+    args = f"{t} a" if name == "NEG" else f"{t} a, {t} b"
+    out.append(f"static inline {t} __hvx_{name.lower()}_f{n}({args}) {{ return ({t}){parts[0]}; }}")
+  return out
 
 def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   # STACK(v[k], v[k+1], ..., v[k+n-1]) of one vector v -> (v, [k..k+n-1])
@@ -26,6 +72,8 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
 # NOTE: this just increases readability of the generated code
 dsp_string = PatternMatcher([
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
+  (UPat(tuple(HVX_QF_OPS), dtypes.float32, name="x"), lambda ctx,x:
+   f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
   # shufflevector instead of a per-lane constructor
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
@@ -130,6 +178,7 @@ class DSPRenderer(ClangRenderer):
   unsigned int a_scalar; __builtin_memcpy(&a_scalar, &a, 4);
   return {builtin}(c, b, a_scalar);
 }}""")
+    prefix += _qf_helpers(uops, lambda n: self._render_dtype(dtypes.float32, n, AddrSpace.REG))
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   def _render_defines(self, uops) -> list[str]:
@@ -236,7 +285,7 @@ def _find_libgcc() -> str:
 
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
-    self.mock, compiler_args = mock, "--target=hexagon -mcpu=hexagonv65 -fuse-ld=lld -nostdlib -mhvx=v65 -mhvx-length=128b"
+    self.mock, compiler_args = mock, f"--target=hexagon -mcpu=hexagon{HVX_ARCH} -fuse-ld=lld -nostdlib -mhvx={HVX_ARCH} -mhvx-length=128b"
     self.libgcc = _find_libgcc()
     if mock: self.args = f"-static {compiler_args}"
     else:
