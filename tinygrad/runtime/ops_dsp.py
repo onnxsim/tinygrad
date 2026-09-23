@@ -235,6 +235,11 @@ static double __hmx_racc[1024];
 static int __hmx_t;
 static inline __fp16* __hmx_sa(void) { return __hmx_ra[__hmx_t]; }
 static inline __fp16* __hmx_sb(void) { return __hmx_rb[__hmx_t]; }
+#define __HMX_CA 64
+#define __HMX_CB 32
+static __fp16 __hmx_rca[__HMX_CA][1024] __attribute__((aligned(128))), __hmx_rcb[__HMX_CB][1024] __attribute__((aligned(128)));
+static inline __fp16* __hmx_ca(int i) { return __hmx_rca[i]; }
+static inline __fp16* __hmx_cb(int i) { return __hmx_rcb[i]; }
 static inline void __hmx_begin(void) { for (int i = 0; i < 1024; i++) __hmx_racc[i] = 0.0; }
 static inline void __hmx_mac(__fp16* a, __fp16* b) {
   const unsigned short *A = (const unsigned short*)a, *B = (const unsigned short*)b;
@@ -257,6 +262,11 @@ static int __hmx_t;
 /* VTCM (2 KB aligned): A stage x2 @0, B stage x2 @4 KB, out @8 KB, bias table @10 KB */
 static inline __fp16* __hmx_sa(void) { return (__fp16*)(__hmx_vtcm + 2048 * __hmx_t); }
 static inline __fp16* __hmx_sb(void) { return (__fp16*)(__hmx_vtcm + 4096 + 2048 * __hmx_t); }
+/* tile caches: A 64 slots @16 KB, B 32 slots @144 KB (the runtime gives >= 208 KB inside one 256 KB window) */
+#define __HMX_CA 64
+#define __HMX_CB 32
+static inline __fp16* __hmx_ca(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * i); }
+static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 147456 + 2048 * i); }
 static inline void __hmx_begin(void) {
   static unsigned int init = 0;
   if (init != __hmx_gen) {
@@ -274,7 +284,30 @@ static inline __fp16* __hmx_store(void) {
   __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(__hmx_vtcm + 8192), "r"(0) : "memory");
   return (__fp16*)(__hmx_vtcm + 8192);
 }
-#endif"""
+#endif
+/* packed tiles of read-only operands are memoized by their first row pointer (same pointer = same tile within one
+ * kernel call); __hmx_call_start() invalidates at every call */
+static const void* __hmx_tag_a[__HMX_CA];
+static const void* __hmx_tag_b[__HMX_CB];
+/* L2-prefetch the next K block of a 32-row operand (32 rows x 64 bytes at the row stride of r0, r1) */
+static inline void __hmx_prefetch_next(const __fp16* r0, const __fp16* r1) {
+#ifndef HMX_REF
+  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
+  if (stride < 65536u) __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + 32 * stride), (stride << 16) | (64u << 8) | 32u);
+#else
+  (void)r0; (void)r1;
+#endif
+}
+static inline void __hmx_call_start(void) {
+  for (int i = 0; i < __HMX_CA; i++) __hmx_tag_a[i] = 0;
+  for (int i = 0; i < __HMX_CB; i++) __hmx_tag_b[i] = 0;
+}
+/* returns the cached tile for key k, or 0 after claiming its slot (*slot = where to pack) */
+static inline __fp16* __hmx_lookup(const void** tags, int n, __fp16* (*at)(int), const void* k, __fp16** slot) {
+  int i = (int)(((unsigned)k >> 6) % (unsigned)n);
+  if (tags[i] == k) return at(i);
+  tags[i] = k; *slot = at(i); return 0;
+}"""
 
 def _hmx_lane(u:UOp):
   # lane j of a vector value: INDEX(value, CAST(CONST j)) -> (value, j)
@@ -298,6 +331,11 @@ def _hmx_rows(stack:UOp):
   return rows
 
 _ILV = ",".join(f"{j},{j+32}" for j in range(32))
+def _hmx_param(u:UOp):
+  # the PARAM (or register BUFFER) an address expression indexes
+  while u.op in (Ops.SHRINK, Ops.INDEX, Ops.AFTER, Ops.CAST, Ops.BITCAST): u = u.src[0]
+  return u
+
 def _hmx_bail(uops, why:int):
   if getenv("HMX_DEBUG"): print(f"hmx_acc rewrite skipped (check {why})")
   return uops, False
@@ -307,6 +345,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
   users: dict[UOp, list[UOp]] = {}
   for u in uops:
     for x in u.src: users.setdefault(x, []).append(u)
+  written = {_hmx_param(u.src[0]) for u in uops if u.op is Ops.STORE}
+  call_start = False
   drop: set[UOp] = set()
   before: dict[int, list[UOp]] = {}
   after: dict[int, list[UOp]] = {}
@@ -347,12 +387,22 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       pa = "".join(f" __hmx_pack2(_a+{64*q}, {ptr[2*q]}, {ptr[2*q+1]});" for q in range(16))
       pb = "".join(f" __hmx_pack2(_b+{64*q}, {ptr[32+2*q]}, {ptr[33+2*q]});" for q in range(16))
       srcs = tuple(v.src[0] for v in vals)
+      # operands the kernel never writes are memoized in VTCM by their first row pointer (A repeats across the N tiles)
+      ro = [all(_hmx_param(v.src[0]) not in written for v, _ in r) for r in (ra, rb)]
+      if ro[0]: pa = f" __fp16* _c = __hmx_lookup(__hmx_tag_a, __HMX_CA, __hmx_ca, {ptr[0]}, &_s); if (_c) _a = _c; else {{{{ _a = _s;{pa} }}}}"
+      if ro[1]: pb = f" __fp16* _d = __hmx_lookup(__hmx_tag_b, __HMX_CB, __hmx_cb, {ptr[32]}, &_s); if (_d) _b = _d; else {{{{ _b = _s;{pb} }}}}"
+      if any(ro): call_start = True
+      # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs
+      pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
+      pfa = f" __hmx_prefetch_next({ptr[0]}, {ptr[1]});"
+      pa = pfa + pa if not ro[0] else pa.replace("{{ _a = _s;", "{{ _a = _s;" + pfa, 1)
     elif all(v.max_numel() == 32 for v, _ in rows):
       pa = "".join(f" *(__hmx_h64*)(_a+{64*q}) = __builtin_shufflevector({{{2*q}}},{{{2*q+1}}},{_ILV});" for q in range(16))
       pb = "".join(f" *(__hmx_h64*)(_b+{64*q}) = __builtin_shufflevector({{{32+2*q}}},{{{33+2*q}}},{_ILV});" for q in range(16))
       srcs = tuple(v for v, _ in rows)
     else: return _hmx_bail(uops, 10)
-    replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, "{{ __fp16* _a = __hmx_sa(); __fp16* _b = __hmx_sb();"+pa+pb+" __hmx_mac(_a, _b); }}")
+    replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, "{{ __fp16* _a = __hmx_sa(); __fp16* _b = __hmx_sb(); __fp16* _s = 0; (void)_s;"+pa+pb+
+                     " __hmx_mac(_a, _b); }}")
     # after the loop: one store, then each accumulator-array vector = the same lanes of the output tile
     outs = []
     for k, so in enumerate(stores):
@@ -367,6 +417,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     after.setdefault(pos[e], []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores),
       "{{ __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
   if not replace: return _hmx_bail(uops, 9)
+  if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
   out = []
   for i, u in enumerate(uops):
     out += before.get(i, [])
