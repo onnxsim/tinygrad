@@ -4,14 +4,16 @@ from tinygrad.helpers import Target, Context
 from tinygrad.codegen import to_program
 from tinygrad.runtime import ops_dsp
 from tinygrad.runtime.ops_dsp import MockDSPRenderer
+from tinygrad.codegen.opt import tc
 
 class _NoCompile:
   def compile_cached(self, src:str) -> bytes: return b""
   def compile(self, src:str) -> bytes: return b""
 
-def dsp_source(t:Tensor) -> str:
+def dsp_source(t:Tensor, tensor_cores=None) -> str:
   ast = t.schedule_linear().src[-1].src[0]
   ren = MockDSPRenderer(Target(device="DSP"))
+  if tensor_cores is not None: ren.tensor_cores = tensor_cores
   ren.compiler = _NoCompile()  # render only: the point is the source text, and a bad source shouldn't cost a compile
   return to_program(ast, ren).src[2].arg
 
@@ -82,3 +84,27 @@ class TestDSPVrmpyGemv(unittest.TestCase):
     self.assertIn("__attribute__((aligned(128)))", src)
     self.assertIn("*((int32*)((buf0+0)))", src)
     self.assertNotIn("*(buf0+1)", src)
+
+class TestDSPHmx(unittest.TestCase):
+  # the V69 HMX fp16 TensorCore (HMX=1): whole 32x32 tiles, fragments already in the HMX tile layout, one load pair + one
+  # store per tile op; MOCKDSP builds its scalar reference (-DHMX_REF) since qemu can't run HMX
+  def src(self, M, K, N, dtype=dtypes.half):
+    return dsp_source(Tensor.empty(M, K, dtype=dtype).matmul(Tensor.empty(K, N, dtype=dtype), dtype=dtype), tc.hexagon_hmx + tc.hexagon_v65)
+
+  def test_half_matmul_uses_hmx(self):
+    src = self.src(64, 64, 64)
+    self.assertIn("__WMMA_32_32_32_half_half(", src)
+    self.assertIn("activation.hf = mxmem(%0,%1):deep", src)
+    self.assertIn("weight.hf = mxmem(%2,%3)", src)
+    self.assertIn("mxmem(%0,%1):after.hf = acc", src)
+    self.assertIn("#ifdef HMX_REF", src)
+
+  def test_tiles_move_as_vectors(self):
+    # a tile goes to VTCM and back as one 2 KB vector value, not per-element and not through a libc memcpy call
+    src = self.src(64, 64, 64)
+    self.assertIn("*(__fp161024*)(v + 1024) = a;", src)
+    self.assertIn("return *(__fp161024*)(v + 4096);", src)
+    self.assertNotIn("__builtin_memcpy(v", src)
+
+  def test_float_matmul_is_not_hmx(self):
+    self.assertNotIn("mxmem", self.src(64, 64, 64, dtypes.float32))

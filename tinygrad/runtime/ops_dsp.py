@@ -137,7 +137,8 @@ def _dsp_tcs(): return (tc.hexagon_hmx if getenv("HMX") else []) + tc.hexagon_v6
 # layout IDX(i,j) = 64*(i/2)+2*j+i%2 (the TC's swizzles make tinygrad's fragments exactly that order). C is folded into the
 # same accumulation as a second K block against an identity weight tile, so one load pair + one store does the whole op.
 # Preconditions are the runtime's (scripts/android/hmx_gemm/hmx_runtime.h in onnxsim): HMX power vote, VTCM + HMX context,
-# HVX + HMX lock on this thread, and __hmx_vtcm pointing at >= 16 KB of that VTCM inside one 256 KB window, 2 KB aligned.
+# HVX + HMX lock on this thread, __hmx_vtcm pointing at >= 16 KB of that VTCM inside one 256 KB window, 2 KB aligned, and
+# __hmx_gen bumped (nonzero) on every (re)acquire so the tile op re-initializes its identity tile and bias table there.
 # -DHMX_REF builds a scalar reference of the same op on the same layout instead (for qemu, which can't run HMX).
 def _hmx_wmma_helper(name:str, vt:str) -> str:
   return f"""#ifndef HMX_IDX
@@ -175,20 +176,21 @@ static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
 }}
 #else
 extern unsigned char* __hmx_vtcm;
+extern unsigned int __hmx_gen;  /* bumped by the runtime whenever __hmx_vtcm is (re)acquired */
 static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
   unsigned short* v = (unsigned short*)__hmx_vtcm;  /* act [C, A] | weight [I, B] | out | table */
-  static int init = 0;
-  if (!init) {{
+  static unsigned int init = 0;
+  if (init != __hmx_gen) {{
     for (int i = 0; i < 1024; i++) v[2048 + i] = 0;
     for (int k = 0; k < 32; k++) v[2048 + HMX_IDX(k, k)] = 0x3c00;  /* fp16 1.0 */
     for (int j = 0; j < 64; j++) ((unsigned int*)(v + 5120))[j] = 0;  /* zero bias */
-    init = 1;
+    init = __hmx_gen;
   }}
-  __builtin_memcpy(v, &c, 2048); __builtin_memcpy(v + 1024, &a, 2048); __builtin_memcpy(v + 3072, &b, 2048);
+  *({vt}*)v = c; *({vt}*)(v + 1024) = a; *({vt}*)(v + 3072) = b;  /* plain vector stores (no libc memcpy on the skel) */
   __asm__ volatile("bias = mxmem(%0)" :: "r"(v + 5120) : "memory");
   __asm__ volatile("{{ activation.hf = mxmem(%0,%1):deep\\n weight.hf = mxmem(%2,%3) }}" :: "r"(v), "r"(4095), "r"(v + 2048), "r"(4095) : "memory");
   __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(v + 4096), "r"(0) : "memory");
-  {vt} d; __builtin_memcpy(&d, v + 4096, 2048); return d;
+  return *({vt}*)(v + 4096);
 }}
 #endif"""
 
