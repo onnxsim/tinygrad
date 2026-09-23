@@ -100,7 +100,7 @@ class DSPRenderer(ClangRenderer):
                  # native integer max (HVX vmax*); floats keep tinygrad's own (a<b)?b:a semantics, which differ from the
                  # builtin's IEEE maxNum on NaN. The statement expression evaluates each operand once: a plain ternary
                  # repeats both, and since single-use ALU results are inlined, a chain of maxes (argmax) grows exponentially.
-                 Ops.MAX: lambda a,b,dtype: f"({{__typeof__({a}) _a=({a}), _b=({b}); _a<_b?_b:_a;}})" if dtypes.is_float(dtype) else
+                 Ops.MAX: lambda a,b,dtype: f"({{__auto_type _a=({a}); __auto_type _b=({b}); _a<_b?_b:_a;}})" if dtypes.is_float(dtype) else
                    f"__builtin_elementwise_max({a},{b})"}
   extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
 
