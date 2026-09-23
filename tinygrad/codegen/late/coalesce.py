@@ -121,6 +121,14 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       else: root_src, arg = idx, 0
       memory[(u.op, buf, root_src, valid)].setdefault(arg, []).append(u)
 
+  # on the DSP, don't merge loads wider than the widest contiguous store group: a wider load that consumers only use in
+  # narrower slices has to be split back out of the HVX register, which LLVM does through a stack round trip
+  dsp_load_cap = 128
+  if ctx is not None and ctx.target.device == "DSP":
+    store_runs = [len(g) for (op,_,_,_),offsets in memory.items() if op is Ops.STORE
+                  for _,g in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]) for g in [list(g)]]
+    if store_runs: dsp_load_cap = max(4, max(store_runs))
+
   # build replacements
   replacements = {}
   for (op,buf,base,valid),offsets in memory.items():
@@ -128,7 +136,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     lengths = []
     must_divide = True
     if ctx is not None and ctx.target.device == "DSP":
-      lengths = [128,64,32,16,8,4]
+      lengths = [l for l in [128,64,32,16,8,4] if op is Ops.STORE or l <= dsp_load_cap]
       must_divide = False
     elif buf.dtype not in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and not is_image_shape(buf._shape):
       pass
