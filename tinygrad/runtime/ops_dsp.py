@@ -252,6 +252,9 @@ static inline void __hmx_mac(__fp16* a, __fp16* b) {
   }
   __hmx_t ^= 1;
 }
+static inline void __hmx_mac_span(__fp16* a, __fp16* b, int kt) {
+  for (int k = 0; k < kt; k++) { __hmx_mac(a + 1024 * k, b + 1024 * k); }
+}
 static inline __fp16* __hmx_store(void) {
   unsigned short* o = (unsigned short*)__hmx_ro;
   for (int i = 0; i < 1024; i++) { o[i] = __hmx_d2h(__hmx_racc[i]); __hmx_racc[i] = 0.0; }
@@ -282,6 +285,13 @@ static inline void __hmx_mac(__fp16* a, __fp16* b) {
   __asm__ volatile("{ activation.hf = mxmem(%0,%1):deep\n weight.hf = mxmem(%2,%3) }" :: "r"(a), "r"(2047), "r"(b), "r"(2047) : "memory");
   __hmx_t ^= 1;
 }
+static inline void __hmx_mac_span(__fp16* a, __fp16* b, int kt) {  /* kt consecutive K tiles, <= 32 per load pair */
+  for (int k0 = 0; k0 < kt; k0 += 32) {
+    int n = kt - k0 < 32 ? kt - k0 : 32;
+    __asm__ volatile("{ activation.hf = mxmem(%0,%1):deep\n weight.hf = mxmem(%2,%3) }" :: "r"(a + 1024 * k0), "r"(n * 2048 - 1),
+                     "r"(b + 1024 * k0), "r"(n * 2048 - 1) : "memory");
+  }
+}
 static inline __fp16* __hmx_store(void) {
   __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(__hmx_vtcm + 8192), "r"(0) : "memory");
   return (__fp16*)(__hmx_vtcm + 8192);
@@ -293,15 +303,16 @@ static inline void __hmx_out2(__fp16* d0, __fp16* d1, const __fp16* o) {
   for (int j = 0; j < 32; j++) { d0[j] = o[2 * j]; d1[j] = o[2 * j + 1]; }
 }
 #else
-typedef unsigned short __hmx_u16 __attribute__((vector_size(128)));
-static inline void __hmx_store64(__fp16* d, __hmx_v v) {  /* v's low 64 bytes -> d (64-byte aligned), merged into its 128-byte
-                                                             block (sequential single-thread stores, so read-modify-write is safe) */
-  __hmx_u16* blk = (__hmx_u16*)((unsigned)d & ~127u); __hmx_u16 old = *blk, nv = (__hmx_u16)v;
-  *blk = ((unsigned)d & 64u)
-    ? __builtin_shufflevector(old, nv, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-        64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95)
-    : __builtin_shufflevector(nv, old, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-        96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127);
+static inline void __hmx_store64(__fp16* d, __hmx_v v) {  /* v's low 64 bytes -> d (64-byte aligned): byte-predicated vmem store
+                                                             (no read of the destination block; the clang predicate builtins
+                                                             assert in this toolchain, so the predicate is set in asm) */
+  unsigned base = (unsigned)d & ~127u;
+  if ((unsigned)d & 64u) {
+    v = __builtin_HEXAGON_V6_vror_128B(v, 64);
+    __asm__ volatile("q0 = vsetq(%2)\n if (!q0) vmem(%0+#0) = %1" :: "r"(base), "v"(v), "r"(64) : "q0", "memory");
+  } else {
+    __asm__ volatile("q0 = vsetq(%2)\n if (q0) vmem(%0+#0) = %1" :: "r"(base), "v"(v), "r"(64) : "q0", "memory");
+  }
 }
 static inline void __hmx_out2(__fp16* d0, __fp16* d1, const __fp16* o) {
   __hmx_v v = __builtin_HEXAGON_V6_vdealh_128B(*(const __hmx_v*)o);  /* even halfwords (row 2q) low, odd (row 2q+1) high */
@@ -426,7 +437,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
   for u in uops:
     for x in u.src: users.setdefault(x, []).append(u)
   written = {_hmx_param(u.src[0]) for u in uops if u.op is Ops.STORE}
+  first = next((k for k,u in enumerate(uops) if u.op is Ops.WMMA), None)
+  loops = _hmx_tile_loops(uops, first) if first is not None else None
   call_start = False
+  span: dict[UOp, tuple] = {}
   drop: set[UOp] = set()
   before: dict[int, list[UOp]] = {}
   after: dict[int, list[UOp]] = {}
@@ -474,9 +488,33 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         if kt > n: return pack  # fewer slots than K tiles: no set per K index, just pack
         return (f" __fp16* _c{dst} = __hmx_lookup(__hmx_tag_{x}, __hmx_rr_{x}, __hmx_c{x}, {key}, {kr}, {min(n // kt, 8)}, &_s);"
                 f" if (_c{dst}) _{dst} = _c{dst}; else {{{{ _{dst} = _s;{pack} }}}}")
-      if ro[0]: pa = cached("a", _HMX_CA, ptr[0], "a", pa)
-      if ro[1]: pb = cached("b", _HMX_CB, ptr[32], "b", pb)
-      if any(ro): srcs = srcs + (e.src[1],)
+      if loops is not None:
+        # exact, tag-free: an operand's tiles are indexed by the loops its address depends on; pack on the first iteration of
+        # the others (outer/inner as rendered, i.e. after the interchange)
+        outer, inner = (loops[1], loops[0]) if loops[2] else (loops[0], loops[1])
+        ti = int(inner.vmax) + 1
+        on, iname = f"{{{len(srcs)+1}}}", f"{{{len(srcs)+2}}}"
+        def exact(r, n, x, pack):
+          # slots contiguous in K for each tile index, so one spanning load pair can read them after the loop
+          deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
+          if deps == {inner} and kt * ti <= n: base, cond = f"({iname})*{kt}", f"({on})==0"
+          elif deps == {outer} and kt <= n: base, cond = "0", f"({iname})==0"
+          elif not deps and kt <= n: base, cond = "0", f"({on})==0 && ({iname})==0"
+          else: return None
+          return f" _{x} = __hmx_c{x}({base}+({kr})); if ({cond}) {{{{{pack} }}}}", base
+        ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
+        eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
+        if ea and eb:
+          # K tiles stay in VTCM: no load pair per K block, one spanning pair after the loop (see the output statement)
+          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname)
+          ea, eb = ea[0], eb[0]
+        else: ea, eb = ea and ea[0], eb and eb[0]
+        pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
+        srcs = srcs + (e.src[1], outer, inner)
+      else:
+        if ro[0]: pa = cached("a", _HMX_CA, ptr[0], "a", pa)
+        if ro[1]: pb = cached("b", _HMX_CB, ptr[32], "b", pb)
+        if any(ro): srcs = srcs + (e.src[1],)
       if any(ro): call_start = True
       # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs
       pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
@@ -488,7 +526,13 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       srcs = tuple(v for v, _ in rows)
     else: return _hmx_bail(uops, 10)
     replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, "{{ __fp16* _a = __hmx_sa(); __fp16* _b = __hmx_sb(); __fp16* _s = 0; (void)_s;"+pa+pb+
-                     " __hmx_mac(_a, _b); }}")
+                     (" (void)_a; (void)_b; }}" if w in span else " __hmx_mac(_a, _b); }}"))
+    def span_mac(srcs0:tuple) -> tuple[str, tuple]:
+      # after the loop: the spanning load pair(s) over all K tiles, rendered with the tile loops' indices
+      if w not in span: return "", ()
+      ab, bb, kt_, o_, i_, on_, in_ = span[w]
+      for k_, v_ in ((on_, "{%d}" % len(srcs0)), (in_, "{%d}" % (len(srcs0)+1))): ab, bb = ab.replace(k_, v_), bb.replace(k_, v_)
+      return f" __hmx_mac_span(__hmx_ca({ab}), __hmx_cb({bb}), {kt_});", (o_, i_)
     # after the loop: one store, then each accumulator-array vector = the same lanes of the output tile
     outs = []
     for k, so in enumerate(stores):
@@ -507,11 +551,13 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       # where the last replaced store was: every row pointer expression is rendered by then
       at = max(pos[g] for g in gone if g.op is Ops.STORE)
+      sm, sx = span_mac(tuple(rowptr))
       after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
-                                      [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr), "{{ const __fp16* _p = __hmx_store();"+pairs+" }}")])
+                                      [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}")])
       continue
-    after.setdefault(pos[e], []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores),
-      "{{ __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
+    sm, sx = span_mac(tuple(so.src[0] for so in stores))
+    after.setdefault(pos[e], []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
+      "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
   if not replace: return _hmx_bail(uops, 9)
   if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
   out = []
@@ -520,29 +566,33 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if u in replace: out.append(replace[u])
     elif u not in drop: out.append(u)
     out += after.get(i, [])
-  return _hmx_interchange(out), True
+  if loops is not None and loops[2]: out = _hmx_interchange(out, loops[0], loops[1])
+  return out, True
 
-def _hmx_interchange(uops:list[UOp]) -> list[UOp]:
-  # the output-tile loops are independent: put the one with more iterations outermost, so the operand indexed by the
-  # (now inner, shorter) loop stays in the VTCM tile cache and the other operand's K panel is reused across it
-  if not getenv("HMX_INTERCHANGE", 1): return uops
-  pos = {u:i for i,u in enumerate(uops)}
+def _hmx_uses(x:UOp, r:UOp) -> bool:
+  # does x's value depend on loop r (data dependence only: a RANGE's own srcs just order it after its enclosing ranges)
+  return x is r or any(r in u.src for u in x.toposort(lambda u: u.op is not Ops.RANGE))
+
+def _hmx_tile_loops(uops:list[UOp], at:int):
+  # the two innermost output-tile loops open at uops[at] -> (o, i, swap): swap = the one with more iterations should be
+  # outermost and they can be interchanged (nothing between the loop heads depends on i, nothing between their ENDs)
+  pos = {u:k for k,u in enumerate(uops)}
   end_of = {e.src[1]: e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE}
-  mac = next((i for i,u in enumerate(uops) if u.op is Ops.CUSTOM and "__hmx_mac(" in u.arg), None)
-  if mac is None: return uops
   open_: list[UOp] = []
-  for u in uops[:mac]:
+  for u in uops[:at]:
     if u.op is Ops.RANGE: open_.append(u)
     elif u.op is Ops.END and len(u.src) > 1 and u.src[1] in open_: open_.remove(u.src[1])
-  loops = [r for r in open_ if r in end_of and r.arg[-1] != AxisType.REDUCE] if open_ else []
-  if len(loops) < 2: return uops
+  loops = [r for r in open_ if r in end_of and r.arg[-1] != AxisType.REDUCE]
+  if len(loops) < 2: return None
   o, i = loops[-2], loops[-1]
-  if o.vmax >= i.vmax: return uops
-  eo, ei = end_of[o], end_of[i]
   mid = uops[pos[o]+1:pos[i]]
-  between_ends = [u for u in uops[pos[ei]+1:pos[eo]] if u.op not in (Ops.GROUP, Ops.NOOP)]
-  if between_ends or any(i in x.toposort() for x in mid): return uops
-  return uops[:pos[o]] + [i, o] + mid + uops[pos[i]+1:]
+  between_ends = [u for u in uops[pos[end_of[i]]+1:pos[end_of[o]]] if u.op not in (Ops.GROUP, Ops.NOOP)]
+  swap = bool(getenv("HMX_INTERCHANGE", 1)) and o.vmax < i.vmax and not between_ends and not any(_hmx_uses(x, i) for x in mid)
+  return o, i, swap
+
+def _hmx_interchange(uops:list[UOp], o:UOp, i:UOp) -> list[UOp]:
+  pos = {u:k for k,u in enumerate(uops)}
+  return uops[:pos[o]] + [i, o] + uops[pos[o]+1:pos[i]] + uops[pos[i]+1:]
 
 class DSPRenderer(ClangRenderer):
   has_threads = False
