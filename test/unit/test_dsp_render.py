@@ -119,6 +119,15 @@ class TestDSPHmx(unittest.TestCase):
     kernel = self.src(64, 64, 64).split("__attribute__((noinline)) void", 1)[1]
     self.assertEqual(kernel.count("__hmx_pack2("), 32)  # 16 row pairs of A + 16 of B per K block
 
+  def test_interchange_and_paired_b(self):
+    # N has more tiles than M: the N-tile loop goes outermost, A stays in loop-indexed VTCM slots, and B tiles n, n+1 are
+    # packed together from full 128-byte row lines on even n
+    kernel = self.src(128, 576, 256).split("__attribute__((noinline)) void", 1)[1]
+    self.assertLess(kernel.index("for (int Lidx2"), kernel.index("for (int Lidx1"))
+    self.assertIn("_a = __hmx_ca((Lidx1)*18+(Ridx0)); if ((Lidx2)==0)", kernel)
+    self.assertIn("_b = __hmx_cb((Lidx2)%2*18+(Ridx0)); if ((Lidx1)==0 && (Lidx2)%2==0)", kernel)
+    self.assertEqual(kernel.count("__hmx_pack2x2("), 16)
+
   def test_plain_tile_op(self):
     src = self.src(64, 96, 64, acc=False)  # a shape not rendered above (to_program caches by AST)
     self.assertIn("__WMMA_32_32_32_half_half(", src)
