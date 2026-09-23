@@ -102,10 +102,15 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("weight.hf = mxmem(%2,%3)", src)
     self.assertIn("mxmem(%0,%1):after.hf = acc", src)
     self.assertIn("#ifdef HMX_REF", src)
-    # begin before the reduce loop, one load pair per K block inside it, one store after it
-    self.assertLess(kernel.index("__hmx_begin();"), kernel.index("for (int Ridx0"))
-    self.assertEqual(kernel.count("__hmx_mac("), 1)
-    self.assertGreater(kernel.index("__hmx_store()"), kernel.index("__hmx_mac("))
+    # begin before the reduce loop; inside it only packing into loop-indexed VTCM slots; after it one spanning load pair
+    # over all K tiles, then the store
+    loop = kernel.index("for (int Ridx0")
+    self.assertLess(kernel.index("__hmx_begin();"), loop)
+    self.assertIn("= __hmx_ca(", kernel)
+    self.assertNotIn("__hmx_mac(_a, _b)", kernel)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+    self.assertLess(loop, kernel.index("__hmx_mac_span("))
+    self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store()"))
     # no 2 KB tile values, no per-K accumulator round trip
     self.assertNotIn("__WMMA_32_32_32_half_half(", kernel)
     self.assertNotIn("__fp161024", kernel)
