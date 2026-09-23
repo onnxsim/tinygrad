@@ -115,8 +115,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider all upcastable axes with 3 or 4 upcast (on the DSP, one HVX-register-sized or larger vector: 128/64/32 lanes,
+    # since real shapes like ...x272 aren't multiples of 128 and would otherwise fall back to a 4-wide upcast)
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128,64,32] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -130,12 +131,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if c is rng: sum_strides += 1
             if c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST: sum_strides += c.src[1].val
             if c.op is Ops.MUL and c.src[1] is rng and c.src[0].op is Ops.CONST: sum_strides += c.src[0].val
-        xb_choices.append((num_strides, sum_strides, axis, upcast_amount))
+        # on the DSP prefer the widest vector for the same axis (the extra key is 0 elsewhere, so ordering is unchanged)
+        xb_choices.append((num_strides, sum_strides, -upcast_amount if is_dsp else 0, axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][2], xb_choices[0][3]))
-      upcasted_axis.add(xb_choices[0][2])
+      k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][3], xb_choices[0][4]))
+      upcasted_axis.add(xb_choices[0][3])
     else: break
 
   # if last reduce dim is small(ish), loop unroll the reduce
@@ -154,10 +156,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             break
   except KernelOptError: pass
 
-  # if nothing at all is upcasted and it's easy to, do an upcast
-  for splits in [4]:
+  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, as wide as the innermost dim allows, up to 128 lanes)
+  for splits in ([128,64,32,16,8,4] if is_dsp else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+      break
 
   # **** local groups ****
 

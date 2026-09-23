@@ -12,10 +12,83 @@ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-i
 
 from tinygrad.uop.ops import PatternMatcher, UPat
 
+HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
+
+def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
+  # STACK(v[k], v[k+1], ..., v[k+n-1]) of one vector v -> (v, [k..k+n-1])
+  if len(x.src) < 2 or any(s.op is not Ops.INDEX or len(s.src) != 2 or s.src[0] is not x.src[0].src[0] for s in x.src): return None
+  v = x.src[0].src[0]
+  if v._shape is None or len(v._shape) != 1: return None
+  lanes = [s.src[1].src[0].arg if s.src[1].op is Ops.CAST else s.src[1].arg for s in x.src]
+  if not all(isinstance(l, int) for l in lanes) or lanes != list(range(lanes[0], lanes[0]+len(lanes))): return None
+  return v, lanes
+
 # NOTE: this just increases readability of the generated code
 dsp_string = PatternMatcher([
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
+  # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
+  # shufflevector instead of a per-lane constructor
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
+   if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
+  # a STACK of one repeated scalar is a splat, which clang lowers to a single HVX vsplat
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})({ctx[x.src[0]]}))"
+   if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
+  # vector casts must convert per lane; a C cast between ext_vector_types is a bitcast
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})"
+   if x.max_numel() > 1 else None),
+  # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a
+  # non-faulting hint, so prefetching past the end of a buffer is harmless. One dcfetch per 128-byte line the load covers
+  # (a 128-lane int32 load is four HVX registers / lines); sub-line loads are skipped, a dcfetch per 32-byte load costs more
+  # than it hides. HVX_PREFETCH is the distance in bytes (0 = off).
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
+   "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH+o}), "
+                 for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
+   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL else None),
 ])
+
+# ***** HVX re-vectorization *****
+# devectorizer2 splits every elementwise op into per-lane scalars and memory_coalescing only regroups the loads and
+# stores (up to 128 lanes for DSP), so the ALU in between is rendered as `(int128){(a[0]+b[0]),(a[1]+b[1]),...}`, which
+# LLVM lowers lane by lane (~10x the instructions of one vector add). This pass rebuilds vector ALU ops bottom-up:
+# STACK(op(a_i, b_i) for i) -> op(STACK(a_i), STACK(b_i)); STACK(v[0], ..., v[n-1]) -> v. clang lowers ext_vector_type
+# arithmetic straight to HVX under -mhvx. Compares/WHERE are left scalar: C vector compares yield same-width int masks,
+# not _Bool vectors, so they'd need mask-dtype plumbing -- MAX (the common select) is native instead.
+HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
+
+def _lane(u:UOp) -> int|None:
+  if u.op is Ops.CAST: u = u.src[0]
+  return u.arg if u.op is Ops.CONST and isinstance(u.arg, int) else None
+
+def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
+  # a column (the j-th operand of every lane) can become one vector operand if it's a splat, constants, consecutive lanes
+  # of one vector, or (recursively) the same vectorizable op in every lane. Anything else -- e.g. a per-lane mix of
+  # compare/cast/mul -- stays a scalar constructor: LLVM's Hexagon backend crashes selecting some of those once they're
+  # wrapped in a vector op ("Cannot select v2i32 = bitcast (V2Q ...)"), and there's nothing to gain vectorizing them.
+  c0 = col[0]
+  if c0._shape != () or c0.dtype == dtypes.bool or depth > 32: return False
+  if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
+  if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
+    lanes = [_lane(c.src[1]) if c.op is Ops.INDEX and len(c.src) == 2 and c.src[0] is c0.src[0] else None for c in col]
+    return None not in lanes and lanes == list(range(lanes[0], lanes[0]+len(lanes)))
+  if c0.op in HVX_VEC_OPS and all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
+    return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
+  return False
+
+def hvx_revectorize(x:UOp) -> UOp|None:
+  srcs, n = x.src, len(x.src)
+  if n < 2 or x.dtype == dtypes.void: return None
+  s0 = srcs[0]
+  # STACK(v[0], v[1], ..., v[n-1]) of a length-n vector is v itself
+  if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
+     all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
+    return s0.src[0]
+  if s0.op not in HVX_VEC_OPS or s0.dtype == dtypes.bool or s0._shape != (): return None
+  if s0.op is Ops.MAX and dtypes.is_float(s0.dtype): return None  # float max renders as a scalar statement expression
+  if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
+  if not _vec_column_ok(srcs): return None
+  return UOp(s0.op, s0.dtype, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)
+
+pm_hvx_revectorize = PatternMatcher([(UPat(Ops.STACK, name="x"), hvx_revectorize)])
 
 class DSPRenderer(ClangRenderer):
   has_threads = False
@@ -23,7 +96,13 @@ class DSPRenderer(ClangRenderer):
   kernel_typedef = "__attribute__((noinline)) void"
   string_rewrite = dsp_string+ClangRenderer.string_rewrite
   type_map = { **ClangRenderer.type_map, dtypes.uint64: "unsigned long long", dtypes.int64: "long long" }
-  code_for_op = {k:v for k,v in ClangRenderer.code_for_op.items() if k != Ops.SQRT}
+  code_for_op = {**{k:v for k,v in ClangRenderer.code_for_op.items() if k != Ops.SQRT},
+                 # native integer max (HVX vmax*); floats keep tinygrad's own (a<b)?b:a semantics, which differ from the
+                 # builtin's IEEE maxNum on NaN. The statement expression evaluates each operand once: a plain ternary
+                 # repeats both, and since single-use ALU results are inlined, a chain of maxes (argmax) grows exponentially.
+                 Ops.MAX: lambda a,b,dtype: f"({{__typeof__({a}) _a=({a}), _b=({b}); _a<_b?_b:_a;}})" if dtypes.is_float(dtype) else
+                   f"__builtin_elementwise_max({a},{b})"}
+  extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
 
   def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), tc.hexagon_v65
 
