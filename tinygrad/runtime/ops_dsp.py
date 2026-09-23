@@ -130,6 +130,68 @@ def hvx_revectorize(x:UOp) -> UOp|None:
 
 pm_hvx_revectorize = PatternMatcher([(UPat(Ops.STACK, name="x"), hvx_revectorize)])
 
+# HMX=1 adds the V69 HMX (fp16) tensor core in front of the HVX vrmpy ones
+def _dsp_tcs(): return (tc.hexagon_hmx if getenv("HMX") else []) + tc.hexagon_v65
+
+# HMX (V69 matrix unit) tile op for the hexagon_hmx TensorCore: D = rne_fp16(C + A.B), all three 32x32 fp16 tiles in the HMX
+# layout IDX(i,j) = 64*(i/2)+2*j+i%2 (the TC's swizzles make tinygrad's fragments exactly that order). C is folded into the
+# same accumulation as a second K block against an identity weight tile, so one load pair + one store does the whole op.
+# Preconditions are the runtime's (scripts/android/hmx_gemm/hmx_runtime.h in onnxsim): HMX power vote, VTCM + HMX context,
+# HVX + HMX lock on this thread, and __hmx_vtcm pointing at >= 16 KB of that VTCM inside one 256 KB window, 2 KB aligned.
+# -DHMX_REF builds a scalar reference of the same op on the same layout instead (for qemu, which can't run HMX).
+def _hmx_wmma_helper(name:str, vt:str) -> str:
+  return f"""#ifndef HMX_IDX
+#define HMX_IDX(i, j) (64 * ((i) / 2) + 2 * (j) + ((i) % 2))
+#endif
+#ifdef HMX_REF
+/* bit-level fp16 <-> double (the freestanding qemu link has no __extendhfsf2/__truncdfhf2) */
+static inline double __hmx_h2d(unsigned short h) {{
+  int e = (h >> 10) & 31, f = h & 1023; double v = e ? (double)(f | 1024) : (double)f;
+  for (int i = 0; i < (e ? e : 1); i++) v *= 2.0;
+  v /= 33554432.0;  /* 2^25 = 2^(15 + 10) */
+  return (h & 0x8000) ? -v : v;
+}}
+static inline unsigned short __hmx_d2h(double x) {{  /* round to nearest even, saturate to inf */
+  unsigned short sgn = x < 0 ? 0x8000 : 0; if (x < 0) x = -x;
+  if (x >= 65520.0) return sgn | 0x7c00;
+  int e = 15; double m = x;
+  if (m >= 2048.0 / 1024.0 * 1.0) {{ while (m >= 2.0 && e < 30) {{ m /= 2.0; e++; }} }} else {{ while (m < 1.0 && e > 1) {{ m *= 2.0; e--; }} }}
+  if (m < 1.0) e = 0;  /* subnormal: m = x / 2^-14 */
+  double q = m * 1024.0; long r = (long)q; double fr = q - (double)r;
+  if (fr > 0.5 || (fr == 0.5 && (r & 1))) r++;
+  if (e == 0) return sgn | (unsigned short)r;  /* r == 1024 rounds up into the smallest normal, same bits */
+  if (r == 2048) {{ r = 1024; e++; if (e >= 31) return sgn | 0x7c00; }}
+  return sgn | (unsigned short)((e << 10) | (r - 1024));
+}}
+static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
+  unsigned short A[1024], B[1024], C[1024], D[1024];
+  __builtin_memcpy(A, &a, 2048); __builtin_memcpy(B, &b, 2048); __builtin_memcpy(C, &c, 2048);
+  for (int m = 0; m < 32; m++) for (int n = 0; n < 32; n++) {{
+    double s = __hmx_h2d(C[HMX_IDX(m, n)]);
+    for (int k = 0; k < 32; k++) s += __hmx_h2d(A[HMX_IDX(m, k)]) * __hmx_h2d(B[HMX_IDX(k, n)]);
+    D[HMX_IDX(m, n)] = __hmx_d2h(s);
+  }}
+  {vt} d; __builtin_memcpy(&d, D, 2048); return d;
+}}
+#else
+extern unsigned char* __hmx_vtcm;
+static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
+  unsigned short* v = (unsigned short*)__hmx_vtcm;  /* act [C, A] | weight [I, B] | out | table */
+  static int init = 0;
+  if (!init) {{
+    for (int i = 0; i < 1024; i++) v[2048 + i] = 0;
+    for (int k = 0; k < 32; k++) v[2048 + HMX_IDX(k, k)] = 0x3c00;  /* fp16 1.0 */
+    for (int j = 0; j < 64; j++) ((unsigned int*)(v + 5120))[j] = 0;  /* zero bias */
+    init = 1;
+  }}
+  __builtin_memcpy(v, &c, 2048); __builtin_memcpy(v + 1024, &a, 2048); __builtin_memcpy(v + 3072, &b, 2048);
+  __asm__ volatile("bias = mxmem(%0)" :: "r"(v + 5120) : "memory");
+  __asm__ volatile("{{ activation.hf = mxmem(%0,%1):deep\\n weight.hf = mxmem(%2,%3) }}" :: "r"(v), "r"(4095), "r"(v + 2048), "r"(4095) : "memory");
+  __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(v + 4096), "r"(0) : "memory");
+  {vt} d; __builtin_memcpy(&d, v + 4096, 2048); return d;
+}}
+#endif"""
+
 class DSPRenderer(ClangRenderer):
   has_threads = False
   buffer_suffix = " restrict __attribute__((align_value(128)))"
@@ -144,7 +206,7 @@ class DSPRenderer(ClangRenderer):
                    f"__builtin_elementwise_max({a},{b})"}
   extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
 
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), tc.hexagon_v65
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), _dsp_tcs()
 
   # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32
   # groups of 4)) in one instruction -- no warp/lane cooperation needed (tensor_cores' threads=1), unlike
@@ -164,6 +226,9 @@ class DSPRenderer(ClangRenderer):
     prefix = list(prefix or [])
     b_dtypes = {_wmma_name(u): u.src[1].dtype for u in uops if u.op is Ops.WMMA}
     for name, _, dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
+      if dtype_in == dtypes.half:
+        prefix.append(_hmx_wmma_helper(name, self._render_dtype(dtypes.half, 1024, AddrSpace.REG)))
+        continue
       dtype_b = b_dtypes[name]
       dstr_a, dstr_b, dstr_c = (self._render_dtype(dt, sz, AddrSpace.REG) for dt, sz in
                                  zip([dtype_in, dtype_b, dtype_out], upcast_sizes))
@@ -293,7 +358,8 @@ class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
     self.mock, compiler_args = mock, f"--target=hexagon -mcpu=hexagon{HVX_ARCH} -fuse-ld=lld -nostdlib -mhvx={HVX_ARCH} -mhvx-length=128b"
     self.libgcc = _find_libgcc()
-    if mock: self.args = f"-static {compiler_args}"
+    # qemu cannot run HMX: MOCKDSP builds the hexagon_hmx TC as its scalar reference on the same tile layout
+    if mock: self.args = f"-static -DHMX_REF {compiler_args}"
     else:
       # Generate link script to pass into clang. Aligning all used sections to 4k fixes invoke problem.
       sections = ['text', 'rela.plt', 'rela.dyn', 'plt', 'data', 'bss', 'hash', 'dynamic',
@@ -447,7 +513,7 @@ static void *mmap2(void *addr, unsigned int length, int prot, int flags, int fd,
 return (void*)syscall((long)addr, length, prot, flags, fd, offset, 222); }}'''
 
 class MockDSPRenderer(DSPRenderer):
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), tc.hexagon_v65
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), _dsp_tcs()
   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     # https://gpages.juszkiewicz.com.pl/syscalls-table/syscalls.html
@@ -526,7 +592,7 @@ HEXSIM_CLOCK_HZ = 1_000_000_000  # placeholder nominal clock (Hexagon v73 cDSP i
                                   # returned times matters for BEAM; this scales Pcycles into a plausible-looking float, nothing more.
 
 class HexagonSimRenderer(DSPRenderer):
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, HexagonSimCompiler(), tc.hexagon_v65
+  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, HexagonSimCompiler(), _dsp_tcs()
   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     # Plain hosted main() (hexagon-sim's standalone-OS mode has real libc) -- no raw trap0 dance

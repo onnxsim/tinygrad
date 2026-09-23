@@ -201,3 +201,14 @@ hexagon_v65 = [TensorCore(dims=(32,1,4), threads=1, elements_per_thread=(4,128,3
   swizzle=(((), ('u0','u1','u2','u3','u4'), ('r0','r1')),
            ((), ('u0','u1','u2','u3','u4'), ('r0','r1'))),
   dtype_in_b=db) for di,db in [(dtypes.uint8, None), (dtypes.int8, None), (dtypes.uint8, dtypes.int8)]]
+
+# Hexagon HMX (V69 matrix unit, driven through hmx_block.h-style inline asm; see ops_dsp.py DSPRenderer):
+# D (fp16 32x32) = rne_fp16(C + A (fp16 32x32) . B (fp16 32x32)): one tile op on a single thread (threads=1), so all ten
+# axis-doubling opts are upcasts and every operand is one whole 32x32 tile (1024 elements). HMX tiles are laid out as
+# IDX(i, j) = 64*(i/2) + 2*j + i%2, i.e. index bits (MSB..LSB) i4 i3 i2 i1 j4 j3 j2 j1 j0 i0. The opts put one M upcast first
+# (u0 = m0) and the other four last (u6..u9 = m1..m4), so C's fragment order (u9..u0) is exactly IDX(m, n); the swizzles
+# give A the same shape with K in N's place (IDX(m, k)) and B with K in M's place (IDX(k, n)).
+hexagon_hmx = [TensorCore(dims=(32,32,32), threads=1, elements_per_thread=(1024,1024,1024), dtype_in=dtypes.half, dtype_out=dtypes.half,
+  opts=("u1","u0","u0","u0","u0","u0","u1","u1","u1","u1"),
+  swizzle=(((), ('u0','r0','r1','r2','r3','r4','u6','u7','u8','u9'), ('u1','u2','u3','u4','u5')),
+           ((), ('r0','u1','u2','u3','u4','u5','r1','r2','r3','r4'), ('u0','u6','u7','u8','u9'))))]
