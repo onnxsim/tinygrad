@@ -111,7 +111,9 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
-      if buf.addrspace == AddrSpace.REG: continue
+      # register arrays are only coalesced on the DSP, where an upcast accumulator (e.g. a vrmpy WMMA's 32 int32 lanes) is one
+      # HVX register: without this every reduce iteration round-trips it through 32 scalar loads/stores
+      if buf.addrspace == AddrSpace.REG and not (ctx is not None and ctx.target.device == "DSP"): continue
       idx, valid = idx_u.get_idx(), idx_u.get_valid()
       root_src: UOp|str
       if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST: root_src, arg = idx.src[0], idx.src[1].val
@@ -123,9 +125,10 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
 
   # on the DSP, don't merge loads wider than the widest contiguous store group: a wider load that consumers only use in
   # narrower slices has to be split back out of the HVX register, which LLVM does through a stack round trip
+  # (in bytes: an int32x32 accumulator store is one 128-byte HVX register, and so is a uint8x128 load)
   dsp_load_cap = 128
   if ctx is not None and ctx.target.device == "DSP":
-    store_runs = [len(g) for (op,_,_,_),offsets in memory.items() if op is Ops.STORE
+    store_runs = [len(g)*buf.dtype.itemsize for (op,buf,_,_),offsets in memory.items() if op is Ops.STORE
                   for _,g in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]) for g in [list(g)]]
     if store_runs: dsp_load_cap = max(4, max(store_runs))
 
@@ -136,8 +139,10 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     lengths = []
     must_divide = True
     if ctx is not None and ctx.target.device == "DSP":
-      lengths = [l for l in [128,64,32,16,8,4] if op is Ops.STORE or l <= dsp_load_cap]
-      must_divide = False
+      lengths = [l for l in [128,64,32,16,8,4] if op is Ops.STORE or l*buf.dtype.itemsize <= max(dsp_load_cap, 4*buf.dtype.itemsize)]
+      # a register array is 128-byte aligned (DSPRenderer.render_buffer) and its vector types assume their natural
+      # alignment, so a group must start at a multiple of its length
+      must_divide = buf.addrspace == AddrSpace.REG
     elif buf.dtype not in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and not is_image_shape(buf._shape):
       pass
     elif buf.addrspace == AddrSpace.REG:

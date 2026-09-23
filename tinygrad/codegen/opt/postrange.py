@@ -11,6 +11,12 @@ from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
 from tinygrad.renderer import Renderer
 
+def _narrow_int(u:UOp) -> UOp:
+  # look through value-preserving integer widening casts (e.g. u8 -> short), back to the narrow value
+  while u.op is Ops.CAST and dtypes.is_int(u.dtype) and dtypes.is_int(s:=u.src[0].dtype) and u.dtype.itemsize > s.itemsize and \
+      (dtypes.is_unsigned(s) or not dtypes.is_unsigned(u.dtype)): u = u.src[0]
+  return u
+
 class Scheduler:
   def __init__(self, ast:UOp, ren:Renderer):
     self.ast, self.ren = ast, ren
@@ -224,7 +230,10 @@ class Scheduler:
         raise KernelOptError(f"invalid tensor core choice {tc_select}")
       for tc in tensor_cores:
         if self.ren.target.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
-        if tc.dtype_in == in0.dtype and tc.dtype_in == in1.dtype and tc.dtype_out == reduceop.dtype:
+        # a mixed-dtype TC (u8 x s8) sees its inputs through the value-preserving widening casts dtype promotion adds
+        # to the MUL (u8,s8 -> short), and computes the exact product itself
+        a, b = (_narrow_int(in0), _narrow_int(in1)) if tc.dtype_in_b is not None else (in0, in1)
+        if tc.dtype_in == a.dtype and tc.dtype_b == b.dtype and tc.dtype_out == reduceop.dtype:
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
           in1_ranges = sorted([u for u in in1.ranges if u not in in0.ranges], key=lambda x: x.arg[0], reverse=True)
@@ -232,6 +241,8 @@ class Scheduler:
           if DEBUG >= 3:
             print(f"TC({axis}): {[(x.arg[0],x.vmax+1) for x in in0_ranges]}",
                               f"{[(x.arg[0],x.vmax+1) for x in in1_ranges]} {[(x.arg[0],x.vmax+1) for x in red_ranges]}")
+          # M=1 (a GEMV): A has no range of its own, and a TC with dims[1]==1 needs none
+          if not len(in0_ranges) and tc.dims[1] == 1: in0_ranges = [None]
           if not len(in0_ranges) or not len(in1_ranges) or not len(red_ranges): continue
 
           # pick ranges
@@ -240,7 +251,8 @@ class Scheduler:
           if not (axis < len(axis_choices)): continue
           axes = list(axis_choices[axis])
 
-          if any(a.arg[-1] is AxisType.REDUCE for a in axes[:2]): raise KernelOptError("tensor core X/Y axes can't be REDUCE")
+          if any(a is not None and a.arg[-1] is AxisType.REDUCE for a in axes[:2]):
+            raise KernelOptError("tensor core X/Y axes can't be REDUCE")
 
           # tag the reduceop
           self.ast = self.ast.substitute({reduceop: reduceop.replace(tag="TC")})
@@ -248,6 +260,7 @@ class Scheduler:
           # do optimizations and save the ranges
           try:
             for i,a in enumerate(axes):
+              if a is None: continue
               idx = self.rngs.index(a)
               if (a.vmax+1) % tc.dims[i] != 0:
                 if opt_level < 2: raise KernelOptError("tc padding requires opt_level >= 2")
@@ -278,6 +291,7 @@ class Scheduler:
             tne = [x.replace(tag=1) for x in ne]
             ret = reduceop.substitute(dict(zip(ne, tne)))
             srcs = list((ret.src[0] if ret.src[0].op is not Ops.CAST else ret.src[0].src[0]).src)
+            if tc.dtype_in_b is not None: srcs = [_narrow_int(x) for x in srcs]
             srcs = [x.substitute(dict(zip(tne, [ne[i] for i in argsort(p)]))) for x,p in zip(srcs, tc.permutes_for_shape_str(tc.base_shape_str()))]
 
             # get reduce/upcast axes for the tensor cores

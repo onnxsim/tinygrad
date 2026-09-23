@@ -32,6 +32,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, TC_OPT.value, USE_TC.value)))
       except KernelOptError: continue
       for tc_dim in [1,0]: # attempt to upcast M and N
+        if rngs[tc_dim] is None: continue # M=1 TC (a GEMV) has no M range
+        # Hexagon's vrmpy TC is one vector instruction per thread: an extra M/N upcast lands *inside* its 32 accumulator
+        # lanes (later upcasts are the faster axes of the register accumulator), so every WMMA's C becomes a strided gather.
+        # One WMMA per 32-lane accumulator slice keeps it a single HVX register.
+        if tk.ren is not None and tk.ren.target.device == "DSP": continue
         szs = [sz for sz in [5,4,3,2] if rngs[tc_dim].src[0].divides(sz) is not None]
         if szs:
           # set it to the replaced range
