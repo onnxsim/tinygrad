@@ -86,24 +86,38 @@ class TestDSPVrmpyGemv(unittest.TestCase):
     self.assertNotIn("*(buf0+1)", src)
 
 class TestDSPHmx(unittest.TestCase):
-  # the V69 HMX fp16 TensorCore (HMX=1): whole 32x32 tiles, fragments already in the HMX tile layout, one load pair + one
-  # store per tile op; MOCKDSP builds its scalar reference (-DHMX_REF) since qemu can't run HMX
-  def src(self, M, K, N, dtype=dtypes.half):
-    return dsp_source(Tensor.empty(M, K, dtype=dtype).matmul(Tensor.empty(K, N, dtype=dtype), dtype=dtype), tc.hexagon_hmx + tc.hexagon_v65)
+  # the V69 HMX fp16 TensorCore: whole 32x32 tiles in the HMX tile layout. By default the renderer keeps the accumulator
+  # inside HMX across the reduce loop (rows packed straight into VTCM with HVX, one load pair per K block, one store per
+  # output tile); hmx_acc=False keeps the plain tile op. MOCKDSP builds the scalar reference (-DHMX_REF) of either.
+  def src(self, M, K, N, dtype=dtypes.half, acc=True):
+    t = Tensor.empty(M, K, dtype=dtype).matmul(Tensor.empty(K, N, dtype=dtype), dtype=dtype)
+    old, MockDSPRenderer.hmx_acc = MockDSPRenderer.hmx_acc, acc
+    try: return dsp_source(t, tc.hexagon_hmx + tc.hexagon_v65)
+    finally: MockDSPRenderer.hmx_acc = old
 
-  def test_half_matmul_uses_hmx(self):
+  def test_half_matmul_keeps_accumulator_in_hmx(self):
     src = self.src(64, 64, 64)
-    self.assertIn("__WMMA_32_32_32_half_half(", src)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
     self.assertIn("activation.hf = mxmem(%0,%1):deep", src)
     self.assertIn("weight.hf = mxmem(%2,%3)", src)
     self.assertIn("mxmem(%0,%1):after.hf = acc", src)
     self.assertIn("#ifdef HMX_REF", src)
+    # begin before the reduce loop, one load pair per K block inside it, one store after it
+    self.assertLess(kernel.index("__hmx_begin();"), kernel.index("for (int Ridx0"))
+    self.assertEqual(kernel.count("__hmx_mac("), 1)
+    self.assertGreater(kernel.index("__hmx_store()"), kernel.index("__hmx_mac("))
+    # no 2 KB tile values, no per-K accumulator round trip
+    self.assertNotIn("__WMMA_32_32_32_half_half(", kernel)
+    self.assertNotIn("__fp161024", kernel)
 
-  def test_tiles_move_as_vectors(self):
-    # a tile goes to VTCM and back as one 2 KB vector value, not per-element and not through a libc memcpy call
-    src = self.src(64, 64, 64)
+  def test_rows_packed_with_hvx(self):
+    kernel = self.src(64, 64, 64).split("__attribute__((noinline)) void", 1)[1]
+    self.assertEqual(kernel.count("__hmx_pack2("), 32)  # 16 row pairs of A + 16 of B per K block
+
+  def test_plain_tile_op(self):
+    src = self.src(64, 96, 64, acc=False)  # a shape not rendered above (to_program caches by AST)
+    self.assertIn("__WMMA_32_32_32_half_half(", src)
     self.assertIn("*(__fp161024*)(v + 1024) = a;", src)
-    self.assertIn("return *(__fp161024*)(v + 4096);", src)
     self.assertNotIn("__builtin_memcpy(v", src)
 
   def test_float_matmul_is_not_hmx(self):
