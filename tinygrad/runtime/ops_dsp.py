@@ -13,51 +13,43 @@ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-i
 from tinygrad.uop.ops import PatternMatcher, UPat
 
 HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
-# HVX ISA the DSP code is compiled for. v65 (the default) has no HVX float at all; from v68 on, float vector math is
-# qfloat (qf32), since v68/v69 HVX has no IEEE fp32 -- see HVX_QF_OPS below. The Snapdragon 8+ Gen 1 test phone is v69.
+# HVX ISA the DSP code is compiled for. v65 (the default) has no HVX float at all. From v68 on, float32 vector math is
+# qfloat (qf32): v68/v69 HVX has no IEEE fp32 (the Snapdragon 8+ Gen 1 test phone is v69), and LLVM lowers plain float
+# vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
 HVX_ARCH = getenv("HVX_ARCH", "v65")
 HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
 
 # ***** qfloat lowering (v68+) *****
-# Each float32 vector add/sub/mul is one qf32 HVX op followed by an explicit qf32->sf conversion. The empty asm stops
-# LLVM from folding that conversion into the next qfloat op: left alone, it chains qf32 x qf32 without renormalizing,
-# which is hundreds of ulp off (the NMS kernel's finding). Only vectors of whole HVX registers (multiples of 32 lanes);
-# smaller float vectors are left to LLVM. NEG is an exact sign-bit flip.
-HVX_QF_OPS = {Ops.MUL: "vmpy_qf32_sf"}
-
+# LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
+# constant): measured bit-identical to converting after every op. The case it gets badly wrong is a multiply of two
+# *computed* values: it keeps both in qf32 and emits qf32 x qf32 without renormalizing (21% worst-case relative error
+# on ((a-b)*(c-d))*((a+b)*(c+d)) on hardware, vs 4.2% renormalized). For exactly those multiplies, each operand is
+# forced to IEEE sf with an empty asm barrier (the NMS kernel's recipe) before the multiply.
 def _computed(u:UOp) -> bool:
   # a value LLVM may be holding as qf32 (an ALU result), as opposed to IEEE sf straight from memory or a constant
   while u.op in (Ops.STACK, Ops.CAST, Ops.BITCAST) and len(u.src) >= 1 and all(s is u.src[0] for s in u.src): u = u.src[0]
   return u.op in GroupOp.ALU
 
 def _qf_vec(x:UOp) -> bool:
-  return HVX_QFLOAT and x.op in HVX_QF_OPS and x.dtype == dtypes.float32 and x._shape is not None and \
+  return HVX_QFLOAT and x.op is Ops.MUL and x.dtype == dtypes.float32 and x._shape is not None and \
     (n:=x.max_numel()) >= 32 and n % 32 == 0 and all(_computed(s) for s in x.src)
 
 def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
-  used = sorted({(x.op.name, x.max_numel()) for x in uops if _qf_vec(x)})
-  if not used: return []
+  widths = sorted({x.max_numel() for x in uops if _qf_vec(x)})
+  if not widths: return []
   # everything stays in registers: wider vectors are split into / rebuilt from whole HVX registers with shufflevector
   # (going through `((__hvx_v*)&a)[i]` instead forces a stack round trip per register -- measured 10x slower)
-  out = ["typedef int __hvx_v __attribute__((vector_size(128)));",
-         "typedef float __hvx_f __attribute__((ext_vector_type(32)));",
-         "static inline __attribute__((unused)) __hvx_f __hvx_sf(__hvx_v q) { __hvx_v r = __builtin_HEXAGON_V6_vconv_sf_qf32_128B(q); "
-         "__asm__(\"\" : \"+v\"(r)); return (__hvx_f)r; }",
-         "static inline __attribute__((unused)) __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }"]
+  out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
+         "static inline __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }"]
   def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
-  for name, n in used:
+  for n in widths:
     t, k = vec_type(n), n // 32
-    parts = []
-    for i in range(k):
-      ai = "a" if k == 1 else f"__builtin_shufflevector(a, a, {lanes(32*i, 32)})"
-      bi = "b" if k == 1 else f"__builtin_shufflevector(b, b, {lanes(32*i, 32)})"
-      parts.append(f"__hvx_mulsf({ai}, {bi})")
-    # concatenate registers pairwise back up to n lanes
-    while len(parts) > 1:
+    parts = [f"__hvx_mulsf({'a' if k == 1 else f'__builtin_shufflevector(a, a, {lanes(32*i, 32)})'}, "
+             f"{'b' if k == 1 else f'__builtin_shufflevector(b, b, {lanes(32*i, 32)})'})" for i in range(k)]
+    while len(parts) > 1:  # concatenate registers pairwise back up to n lanes
       w = 32 * (k // len(parts))
       parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
-    args = f"{t} a" if name == "NEG" else f"{t} a, {t} b"
-    out.append(f"static inline {t} __hvx_{name.lower()}_f{n}({args}) {{ return ({t}){parts[0]}; }}")
+    out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){parts[0]}; }}")
   return out
 
 def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
@@ -72,7 +64,7 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
 # NOTE: this just increases readability of the generated code
 dsp_string = PatternMatcher([
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
-  (UPat(tuple(HVX_QF_OPS), dtypes.float32, name="x"), lambda ctx,x:
+  (UPat(Ops.MUL, dtypes.float32, name="x"), lambda ctx,x:
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
   # shufflevector instead of a per-lane constructor
