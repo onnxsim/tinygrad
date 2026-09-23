@@ -203,7 +203,7 @@ static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
 #   each K block             pack A, B rows into VTCM (one 128-byte halfword interleave per row pair) + one load pair
 #   after the reduce loop    __hmx_out(dst...)               (one :after.hf store, then HVX loads/shuffles into the acc array)
 # so each output tile is rounded to fp16 once (exact accumulation, like hmx_block.h) and nothing 2 KB-sized lives on the stack.
-_HMX_CA, _HMX_CB = 80, 32  # VTCM tile cache slots (2 KB each) for A and B
+_HMX_CA, _HMX_CB = 76, 40  # VTCM tile cache slots (2 KB each) for A and B (16 KB + 116 * 2 KB <= 256 KB)
 _HMX_ACC_HELPERS = r"""#pragma clang diagnostic ignored "-Wunused-function"
 typedef __fp16 __hmx_h32 __attribute__((ext_vector_type(32)));
 typedef __fp16 __hmx_h64 __attribute__((aligned(128),ext_vector_type(64)));
@@ -215,7 +215,17 @@ typedef int __hmx_vp __attribute__((vector_size(256)));
 static inline void __hmx_pack2(__fp16* dst, const __fp16* r0, const __fp16* r1) {
   for (int j = 0; j < 32; j++) { dst[2 * j] = r0[j]; dst[2 * j + 1] = r1[j]; }
 }
+/* rows r0, r1 of two horizontally adjacent tiles (64 fp16 each, 128-byte aligned) -> both tiles' row pair */
+static inline void __hmx_pack2x2(__fp16* d0, __fp16* d1, const __fp16* r0, const __fp16* r1) {
+  for (int j = 0; j < 32; j++) { d0[2*j] = r0[j]; d0[2*j+1] = r1[j]; d1[2*j] = r0[32+j]; d1[2*j+1] = r1[32+j]; }
+}
 #else
+/* one halfword vshuff of two full 128-byte rows gives the row pair of both tiles (low half: tile n, high half: n+1) */
+static inline void __hmx_pack2x2(__fp16* d0, __fp16* d1, const __fp16* r0, const __fp16* r1) {
+  __hmx_vp p = __builtin_HEXAGON_V6_vshuffvdd_128B(*(const __hmx_v*)r1, *(const __hmx_v*)r0, -2);
+  *(__hmx_v*)d0 = __builtin_HEXAGON_V6_lo_128B(p);
+  *(__hmx_v*)d1 = __builtin_HEXAGON_V6_hi_128B(p);
+}
 /* the same with HVX: an aligned 128-byte load never leaves the row's 128-byte block (rows are 64-byte aligned), vror brings
  * the row to the low half, one halfword vshuff interleaves the pair */
 static inline void __hmx_pack2(__fp16* dst, const __fp16* r0, const __fp16* r1) {
@@ -267,11 +277,11 @@ static int __hmx_t;
 /* VTCM (2 KB aligned): A stage x2 @0, B stage x2 @4 KB, out @8 KB, bias table @10 KB */
 static inline __fp16* __hmx_sa(void) { return (__fp16*)(__hmx_vtcm + 2048 * __hmx_t); }
 static inline __fp16* __hmx_sb(void) { return (__fp16*)(__hmx_vtcm + 4096 + 2048 * __hmx_t); }
-/* tile caches: A 80 slots @16 KB, B 32 slots @176 KB (the runtime gives 256 KB inside one 256 KB window) */
+/* tile caches: A slots from 16 KB, B slots after them (the runtime gives 256 KB inside one 256 KB window) */
 #define __HMX_CA @CA@
 #define __HMX_CB @CB@
 static inline __fp16* __hmx_ca(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * i); }
-static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 180224 + 2048 * i); }
+static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * (__HMX_CA + i)); }
 static inline void __hmx_begin(void) {
   static unsigned int init = 0;
   if (init != __hmx_gen) {
@@ -332,6 +342,17 @@ static inline void __hmx_prefetch_next(const __fp16* r0, const __fp16* r1) {
   if (stride < 65536u) __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + 32 * stride), (stride << 16) | (64u << 8) | 32u);
 #else
   (void)r0; (void)r1;
+#endif
+}
+/* L2-prefetch a whole K panel of a 32-column operand: rows x 64 bytes at the row stride of r0, r1 (l2fetch height <= 255) */
+static inline void __hmx_prefetch_panel(const __fp16* r0, const __fp16* r1, int rows) {
+#ifndef HMX_REF
+  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
+  if (stride >= 65536u) return;
+  for (int r = 0; r < rows; r += 240)
+    __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (64u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
+#else
+  (void)r0; (void)r1; (void)rows;
 #endif
 }
 static inline void __hmx_call_start(void) {
@@ -438,6 +459,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     for x in u.src: users.setdefault(x, []).append(u)
   written = {_hmx_param(u.src[0]) for u in uops if u.op is Ops.STORE}
   first = next((k for k,u in enumerate(uops) if u.op is Ops.WMMA), None)
+  ranges = [u for u in uops if u.op is Ops.RANGE]
   loops = _hmx_tile_loops(uops, first) if first is not None else None
   call_start = False
   span: dict[UOp, tuple] = {}
@@ -498,10 +520,19 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           # slots contiguous in K for each tile index, so one spanning load pair can read them after the loop
           deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
           if deps == {inner} and kt * ti <= n: base, cond = f"({iname})*{kt}", f"({on})==0"
+          elif deps == {outer} and 2 * kt <= n and _hmx_pairable(r, outer, ranges):
+            # adjacent outer tiles share every 128-byte row line: pack tiles n, n+1 together on even n (vshuff of full rows)
+            p0 = 0 if x == "a" else 32
+            pk = "".join(f" __hmx_pack2x2(_{x}+{64*q}, _{x}+{1024*kt+64*q}, {ptr[p0+2*q]}, {ptr[p0+2*q+1]});" for q in range(16))
+            pf = f" if (({kr})==0) __hmx_prefetch_panel({ptr[p0]}, {ptr[p0+1]}, {32*kt});"
+            return (f" _{x} = __hmx_c{x}(({on})%2*{kt}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
+                    f"({on})%2*{kt}")
           elif deps == {outer} and kt <= n: base, cond = "0", f"({iname})==0"
           elif not deps and kt <= n: base, cond = "0", f"({on})==0 && ({iname})==0"
           else: return None
-          return f" _{x} = __hmx_c{x}({base}+({kr})); if ({cond}) {{{{{pack} }}}}", base
+          p0, p1 = (ptr[0], ptr[1]) if x == "a" else (ptr[32], ptr[33])
+          pf = f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});"  # the whole K panel, on its first fill
+          return f" _{x} = __hmx_c{x}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}", base
         ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
         eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
         if ea and eb:
@@ -568,6 +599,40 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     out += after.get(i, [])
   if loops is not None and loops[2]: out = _hmx_interchange(out, loops[0], loops[1])
   return out, True
+
+_HMX_EVAL = {Ops.ADD: lambda a,b: a+b, Ops.SUB: lambda a,b: a-b, Ops.MUL: lambda a,b: a*b, Ops.SHL: lambda a,b: a<<b,
+             Ops.SHR: lambda a,b: a>>b, Ops.AND: lambda a,b: a&b, Ops.OR: lambda a,b: a|b, Ops.XOR: lambda a,b: a^b,
+             Ops.CDIV: lambda a,b: int(a/b), Ops.CMOD: lambda a,b: a-b*int(a/b), Ops.MAX: max}
+def _hmx_eval(u:UOp, env:dict):
+  # integer value of an index expression with the loops in env set, or None
+  if u.op is Ops.CONST: return u.arg
+  if u.op is Ops.RANGE: return env.get(u)
+  if u.op is Ops.CAST: return _hmx_eval(u.src[0], env)
+  if u.op in _HMX_EVAL and len(u.src) == 2:
+    a, b = _hmx_eval(u.src[0], env), _hmx_eval(u.src[1], env)
+    return None if a is None or b is None else _HMX_EVAL[u.op](a, b)
+  return None
+
+def _hmx_const_delta(f, ranges:list[UOp]):
+  # f(env) at a few sample points of the loops -> the one constant it always equals, else None
+  vals = set()
+  for smp in range(4):
+    env = {r: (smp * 7 + 3 * n) % max(1, int(r.vmax)) for n, r in enumerate(ranges)}
+    vals.add(f(env))
+  return vals.pop() if len(vals) == 1 and None not in vals else None
+
+def _hmx_pairable(rows, outer:UOp, ranges:list[UOp]) -> bool:
+  # 32-lane row loads whose row stride is a multiple of 64 elements (128 bytes) and whose next outer tile is the next 32
+  # columns: tile n (even) and n+1 then share each aligned 128-byte row line (buffers are 128-byte aligned)
+  if any(b or v.max_numel() != 32 or len(v.src[0].src) < 2 for v, b in rows): return False
+  i0, i1 = rows[0][0].src[0].src[1], rows[1][0].src[0].src[1]
+  def diff(f):
+    def g(env):
+      a, b = f(env), _hmx_eval(i0, env)
+      return None if a is None or b is None else a - b
+    return _hmx_const_delta(g, ranges)
+  stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, outer: env[outer] + 1}))
+  return stride is not None and stride % 64 == 0 and nxt == 32
 
 def _hmx_uses(x:UOp, r:UOp) -> bool:
   # does x's value depend on loop r (data dependence only: a RANGE's own srcs just order it after its enclosing ranges)
