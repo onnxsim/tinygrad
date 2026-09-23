@@ -3,7 +3,7 @@ import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, s
 assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.uop.ops import Ops, UOp, GroupOp
+from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
 from tinygrad.codegen.opt import tc
@@ -235,7 +235,7 @@ static double __hmx_racc[1024];
 static int __hmx_t;
 static inline __fp16* __hmx_sa(void) { return __hmx_ra[__hmx_t]; }
 static inline __fp16* __hmx_sb(void) { return __hmx_rb[__hmx_t]; }
-#define __HMX_CA 64
+#define __HMX_CA 80
 #define __HMX_CB 32
 static __fp16 __hmx_rca[__HMX_CA][1024] __attribute__((aligned(128))), __hmx_rcb[__HMX_CB][1024] __attribute__((aligned(128)));
 static inline __fp16* __hmx_ca(int i) { return __hmx_rca[i]; }
@@ -262,11 +262,11 @@ static int __hmx_t;
 /* VTCM (2 KB aligned): A stage x2 @0, B stage x2 @4 KB, out @8 KB, bias table @10 KB */
 static inline __fp16* __hmx_sa(void) { return (__fp16*)(__hmx_vtcm + 2048 * __hmx_t); }
 static inline __fp16* __hmx_sb(void) { return (__fp16*)(__hmx_vtcm + 4096 + 2048 * __hmx_t); }
-/* tile caches: A 64 slots @16 KB, B 32 slots @144 KB (the runtime gives >= 208 KB inside one 256 KB window) */
-#define __HMX_CA 64
+/* tile caches: A 80 slots @16 KB, B 32 slots @176 KB (the runtime gives 256 KB inside one 256 KB window) */
+#define __HMX_CA 80
 #define __HMX_CB 32
 static inline __fp16* __hmx_ca(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * i); }
-static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 147456 + 2048 * i); }
+static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 180224 + 2048 * i); }
 static inline void __hmx_begin(void) {
   static unsigned int init = 0;
   if (init != __hmx_gen) {
@@ -303,10 +303,14 @@ static inline void __hmx_call_start(void) {
   for (int i = 0; i < __HMX_CB; i++) __hmx_tag_b[i] = 0;
 }
 /* returns the cached tile for key k, or 0 after claiming its slot (*slot = where to pack) */
-static inline __fp16* __hmx_lookup(const void** tags, int n, __fp16* (*at)(int), const void* k, __fp16** slot) {
-  int i = (int)(((unsigned)k >> 6) % (unsigned)n);
-  if (tags[i] == k) return at(i);
-  tags[i] = k; *slot = at(i); return 0;
+static inline __fp16* __hmx_lookup(const void** tags, int n, __fp16* (*at)(int), const void* key, int k, int ktiles, __fp16** slot) {
+  /* ways = n / ktiles slots per K block (set-associative on the K index), round-robin replacement */
+  static unsigned char rr[256];
+  int ways = n / ktiles; if (ways < 1) ways = 1;
+  int set = k % (n / ways), base = set * ways;
+  for (int w = 0; w < ways; w++) if (tags[base + w] == key) return at(base + w);
+  int v = base + (rr[set & 255]++ % ways);
+  tags[v] = key; *slot = at(v); return 0;
 }"""
 
 def _hmx_lane(u:UOp):
@@ -389,8 +393,12 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       srcs = tuple(v.src[0] for v in vals)
       # operands the kernel never writes are memoized in VTCM by their first row pointer (A repeats across the N tiles)
       ro = [all(_hmx_param(v.src[0]) not in written for v, _ in r) for r in (ra, rb)]
-      if ro[0]: pa = f" __fp16* _c = __hmx_lookup(__hmx_tag_a, __HMX_CA, __hmx_ca, {ptr[0]}, &_s); if (_c) _a = _c; else {{{{ _a = _s;{pa} }}}}"
-      if ro[1]: pb = f" __fp16* _d = __hmx_lookup(__hmx_tag_b, __HMX_CB, __hmx_cb, {ptr[32]}, &_s); if (_d) _b = _d; else {{{{ _b = _s;{pb} }}}}"
+      kr, kt = f"{{{len(srcs)}}}", int(e.src[1].vmax) + 1  # the reduce loop's variable and trip count
+      def cached(tag, n, at, key, dst, pack): return (f" __fp16* _c{dst} = __hmx_lookup({tag}, {n}, {at}, {key}, {kr}, {kt}, &_s);"
+                                                    f" if (_c{dst}) _{dst} = _c{dst}; else {{{{ _{dst} = _s;{pack} }}}}")
+      if ro[0]: pa = cached("__hmx_tag_a", "__HMX_CA", "__hmx_ca", ptr[0], "a", pa)
+      if ro[1]: pb = cached("__hmx_tag_b", "__HMX_CB", "__hmx_cb", ptr[32], "b", pb)
+      if any(ro): srcs = srcs + (e.src[1],)
       if any(ro): call_start = True
       # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs
       pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
@@ -424,7 +432,29 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if u in replace: out.append(replace[u])
     elif u not in drop: out.append(u)
     out += after.get(i, [])
-  return out, True
+  return _hmx_interchange(out), True
+
+def _hmx_interchange(uops:list[UOp]) -> list[UOp]:
+  # the output-tile loops are independent: put the one with more iterations outermost, so the operand indexed by the
+  # (now inner, shorter) loop stays in the VTCM tile cache and the other operand's K panel is reused across it
+  if not getenv("HMX_INTERCHANGE", 1): return uops
+  pos = {u:i for i,u in enumerate(uops)}
+  end_of = {e.src[1]: e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE}
+  mac = next((i for i,u in enumerate(uops) if u.op is Ops.CUSTOM and "__hmx_mac(" in u.arg), None)
+  if mac is None: return uops
+  open_: list[UOp] = []
+  for u in uops[:mac]:
+    if u.op is Ops.RANGE: open_.append(u)
+    elif u.op is Ops.END and len(u.src) > 1 and u.src[1] in open_: open_.remove(u.src[1])
+  loops = [r for r in open_ if r in end_of and r.arg[-1] != AxisType.REDUCE] if open_ else []
+  if len(loops) < 2: return uops
+  o, i = loops[-2], loops[-1]
+  if o.vmax >= i.vmax: return uops
+  eo, ei = end_of[o], end_of[i]
+  mid = uops[pos[o]+1:pos[i]]
+  between_ends = [u for u in uops[pos[ei]+1:pos[eo]] if u.op not in (Ops.GROUP, Ops.NOOP)]
+  if between_ends or any(i in x.toposort() for x in mid): return uops
+  return uops[:pos[o]] + [i, o] + mid + uops[pos[i]+1:]
 
 class DSPRenderer(ClangRenderer):
   has_threads = False
