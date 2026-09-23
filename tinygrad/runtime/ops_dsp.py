@@ -358,7 +358,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     for k, so in enumerate(stores):
       lanes = [l[1] for x in so.src[1].src if (l:=_hmx_lane(x)) is not None]
       if len(lanes) == 128 and all(0 <= l < 1024 for l in lanes) and len({l//128 for l in lanes}) <= 2:
-        blks = sorted({l//128 for l in lanes}); b0, b1 = blks[0], blks[-1]
+        blks = sorted({l//128 for l in lanes})
+        b0, b1 = blks[0], blks[-1]
         idx = ",".join(str(l - b0*128 if l//128 == b0 else 128 + l - b1*128) for l in lanes)
         outs.append(f" *(__hmx_h128*){{{k}}} = __builtin_shufflevector(_o[{b0}], _o[{b1}], {idx});")
       else:
