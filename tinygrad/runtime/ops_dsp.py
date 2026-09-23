@@ -5,7 +5,7 @@ from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, 
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
-from tinygrad.renderer.cstyle import ClangRenderer, wmma_args
+from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
 from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
 if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-import
@@ -162,16 +162,30 @@ class DSPRenderer(ClangRenderer):
   # recognize single-thread/vector-native tensor cores as a distinct case -- out of scope here.
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
     prefix = list(prefix or [])
+    b_dtypes = {_wmma_name(u): u.src[1].dtype for u in uops if u.op is Ops.WMMA}
     for name, _, dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
+      dtype_b = b_dtypes[name]
       dstr_a, dstr_b, dstr_c = (self._render_dtype(dt, sz, AddrSpace.REG) for dt, sz in
-                                 zip([dtype_in, dtype_in, dtype_out], upcast_sizes))
-      builtin = "__builtin_HEXAGON_V6_vrmpyub_acc_128B" if dtype_in == dtypes.uint8 else "__builtin_HEXAGON_V6_vrmpybusv_acc_128B"
+                                 zip([dtype_in, dtype_b, dtype_out], upcast_sizes))
+      # u8 x u8: Vx.uw += vrmpy(Vu.ub, Rt.ub) takes A as a scalar. The signed forms have no scalar-A variant with B in the
+      # vector, so A (4 bytes) is splat: u8 x s8 = Vx.w += vrmpy(Vu.ub, Vv.b) (vrmpybusv), s8 x s8 = vrmpy(Vu.b, Vv.b) (vrmpybv).
+      if dtype_in == dtypes.uint8 and dtype_b == dtypes.uint8: call = "__builtin_HEXAGON_V6_vrmpyub_acc_128B(c, b, a_scalar)"
+      else:
+        vv = "__builtin_HEXAGON_V6_vrmpybusv_acc_128B" if dtype_in == dtypes.uint8 else "__builtin_HEXAGON_V6_vrmpybv_acc_128B"
+        call = f"{vv}(c, __builtin_HEXAGON_V6_lvsplatw_128B(a_scalar), b)"
       prefix.append(f"""static inline {dstr_c} __{name}({dstr_a} a, {dstr_b} b, {dstr_c} c) {{
   unsigned int a_scalar; __builtin_memcpy(&a_scalar, &a, 4);
-  return {builtin}(c, b, a_scalar);
+  return {call};
 }}""")
     prefix += _qf_helpers(uops, lambda n: self._render_dtype(dtypes.float32, n, AddrSpace.REG))
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
+  # whose ext_vector_types assume natural alignment up to one 128-byte HVX register
+  def render_buffer(self, x:UOp):
+    ret = super().render_buffer(x)
+    if x.addrspace != AddrSpace.REG or x.max_numel() == 1 or "aligned(128)" in ret: return ret
+    return ret[:-1] + " __attribute__((aligned(128)));"
 
   def _render_defines(self, uops) -> list[str]:
     return ['''/* DSP boilerplate */ struct dcvs_v2_req { int type; int _pad; _Bool dcvs_enable; char dcvs_option; _Bool set_latency; int latency;

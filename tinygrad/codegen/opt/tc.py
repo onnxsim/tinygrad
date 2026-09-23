@@ -14,6 +14,9 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   # (local_swizzle, upcast_swizzle, reduce_swizzle)
   # l<num> is the num axis of the locals, similar for u<num> and upcasts, r<num> and reduces
   swizzle: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]]
+  dtype_in_b: DType|None = None # dtype for B when it differs from A's (e.g. Hexagon's u8 x s8 vrmpybusv); None means dtype_in
+  @property
+  def dtype_b(self) -> DType: return self.dtype_in if self.dtype_in_b is None else self.dtype_in_b
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def _remaps(self) -> list[dict[str, str]]:
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
@@ -37,7 +40,8 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   def base_upcast_axes(self):
     # this is defined in the swizzle. first we use the upcast axes, then the reduce
     return ([f"r{i}" for i in range(len(self.get_reduce_axes()))] + [f"u{i}" for i in range(len(self.get_upcast_axes()))])[::-1]
-  def __str__(self): return "_".join(["WMMA"] + list(map(str, self.dims)) + [self.dtype_in.name, self.dtype_out.name])
+  def __str__(self): return "_".join(["WMMA"] + list(map(str, self.dims)) + [self.dtype_in.name] +
+                                     ([self.dtype_in_b.name] if self.dtype_in_b is not None else []) + [self.dtype_out.name])
   def __post_init__(self):
     # all axes have size 2, <local> <reduce> <upcast> is the order
     local_axes, upcast_axes, reduce_axes = len(self.get_local_axes()), len(self.get_upcast_axes()), len(self.get_reduce_axes())
@@ -190,8 +194,10 @@ metal = [TensorCore(dims=(8,8,8), threads=32, elements_per_thread=(2,2,2), dtype
 # local_axes=0 (2**0 threads), so all 5 axis-doubling opts needed for N=32=2**5 are upcast ("u0") opts,
 # and M=1 needs none. elements_per_thread=(4,128,32): A is the full K=4 reduction (M contributes nothing
 # since M=1), B is all 5 upcast bits x the K=4 reduction (32*4=128), C is all 5 upcast bits (32).
+# The (uint8, int8) entry is vrmpybusv: A (u8x4) is splat into a vector, B is s8 -- a W8A8 GEMV/GEMM with uint8 activations
+# and int8 weights. M=1 (dims[1]) also lets the TC match a GEMV, whose A side (one activation row) has no range of its own.
 hexagon_v65 = [TensorCore(dims=(32,1,4), threads=1, elements_per_thread=(4,128,32), dtype_in=di, dtype_out=dtypes.int32,
   opts=("u0","u0","u0","u0","u0"),
   swizzle=(((), ('u0','u1','u2','u3','u4'), ('r0','r1')),
-           ((), ('u0','u1','u2','u3','u4'), ('r0','r1'))))
-  for di in [dtypes.uint8, dtypes.int8]]
+           ((), ('u0','u1','u2','u3','u4'), ('r0','r1'))),
+  dtype_in_b=db) for di,db in [(dtypes.uint8, None), (dtypes.int8, None), (dtypes.uint8, dtypes.int8)]]
