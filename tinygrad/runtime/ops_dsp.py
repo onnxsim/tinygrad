@@ -13,6 +13,7 @@ if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-i
 from tinygrad.uop.ops import PatternMatcher, UPat
 
 HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
+HVX_PREFETCH_HALF = getenv("HVX_PREFETCH_HALF", 128)
 # HVX ISA the DSP code is compiled for. v65 (the default) has no HVX float at all. From v68 on, float32 vector math is
 # qfloat (qf32): v68/v69 HVX has no IEEE fp32 (the Snapdragon 8+ Gen 1 test phone is v69), and LLVM lowers plain float
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
@@ -129,6 +130,34 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   return v, lanes
 
 # NOTE: this just increases readability of the generated code
+def _lane_window(ctx, x:UOp) -> str|None:
+  # a window of a loaded vector (an HMX epilogue's 32-lane rows of the 128-lane accumulator-array vectors): read it again from
+  # memory. As a __builtin_shufflevector at a lane offset that isn't a register boundary, clang v19 builds it lane by lane
+  # (vinsert, ~6x the packets); a vector load of the window is one vmem(u). Only if nothing stores to that buffer in between
+  if (sl:=_lane_slice(x)) is None or not _loaded_unchanged(ctx, v:=sl[0], x): return None
+  return f"(*(({ctx.render_type(x)}*)(({ctx.render_dtype(x.src[0].dtype)}*){ctx[v.src[0]]}+{sl[1][0]})))"
+
+def _inline_vector_load(ctx, u:UOp) -> bool:
+  # a vector load used once, later in the same loop body, with no store to its buffer in between: render it at the use. Loads
+  # come out of the linearizer early (an HMX epilogue loads all 32 residual rows before the first store), and clang then
+  # keeps them all live -- 32 x 64 bytes against 32 HVX registers -- and spills them, rebuilding each lane by lane (vinsert)
+  if u.max_numel() == 1 or len(users:=getattr(ctx, "_users", {}).get(u, [])) != 1: return False
+  x, pos = users[0], ctx._pos
+  return x in pos and not any(pos[u] < i < pos[x] for i in ctx._scopes) and _loaded_unchanged(ctx, u, x)
+
+def _loaded_unchanged(ctx, v:UOp, x:UOp) -> bool:
+  # v is a plain load and nothing stores to its buffer between v and its use x (so the memory can be read again at x)
+  pos, stores = getattr(ctx, "_pos", {}), getattr(ctx, "_stores", [])
+  if v.op is not Ops.LOAD or len(v.src) != 1 or v not in pos or x not in pos: return False
+  return not any(pos[v] < i < pos[x] and p is _hmx_param(v.src[0]) for i, p in stores)
+
+def _splat_of_loaded_lane(ctx, x:UOp) -> str|None:
+  if len(x.src) < 2 or any(s is not x.src[0] for s in x.src): return None
+  s = x.src[0]
+  if s.op is not Ops.INDEX or len(s.src) != 2 or s._shape != () or (lane:=_lane(s.src[1])) is None: return None
+  if not _loaded_unchanged(ctx, v:=s.src[0], x): return None
+  return f"(({ctx.render_type(x)})((({ctx.render_dtype(s.dtype)}*){ctx[v.src[0]]})[{lane}]))"
+
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
@@ -140,9 +169,13 @@ dsp_string = PatternMatcher([
   (UPat(Ops.MUL, dtypes.float32, name="x"), lambda ctx,x:
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
-  # shufflevector instead of a per-lane constructor
+  # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
+  # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
+  # vector load): reload that element as a scalar (then one vsplat) -- the lane splat clang v19 builds with vinserts
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _splat_of_loaded_lane(ctx, x)),
   # a STACK of one repeated scalar is a splat, which clang lowers to a single HVX vsplat
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})({ctx[x.src[0]]}))"
    if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
@@ -152,11 +185,16 @@ dsp_string = PatternMatcher([
   # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a
   # non-faulting hint, so prefetching past the end of a buffer is harmless. One dcfetch per 128-byte line the load covers
   # (a 128-lane int32 load is four HVX registers / lines); sub-line loads are skipped, a dcfetch per 32-byte load costs more
-  # than it hides. HVX_PREFETCH is the distance in bytes (0 = off).
+  # than it hides. HVX_PREFETCH is the distance in bytes (0 = off). A half-line (64-byte) load gets one dcfetch of the next
+  # line instead (HVX_PREFETCH_HALF): an HMX epilogue reads its 32 rows of 64 bytes at the row stride, each a DDR miss, and the
+  # tile after next reads that next line
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH+o}), "
                  for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
    if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL else None),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
+   f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
+   if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
 ])
 
 # ***** HVX re-vectorization *****
@@ -410,6 +448,9 @@ static inline __fp16* __hmx_store(void) {
 static inline void __hmx_out2(__fp16* d0, __fp16* d1, const __fp16* o) {
   for (int j = 0; j < 32; j++) { d0[j] = o[2 * j]; d1[j] = o[2 * j + 1]; }
 }
+static inline void __hmx_deal2(__fp16* d, const __fp16* o) {
+  for (int q = 0; q < 2; q++) __hmx_out2(d + 64 * q, d + 64 * q + 32, o + 64 * q);
+}
 #else
 static inline void __hmx_store64(__fp16* d, __hmx_v v) {  /* v's low 64 bytes -> d (64-byte aligned): byte-predicated vmem store
                                                              (no read of the destination block; the clang predicate builtins
@@ -426,6 +467,13 @@ static inline void __hmx_out2(__fp16* d0, __fp16* d1, const __fp16* o) {
   __hmx_v v = __builtin_HEXAGON_V6_vdealh_128B(*(const __hmx_v*)o);  /* even halfwords (row 2q) low, odd (row 2q+1) high */
   __hmx_store64(d0, v);
   __hmx_store64(d1, __builtin_HEXAGON_V6_vror_128B(v, 64));
+}
+/* output row pairs q, q+1 -> rows 2q..2q+3 in order into a 256-byte accumulator-array vector: one vdealh per register (as
+ * a __builtin_shufflevector clang doesn't find that and builds it lane by lane through the stack). The stores are asm: as C
+ * stores clang forwards the registers into the epilogue's 32-lane row loads and assembles every row lane by lane (vinsert) */
+static inline void __hmx_deal2(__fp16* d, const __fp16* o) {
+  __asm__ volatile("vmem(%0+#0) = %1" :: "r"(d), "v"(__builtin_HEXAGON_V6_vdealh_128B(((const __hmx_v*)o)[0])) : "memory");
+  __asm__ volatile("vmem(%0+#0) = %1" :: "r"(d + 64), "v"(__builtin_HEXAGON_V6_vdealh_128B(((const __hmx_v*)o)[1])) : "memory");
 }
 #endif
 /* packed tiles of read-only operands are memoized by their first row pointer (same pointer = same tile within one
@@ -705,6 +753,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       if len(lanes) == 128 and all(0 <= l < 1024 for l in lanes) and len({l//128 for l in lanes}) <= 2:
         blks = sorted({l//128 for l in lanes})
         b0, b1 = blks[0], blks[-1]
+        if lanes == [b0*128 + 64*q + 2*j + i for q in range(2) for i in range(2) for j in range(32)]:
+          # four consecutive rows, in order (the accumulator array is row-major): one vdealh per HVX register
+          outs.append(f" __hmx_deal2((__fp16*){{{k}}}, _p+{b0*128});")
+          continue
         idx = ",".join(str(l - b0*128 if l//128 == b0 else 128 + l - b1*128) for l in lanes)
         outs.append(f" *(__hmx_h128*){{{k}}} = __builtin_shufflevector(_o[{b0}], _o[{b1}], {idx});")
       else:  # a vector as wide as the store (a single-K-tile op stores straight to the output, 32 lanes per row)
@@ -809,6 +861,7 @@ def _hmx_interchange(uops:list[UOp], o:UOp, i:UOp) -> list[UOp]:
 
 class DSPRenderer(ClangRenderer):
   has_threads = False
+  def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
   buffer_suffix = " restrict __attribute__((align_value(128)))"
   kernel_typedef = "__attribute__((noinline)) void"
   string_rewrite = dsp_string+ClangRenderer.string_rewrite
@@ -841,6 +894,13 @@ class DSPRenderer(ClangRenderer):
   def render(self, uops:list[UOp]) -> str:
     self._hmx_acc = False
     if self.hmx_acc: uops, self._hmx_acc = _hmx_acc_rewrite(uops)
+    # _lane_window: uop positions and (position, buffer) of every store
+    self._pos = {u:i for i,u in enumerate(uops)}
+    self._stores = [(i, _hmx_param(u.src[0])) for i,u in enumerate(uops) if u.op is Ops.STORE]
+    self._users: dict[UOp, list[UOp]] = {}
+    for u in uops:
+      for s in u.src: self._users.setdefault(s, []).append(u)
+    self._scopes = [i for i,u in enumerate(uops) if u.op in (Ops.RANGE, Ops.END, Ops.IF, Ops.ENDIF)]
     return self.render_kernel(*self._render(uops), uops)
 
   # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32

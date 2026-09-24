@@ -40,7 +40,7 @@ class TestDSPRender(unittest.TestCase):
 
   def test_int_add_is_one_vector_op(self):
     src = dsp_source(Tensor.empty(4096, dtype=dtypes.int32) + Tensor.empty(4096, dtype=dtypes.int32))
-    self.assertIn("(val0+val1)", src)
+    self.assertRegex(src, r"\*\(\(int128\*\)\(\(data1_4096\+alu0\)\)\)\)\+\(")  # one int128 + int128 (loads rendered inline)
     self.assertNotIn("val0[1]", src)  # no per-lane constructor
 
 class TestDSPQfloat(unittest.TestCase):
@@ -174,6 +174,20 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("_b = __hmx_ca(32+(Lidx2)*32+(Ridx0))", kernel)  # after A (18 slots, rounded to 32), 32 per panel
     self.assertNotIn("__hmx_lookup(", kernel)
     self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+
+  def test_epilogue_single_m_tile(self):
+    # an epilogue (bias + residual) on an HMX output with a single M tile: the accumulator array follows the output's memory
+    # order (expanded axes sorted by store stride, not toposort -- that came out column-major, every element a lane gather),
+    # its vectors are one vdealh per register, rows are read back as 32-lane loads and the bias as a scalar reload + splat
+    a, b = Tensor.empty(32, 224, dtype=dtypes.half), Tensor.empty(224, 512, dtype=dtypes.half)
+    bias, res = Tensor.empty(32, 1, dtype=dtypes.half), Tensor.empty(32, 512, dtype=dtypes.half)
+    src = dsp_source(a.matmul(b, dtype=dtypes.half) + bias + res, tc.hexagon_hmx + tc.hexagon_v65)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
+    self.assertEqual(kernel.count("__hmx_deal2("), 8)
+    self.assertNotIn("_p[1]", kernel)  # no per-lane accumulator gather
+    self.assertIn("(*((__fp1632*)((__fp16*)(buf0+", kernel)
+    self.assertNotIn("__builtin_shufflevector(val", kernel)
+    self.assertRegex(kernel, r"\(\(__fp1632\)\(\(\(__fp16\*\)\(data\d+_32\+?[^)]*\)\)\[\d+\]\)\)")
 
   def test_plain_tile_op(self):
     src = self.src(64, 96, 64, acc=False)  # a shape not rendered above (to_program caches by AST)

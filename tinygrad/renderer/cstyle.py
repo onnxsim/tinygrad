@@ -196,6 +196,8 @@ class CStyleLanguage(Renderer):
     return self._render_dtype(dt, 1, AddrSpace.REG)
 
   def __getitem__(self, key): return self.r[key]  # hacky helper
+  # a single-use LOAD from memory rendered at its use instead of as a variable (a backend that knows it's safe: see DSP)
+  def inline_load(self, u:UOp) -> bool: return False
   def _render(self, uops:list[UOp]) -> tuple[str, list[str], list[tuple[str,tuple[UOp,bool]]]]:
     r: dict[UOp, str] = {}
     self.r = r
@@ -238,6 +240,7 @@ class CStyleLanguage(Renderer):
       if (u.op is not Ops.CAST or u.max_numel() == 1) and ((u.op is Ops.CAST and u.src[0].op is Ops.CONST) or \
         u.op in {Ops.INDEX, Ops.SHRINK, Ops.CUSTOMI} or \
         (u.op is Ops.LOAD and u.src[0].addrspace == AddrSpace.REG and child_count[u] == 1) or \
+        (u.op is Ops.LOAD and child_count[u] == 1 and self.inline_load(u)) or \
         (u.op in {Ops.CAST, Ops.BITCAST} and u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL)) or \
         (u.op in {Ops.STACK, *(GroupOp.ALU-{Ops.WHERE}), Ops.CAST, Ops.BITCAST} and child_count[u] == 1 and not getenv("EXPAND_SSA"))):
         r[u] = l

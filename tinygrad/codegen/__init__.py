@@ -39,12 +39,32 @@ pm_number_params = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), do_number_param),
 ])
 
-def build_range_map(sink:UOp) -> dict[int, int]:
-  ctx: dict[int, int] = {}
-  for x in sink.toposort():
-    if x.op is Ops.RANGE and x.arg[1] in {AxisType.UNROLL, AxisType.UPCAST}:
-      ctx[x.arg[0]] = len(ctx)
-  return ctx
+def build_range_map(sink:UOp, store_order:bool=False) -> dict[int, int]:
+  rngs = [x for x in sink.toposort() if x.op is Ops.RANGE and x.arg[1] in {AxisType.UNROLL, AxisType.UPCAST}]
+  if store_order and (ordered:=_store_stride_order(sink, rngs)) is not None: rngs = ordered
+  return {x.arg[0]:i for i,x in enumerate(rngs)}
+
+def _store_stride_order(sink:UOp, rngs:list[UOp]) -> list[UOp]|None:
+  # the expanded axes ordered by their stride in the (single) global store, largest first, so vector lanes -- and a tensor
+  # core's register accumulator -- follow the output's memory order. Toposort order depends on how the index expression
+  # happens to be built: for an HMX tile with a single M tile, or a permuted output, it put the N axes before M and the
+  # accumulator came out column-major (every epilogue element a scalar lane gather). None (keep toposort) unless every
+  # axis has a constant stride
+  stores = [x for x in sink.toposort() if x.op is Ops.STORE and x.src[0].op is Ops.INDEX and len(x.src[0].src) >= 2]
+  if len(stores) != 1 or not any(x.op is Ops.WMMA for x in sink.toposort()): return None
+  idx = stores[0].src[0].src[1]
+  zero = {r:r.const_like(0) for r in idx.toposort() if r.op is Ops.RANGE}
+  base = idx.substitute(zero).simplify()
+  strides = {}
+  for r in rngs:
+    if r not in zero:
+      strides[r] = 0
+      continue
+    d = (idx.substitute({**zero, r:r.const_like(1)}).simplify() - base).simplify()
+    if d.op is not Ops.CONST: return None
+    strides[r] = d.arg
+  pos = {r:i for i,r in enumerate(rngs)}
+  return sorted(rngs, key=lambda r: (-strides[r], pos[r]))
 
 def expand_reduce(r:UOp):
   range_srcs = []
@@ -319,7 +339,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_reduce_unparented, name="postopt symbolic")
 
   # expand
-  sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink), name="expander")
+  sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink, ren.target.device == "DSP"), name="expander")
 
   # remove reduce
   sink = graph_rewrite(sink, mop_cleanup+pm_reduce_local, ctx=ReduceContext(), name="remove reduces")
