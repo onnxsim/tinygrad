@@ -38,6 +38,12 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((a.float() * b.float()).sum(axis=0))
     self.assertIn("float128", src)
 
+  def test_strided_reduce_prefetches_rows_ahead(self):
+    # a reduction down the rows of a row-major (512, 1024) half matrix: the load moves 2 KB per reduce step, so it prefetches
+    # HVX_PREFETCH_STRIDES (4) rows ahead, not HVX_PREFETCH bytes (one row)
+    src = dsp_source(Tensor.empty(512, 1024, dtype=dtypes.half).float().sum(0))
+    self.assertIn("+8192)", src)
+
   def test_int_add_is_one_vector_op(self):
     src = dsp_source(Tensor.empty(4096, dtype=dtypes.int32) + Tensor.empty(4096, dtype=dtypes.int32))
     self.assertRegex(src, r"\*\(\(int128\*\)\(\(data1_4096\+alu0\)\)\)\)\+\(")  # one int128 + int128 (loads rendered inline)
@@ -83,6 +89,11 @@ class TestDSPQfMath(unittest.TestCase):
     self.assertIn("__TG_EXP2(", src)
     self.assertIn("__tg_exp2_v(", src)  # a whole-HVX-register width is used
     self.assertIn("0x4B400000", src)    # magic-number rounding, no float->int conversion
+
+  def test_sqrt_is_a_vector_helper(self):
+    src = dsp_source(Tensor.empty(4096).sqrt())
+    self.assertIn("__TG_SQRT(", src)
+    self.assertIn("0x5F3759DF", src)
 
   def test_half_exp_is_an_hf_helper(self):
     # a half exp (float EXP2 cast back to half) at a 64-lane multiple: the hf helper, 64 lanes per register

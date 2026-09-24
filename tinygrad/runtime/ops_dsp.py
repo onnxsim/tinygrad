@@ -14,6 +14,10 @@ from tinygrad.uop.ops import PatternMatcher, UPat
 
 HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
 HVX_PREFETCH_HALF = getenv("HVX_PREFETCH_HALF", 128)
+# a load whose address moves by more than 256 bytes per iteration of its innermost loop (a reduction down the rows of a
+# row-major matrix) prefetches HVX_PREFETCH_STRIDES iterations ahead instead of HVX_PREFETCH bytes (one iteration, for
+# a 2 KB row): the MCC LayerNorm statistics read 1 MB at ~1.2 GB/s
+HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 # HVX ISA the DSP code is compiled for. v65 (the default) has no HVX float at all. From v68 on, float32 vector math is
 # qfloat (qf32): v68/v69 HVX has no IEEE fp32 (the Snapdragon 8+ Gen 1 test phone is v69), and LLVM lowers plain float
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
@@ -81,7 +85,7 @@ def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
 def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
   if not QF_MATH: return []
   uses = {(Ops.RECIPROCAL if u.op is Ops.FDIV else u.op, u.max_numel()) for u in uops
-          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV) and u.dtype == dtypes.float32 or _hf_div(u)}
+          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT) and u.dtype == dtypes.float32 or _hf_div(u)}
   if not uses: return []
   poly = "".join(f" p = __hvx_mulsf(p, f) + {c}f;" for c in _QF_EXP2_C[1:])
   out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
@@ -103,9 +107,16 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
          " int b; __builtin_memcpy(&b, &p, 4); b += n << 23; __builtin_memcpy(&p, &b, 4); return p; }",
          "static inline float __tg_recip_s(float x) {"
          " int b; __builtin_memcpy(&b, &x, 4); b = 0x7EF311C7 - b; float y; __builtin_memcpy(&y, &b, 4);"
-         " for (int k = 0; k < 3; k++) y = y * (2.0f - x * y); return y; }"]
+         " for (int k = 0; k < 3; k++) y = y * (2.0f - x * y); return y; }",
+         # sqrt(x) = x / sqrt(x): the rsqrt bit estimate + 3 Newton steps (0 -> 0; tinygrad decomposes SQRT into a scalar loop)
+         "static inline __hvx_f __tg_sqrt_v(__hvx_f x) {"
+         " __hvx_f y = __builtin_bit_cast(__hvx_f, 0x5F3759DF - (__builtin_bit_cast(__hvx_i, x) >> 1)), h = __hvx_mulsf(x, (__hvx_f)(0.5f));"
+         " for (int k = 0; k < 3; k++) y = __hvx_mulsf(y, 1.5f - __hvx_mulsf(h, __hvx_mulsf(y, y))); return __hvx_mulsf(x, y); }",
+         "static inline float __tg_sqrt_s(float x) {"
+         " int b; __builtin_memcpy(&b, &x, 4); b = 0x5F3759DF - (b >> 1); float y; __builtin_memcpy(&y, &b, 4);"
+         " for (int k = 0; k < 3; k++) y = y * (1.5f - 0.5f * x * y * y); return x * y; }"]
   def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
-  for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL)):
+  for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL), ("sqrt", Ops.SQRT)):
     widths = sorted({n for o, n in uses if o is op})
     if not widths: continue
     assoc = []
@@ -228,6 +239,18 @@ def _splat_of_loaded_lane(ctx, x:UOp) -> str|None:
   if not _loaded_unchanged(ctx, v:=s.src[0], x): return None
   return f"(({ctx.render_type(x)})((({ctx.render_dtype(s.dtype)}*){ctx[v.src[0]]})[{lane}]))"
 
+def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
+  if HVX_PREFETCH_STRIDES <= 0 or len(bidx.src) < 2 or not (pos:=getattr(ctx, "_pos", None)): return HVX_PREFETCH
+  idx = bidx.src[1]
+  rngs = [r for r in idx.toposort() if r.op is Ops.RANGE and r in pos]
+  if not rngs: return HVX_PREFETCH
+  inner = max(rngs, key=lambda r: pos[r])
+  zero = {r:r.const_like(0) for r in rngs}
+  d = (idx.substitute({**zero, inner:inner.const_like(1)}).simplify() - idx.substitute(zero).simplify()).simplify()
+  if d.op is not Ops.CONST: return HVX_PREFETCH
+  step = int(d.arg) * itemsize
+  return HVX_PREFETCH_STRIDES * step if step > 256 else HVX_PREFETCH
+
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
@@ -261,7 +284,7 @@ dsp_string = PatternMatcher([
   # line instead (HVX_PREFETCH_HALF): an HMX epilogue reads its 32 rows of 64 bytes at the row stride, each a DDR miss, and the
   # tile after next reads that next line
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
-   "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH+o}), "
+   "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{_prefetch_distance(ctx, bidx, x.dtype.itemsize)+o}), "
                  for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
    if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
@@ -279,7 +302,7 @@ dsp_string = PatternMatcher([
 HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
 # with qfloat (v68+) EXP2 / RECIPROCAL / float FDIV are rendered as vector helpers (_qf_math_helpers) instead of being
 # decomposed, so they re-vectorize too (added while QF_MATH is on, see _vec_ops)
-_QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV}
+_QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT}
 
 def _vec_ops() -> set: return HVX_VEC_OPS | _QF_VEC_OPS if QF_MATH else HVX_VEC_OPS
 
@@ -949,9 +972,10 @@ class DSPRenderer(ClangRenderer):
   # divide (LLVM scalarizes a vector one), and a lane stack whose top op is a division would keep the whole expression, EXP2s
   # included, scalar
   qf_code_for_op = {Ops.EXP2: lambda x,dtype: f"__TG_EXP2({x})", Ops.RECIPROCAL: lambda x,dtype: f"__TG_RECIP({x})",
+                    Ops.SQRT: lambda x,dtype: f"__TG_SQRT({x})",
                     Ops.FDIV: lambda a,b,dtype: f"({a}*__TG_RECIP({b}))" if dtype == dtypes.float32 else f"({a}/{b})"}
   extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
-  qf_matcher = PatternMatcher([(UPat((Ops.EXP2, Ops.RECIPROCAL), name="x"), _qf_math_half)])
+  qf_matcher = PatternMatcher([(UPat((Ops.EXP2, Ops.RECIPROCAL, Ops.SQRT), name="x"), _qf_math_half)])
 
   def __init__(self, target:Target):
     self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), _dsp_tcs()
