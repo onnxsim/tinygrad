@@ -109,8 +109,9 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
       else:  # other widths: per lane (scalar helper)
         out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ {t} y; for (int i = 0; i < {n}; i++) y[i] = __tg_{name}_s(x[i]); return y; }}")
       assoc.append(f"{t}: __tg_{name}_f{n}")
-    # the renderer only knows the scalar dtype; the C type picks the width (a function designator, then the call)
-    out.append(f"#define __TG_{name.upper()}(x) _Generic((x), {', '.join(assoc)})(x)")
+    # the renderer only knows the scalar dtype; the C type picks the width (a function designator, then the call). Variadic:
+    # an operand may be a lane constructor, (float128){a, b, ...}, whose commas would split a plain macro argument
+    out.append(f"#define __TG_{name.upper()}(...) _Generic((__VA_ARGS__), {', '.join(assoc)})(__VA_ARGS__)")
   return out
 
 def _qf_math_half(x:UOp) -> UOp|None:
@@ -129,6 +130,10 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
 
 # NOTE: this just increases readability of the generated code
 dsp_string = PatternMatcher([
+  # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
+  # operand) where the scalar form keeps tinygrad's (a<b)?b:a -- they only differ on NaN
+  (UPat(Ops.MAX, dtype=(dtypes.float32, dtypes.half), name="x"),
+   lambda ctx,x: f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None),
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
   (UPat(Ops.MUL, dtypes.float32, name="x"), lambda ctx,x:
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
@@ -199,7 +204,8 @@ def hvx_revectorize(x:UOp) -> UOp|None:
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
   if s0.op not in _vec_ops() or s0.dtype == dtypes.bool or s0._shape != (): return None
-  if s0.op is Ops.MAX and dtypes.is_float(s0.dtype): return None  # float max renders as a scalar statement expression
+  # a scalar float max renders as a statement expression; a vector one (qfloat targets) as HVX's native max (dsp_string)
+  if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not HVX_QFLOAT: return None
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
   if not _vec_column_ok(srcs): return None
   return UOp(s0.op, s0.dtype, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)

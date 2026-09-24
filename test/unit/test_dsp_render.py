@@ -72,6 +72,11 @@ class TestDSPQfMath(unittest.TestCase):
     self.assertIn("__tg_exp2_v(", src)  # a whole-HVX-register width is used
     self.assertIn("0x4B400000", src)    # magic-number rounding, no float->int conversion
 
+  def test_helper_macro_takes_a_lane_constructor(self):
+    # an operand built from two half-width loads is a lane constructor with commas: the dispatch macro must be variadic
+    src = dsp_source(Tensor.empty(4096).exp())
+    self.assertIn("#define __TG_EXP2(...)", src)
+
   def test_division_is_reciprocal(self):
     src = dsp_source(Tensor.empty(4096) / (Tensor.empty(4096) + 1))
     self.assertIn("__TG_RECIP(", src)

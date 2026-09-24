@@ -5,6 +5,8 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
+HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -128,22 +130,36 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       rng = k.rngs[axis]
       if any(rng not in b.src[1].get_idx().backward_slice and all(r2 in b.src[1].get_idx().backward_slice
           for r2 in k.ranges_of(AxisType.UPCAST, AxisType.UNROLL)) for b in k.bufs):
-        num_strides, sum_strides = 0, 0
+        num_strides, sum_strides, gathers = 0, 0, 0
         for b in k.bufs:
           idx = b.src[1].get_idx()
           if rng in idx.backward_slice: num_strides += 1
+          unit = False
           for c in idx.split_uop(Ops.ADD):
-            if c is rng: sum_strides += 1
+            if c is rng: sum_strides, unit = sum_strides + 1, True
             if c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST: sum_strides += c.src[1].val
             if c.op is Ops.MUL and c.src[1] is rng and c.src[0].op is Ops.CONST: sum_strides += c.src[0].val
-        # on the DSP prefer the widest vector for the same axis (the extra key is 0 elsewhere, so ordering is unchanged)
-        xb_choices.append((num_strides, sum_strides, -upcast_amount if is_dsp else 0, axis, upcast_amount))
+          # a buffer indexed along the axis other than at unit stride: its vector access is a gather (scalar loads on HVX)
+          if rng in idx.backward_slice and not unit: gathers += 1
+        # on the DSP first avoid gathers (HVX_UPCAST_CONTIG=1), then prefer the widest vector for the same axis (both keys are 0
+        # elsewhere, so ordering is unchanged)
+        xb_choices.append((gathers if is_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if is_dsp else 0,
+                           axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][3], xb_choices[0][4]))
-      upcasted_axis.add(xb_choices[0][3])
+      k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][-2], xb_choices[0][-1]))
+      upcasted_axis.add(xb_choices[0][-2])
     else: break
+
+  # on the DSP, a reduction nothing broadcasts into (a per-element dot product like q . k over a small head dim) got no upcast
+  # above; the unroll below would then take every "nothing upcasted" case and leave it scalar. Upcast the innermost output
+  # axis first instead: a vector accumulator per 128 outputs, the reduce stays a loop
+  if is_dsp and HVX_UPCAST_CONTIG and not k.axes_of(AxisType.UPCAST) and k.axes_of(AxisType.REDUCE):
+    for splits in [128,64,32]:
+      if k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+        break
 
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
