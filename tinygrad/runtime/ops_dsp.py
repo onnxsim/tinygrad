@@ -64,10 +64,24 @@ def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
 QF_MATH = HVX_QFLOAT and bool(getenv("HVX_QF_MATH", 1))
 _QF_EXP2_C = [1.53592089e-4, 1.33926270e-3, 9.61838476e-3, 5.55034727e-2, 2.40226448e-1, 6.93147182e-1, 1.0]
 
+def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
+  widths = sorted({u.max_numel() for u in uops if _hf_exp2_src(u) is not None})
+  if not widths: return []
+  out = [_HF_EXP2]
+  for n in widths:
+    t, k = vtype(dtypes.half, n), n // 64
+    lanes = [",".join(str(i) for i in range(64*j, 64*j+64)) for j in range(k)]
+    parts = [f"__tg_exp2_h({'x' if k == 1 else f'__builtin_shufflevector(x, x, {lanes[j]})'})" for j in range(k)]
+    while len(parts) > 1:
+      w = 64 * (k // len(parts))
+      parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {','.join(str(i) for i in range(2*w))})" for j in range(0, len(parts), 2)]
+    out.append(f"static inline {t} __tg_exp2_h{n}({t} x) {{ return ({t}){parts[0]}; }}")
+  return out
+
 def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
   if not QF_MATH: return []
   uses = {(Ops.RECIPROCAL if u.op is Ops.FDIV else u.op, u.max_numel()) for u in uops
-          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV) and u.dtype == dtypes.float32}
+          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV) and u.dtype == dtypes.float32 or _hf_div(u)}
   if not uses: return []
   poly = "".join(f" p = __hvx_mulsf(p, f) + {c}f;" for c in _QF_EXP2_C[1:])
   out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
@@ -114,6 +128,62 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
     # an operand may be a lane constructor, (float128){a, b, ...}, whose commas would split a plain macro argument
     out.append(f"#define __TG_{name.upper()}(...) _Generic((__VA_ARGS__), {', '.join(assoc)})(__VA_ARGS__)")
   return out
+
+# half EXP2 is rewritten to float (_qf_math_half); a 64-lane-multiple vector of that, CAST(half, EXP2(CAST(float, x))), renders as
+# an hf helper instead (the hand-written MCC kernel's: 1536.0 magic-number round, degree-4 polynomial in qf16 converted back to
+# hf after every op, exponent add; 0 below 2^-14, inf from 2^16): 64 lanes per HVX register instead of 32, and no hf<->sf
+# conversions. Relative error ~5e-4 near 0, up to 7e-3 for |x| > 8 (qf16 rounding of n - x), vs ~5e-4 through float
+HVX_HF_EXP2 = getenv("HVX_HF_EXP2", 1)
+def _splat_const(u:UOp) -> float|None:
+  # a constant, possibly cast, possibly splat across a STACK
+  if u.op is Ops.STACK and all(s is u.src[0] for s in u.src): u = u.src[0]
+  while u.op is Ops.CAST: u = u.src[0]
+  return float(u.arg) if u.op is Ops.CONST else None
+
+def _hf_exp2_src(u:UOp) -> tuple[UOp, float|None]|None:
+  # CAST(half, EXP2(y)): (x, c) for y = CAST(float, x) * c (exp: times log2(e)) or CAST(float, x) with x half, else (y, None) --
+  # a float exponent is rounded to hf first (<= 2^-8 absolute for |y| < 16, so < 0.3% relative; the result is half anyway)
+  if not (HVX_HF_EXP2 and QF_MATH) or u.op is not Ops.CAST or u.dtype != dtypes.half or u.max_numel() % 64 != 0: return None
+  if (e:=u.src[0]).op is not Ops.EXP2 or e.dtype != dtypes.float32: return None
+  a = e.src[0]
+  if a.op is Ops.MUL and (i:=next((i for i in (0, 1) if _splat_const(a.src[1-i]) is not None), None)) is not None:
+    if a.src[i].op is Ops.CAST and a.src[i].src[0].dtype == dtypes.half: return a.src[i].src[0], _splat_const(a.src[1-i])
+  return (a.src[0], None) if a.op is Ops.CAST and a.src[0].dtype == dtypes.half else (a, None)
+
+_HF_EXP2 = r"""typedef __fp16 __hvx_h __attribute__((ext_vector_type(64)));
+typedef short __hvx_hs __attribute__((ext_vector_type(64)));
+static inline __hvx_h __hvx_hfb(__hvx_h a) { __asm__("" : "+v"(a)); return a; }
+static inline __hvx_h __tg_exp2_h(__hvx_h x) {
+  const __hvx_h magic = (__hvx_h)(__fp16)1536.0f;
+  __hvx_h xc = __builtin_elementwise_min(__builtin_elementwise_max(x, (__hvx_h)(__fp16)-14.0f), (__hvx_h)(__fp16)15.99f);
+  __hvx_h r = __hvx_hfb(xc + magic);
+  __hvx_hs n = __builtin_bit_cast(__hvx_hs, r) - (__hvx_hs)(short)0x6600;
+  __hvx_h g = __hvx_hfb(__hvx_hfb(r - magic) - xc);
+  __hvx_h p = __hvx_hfb(__hvx_hfb(g * (__fp16)0.00961813f) + (__fp16)-0.0555041f);
+  p = __hvx_hfb(__hvx_hfb(p * g) + (__fp16)0.2402265f);
+  p = __hvx_hfb(__hvx_hfb(p * g) + (__fp16)-0.6931472f);
+  p = __hvx_hfb(__hvx_hfb(p * g) + (__fp16)1.0f);
+  __hvx_hs b = __builtin_bit_cast(__hvx_hs, p) + (n << 10);
+  b = x < (__hvx_h)(__fp16)-14.0f ? (__hvx_hs)(short)0 : b;
+  b = x >= (__hvx_h)(__fp16)16.0f ? (__hvx_hs)(short)0x7C00 : b;
+  return __builtin_bit_cast(__hvx_h, b);
+}"""
+
+def _hf_div(u:UOp) -> bool:
+  # a vector half division (QF_MATH): a * (1 / b), the reciprocal through the float helper -- clang scalarizes a vector hf
+  # division (GELU's x / (1 + 2^t): 190 ms instead of ~4). At render time: as a rewrite, the late decompositions turn it back
+  return bool(QF_MATH) and u.op is Ops.FDIV and u.dtype == dtypes.half and u.max_numel() > 1
+
+def _hf_div_render(ctx, x:UOp) -> str|None:
+  if not _hf_div(x): return None
+  ft, ht = ctx._render_dtype(dtypes.float32, x.max_numel(), AddrSpace.REG), ctx.render_type(x)
+  return f"({ctx[x.src[0]]}*__builtin_convertvector(__TG_RECIP(__builtin_convertvector({ctx[x.src[1]]}, {ft})), {ht}))"
+
+def _hf_exp2_render(ctx, x:UOp) -> str|None:
+  if (m:=_hf_exp2_src(x)) is None: return None
+  arg = ctx[m[0]] if m[0].dtype == dtypes.half else f"__builtin_convertvector({ctx[m[0]]}, {ctx.render_type(x)})"
+  if m[1] is not None: arg = f"({arg}*(({ctx.render_type(x)})((__fp16){m[1]!r}f)))"
+  return f"__tg_exp2_h{x.max_numel()}({arg})"
 
 def _qf_math_half(x:UOp) -> UOp|None:
   # half EXP2 / RECIPROCAL go through float32 (the helpers are float32; scalar __fp16 can't be a function argument)
@@ -162,6 +232,8 @@ def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
 dsp_string = PatternMatcher([
+  (UPat(Ops.CAST, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_exp2_render(ctx, x)),
+  (UPat(Ops.FDIV, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_div_render(ctx, x)),
   # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
   # operand) where the scalar form keeps tinygrad's (a<b)?b:a -- they only differ on NaN
   (UPat(Ops.MAX, dtype=(dtypes.float32, dtypes.half), name="x"), lambda ctx,x: _vec_fmax(ctx, x)),
@@ -941,6 +1013,7 @@ class DSPRenderer(ClangRenderer):
     qm = _qf_math_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if qm and not any("typedef float __hvx_f " in p for p in prefix): prefix += qm
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
+    prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 

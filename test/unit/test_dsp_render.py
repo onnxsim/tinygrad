@@ -84,6 +84,18 @@ class TestDSPQfMath(unittest.TestCase):
     self.assertIn("__tg_exp2_v(", src)  # a whole-HVX-register width is used
     self.assertIn("0x4B400000", src)    # magic-number rounding, no float->int conversion
 
+  def test_half_exp_is_an_hf_helper(self):
+    # a half exp (float EXP2 cast back to half) at a 64-lane multiple: the hf helper, 64 lanes per register
+    src = dsp_source(Tensor.empty(48, 1024, dtype=dtypes.half).exp())
+    self.assertIn("__tg_exp2_h128(", src)
+    self.assertIn("static inline __hvx_h __tg_exp2_h(", src)
+
+  def test_half_division_is_reciprocal(self):
+    # a vector hf division (scalarized by clang) renders as a * (1 / b), the reciprocal through the float helper
+    src = dsp_source(Tensor.empty(48, 1024, dtype=dtypes.half) / Tensor.empty(48, 1024, dtype=dtypes.half))
+    self.assertIn("__TG_RECIP(__builtin_convertvector(", src)
+    self.assertNotRegex(src, r"val\d+/")
+
   def test_helper_macro_takes_a_lane_constructor(self):
     # an operand built from two half-width loads is a lane constructor with commas: the dispatch macro must be variadic
     src = dsp_source(Tensor.empty(4096).exp())
