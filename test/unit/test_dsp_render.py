@@ -60,8 +60,26 @@ class TestDSPQfloat(unittest.TestCase):
     a, b, c, d = (Tensor.empty(2048) for _ in range(4))
     self.assertNotIn("__hvx_", dsp_source((a - b) * (c + d)))
 
-if __name__ == '__main__':
-  unittest.main()
+class TestDSPQfMath(unittest.TestCase):
+  # QF_MATH (v68+): EXP2 / RECIPROCAL are not decomposed (tinygrad's decomposition needs vector int<->float conversion, v73+)
+  # but rendered as conversion-free HVX helpers, and float division as a * reciprocal(b), so they vectorize
+  def setUp(self): self.prev, ops_dsp.QF_MATH = ops_dsp.QF_MATH, True
+  def tearDown(self): ops_dsp.QF_MATH = self.prev
+
+  def test_exp_is_a_vector_helper(self):
+    src = dsp_source(Tensor.empty(4096).exp())
+    self.assertIn("__TG_EXP2(", src)
+    self.assertIn("__tg_exp2_v(", src)  # a whole-HVX-register width is used
+    self.assertIn("0x4B400000", src)    # magic-number rounding, no float->int conversion
+
+  def test_division_is_reciprocal(self):
+    src = dsp_source(Tensor.empty(4096) / (Tensor.empty(4096) + 1))
+    self.assertIn("__TG_RECIP(", src)
+    self.assertNotIn(")/(", src)
+
+  def test_off(self):
+    ops_dsp.QF_MATH = False
+    self.assertNotIn("__TG_EXP2", dsp_source(Tensor.empty(2048).exp()))
 
 class TestDSPVrmpyGemv(unittest.TestCase):
   # a W8A8 decode GEMV: one uint8 activation row times int8 weights, int32 accumulation -- exactly vrmpybusv (u8 x s8 dot4)
@@ -134,5 +152,25 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("*(__fp161024*)(v + 1024) = a;", src)
     self.assertNotIn("__builtin_memcpy(v", src)
 
+  def test_single_k_tile_matmul(self):
+    # K = 32 (an attention score q . k^T with head_dim 32): no reduce loop, so the tile op is begun right before it and stored
+    # right after -- an enclosing output-tile loop is not the reduction -- and the output rows go out with the row-pair store
+    kernel = self.src(64, 32, 96).split("__attribute__((noinline)) void", 1)[1]
+    self.assertNotIn("for (int Ridx", kernel)
+    self.assertEqual(kernel.count("__hmx_begin();"), 1)
+    self.assertLess(kernel.index("__hmx_begin();"), kernel.index("__hmx_store()"))
+    self.assertIn("__hmx_out2(", kernel)
+    self.assertNotIn("*(__hmx_h128*)", kernel)  # no 128-lane store over 32-element rows
+
+  def test_a_panel_prefetch_is_rows(self):
+    # A's K panel is 32 rows of K columns: __hmx_prefetch_rows; the 32*kt-row panel prefetch is B's shape only (on A it read
+    # far past the operand and faulted the PD on the phone)
+    kernel = self.src(64, 2048, 64).split("__attribute__((noinline)) void", 1)[1]
+    for call in kernel.split("__hmx_prefetch_panel(")[1:]:
+      self.assertNotIn("data1", call.split(")")[0])  # data1 = A
+
   def test_float_matmul_is_not_hmx(self):
     self.assertNotIn("mxmem", self.src(64, 64, 64, dtypes.float32))
+
+if __name__ == '__main__':
+  unittest.main()

@@ -52,6 +52,72 @@ def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
     out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){parts[0]}; }}")
   return out
 
+# ***** qfloat exp2 / reciprocal (v68+) *****
+# tinygrad's own EXP2 decomposition rounds with a float->int conversion and builds 2^q with int->float, and vector int<->float
+# conversions only exist from v73 (vconv_sf_w / w_sf), so on v68/v69 every transcendental kernel falls back to scalar code.
+# These helpers need no conversion: exp2 rounds with the 1.5*2^23 magic add (n = bits - 0x4B400000, an int subtract on the
+# reinterpreted bits; the qf32->sf rounding may be one off, so f = x - (r - magic) stays exact and the polynomial covers
+# [-1, 1]), a degree-6 polynomial for 2^f and adds n to the exponent field; the reciprocal is the 0x7EF311C7 bit estimate +
+# 3 Newton steps. Every computed x computed multiply goes through IEEE sf first (the "+v" barrier, as _qf_helpers).
+# Domain: exp2 input clamped to [-126, 126] (so -inf -> 2^-126, not 0), reciprocal for normal x != 0.
+QF_MATH = HVX_QFLOAT and bool(getenv("HVX_QF_MATH", 1))
+_QF_EXP2_C = [1.53592089e-4, 1.33926270e-3, 9.61838476e-3, 5.55034727e-2, 2.40226448e-1, 6.93147182e-1, 1.0]
+
+def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
+  if not QF_MATH: return []
+  uses = {(Ops.RECIPROCAL if u.op is Ops.FDIV else u.op, u.max_numel()) for u in uops
+          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV) and u.dtype == dtypes.float32}
+  if not uses: return []
+  poly = "".join(f" p = __hvx_mulsf(p, f) + {c}f;" for c in _QF_EXP2_C[1:])
+  out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
+         "typedef int __hvx_i __attribute__((ext_vector_type(32)));",
+         "static inline __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }",
+         "static inline __hvx_f __tg_exp2_v(__hvx_f x) {"
+         " x = __builtin_elementwise_min(__builtin_elementwise_max(x, (__hvx_f)(-126.0f)), (__hvx_f)(126.0f));"
+         " __hvx_f r = x + 12582912.0f; __asm__(\"\" : \"+v\"(r));"
+         " __hvx_i n = __builtin_bit_cast(__hvx_i, r) - 0x4B400000; __hvx_f f = x - (r - 12582912.0f);"
+         f" __hvx_f p = {_QF_EXP2_C[0]}f * f + {_QF_EXP2_C[1]}f;" + poly.split(";", 1)[1] +
+         " __asm__(\"\" : \"+v\"(p)); return __builtin_bit_cast(__hvx_f, __builtin_bit_cast(__hvx_i, p) + (n << 23)); }",
+         "static inline __hvx_f __tg_recip_v(__hvx_f x) {"
+         " __hvx_f y = __builtin_bit_cast(__hvx_f, 0x7EF311C7 - __builtin_bit_cast(__hvx_i, x));"
+         " for (int k = 0; k < 3; k++) y = __hvx_mulsf(y, 2.0f - __hvx_mulsf(x, y)); return y; }",
+         "static inline float __tg_exp2_s(float x) {"
+         " x = x < -126.0f ? -126.0f : (x > 126.0f ? 126.0f : x); float r = x + 12582912.0f; int n; __builtin_memcpy(&n, &r, 4);"
+         f" n -= 0x4B400000; float f = x - (r - 12582912.0f), p = {_QF_EXP2_C[0]}f;" +
+         "".join(f" p = p * f + {c}f;" for c in _QF_EXP2_C[1:]) +
+         " int b; __builtin_memcpy(&b, &p, 4); b += n << 23; __builtin_memcpy(&p, &b, 4); return p; }",
+         "static inline float __tg_recip_s(float x) {"
+         " int b; __builtin_memcpy(&b, &x, 4); b = 0x7EF311C7 - b; float y; __builtin_memcpy(&y, &b, 4);"
+         " for (int k = 0; k < 3; k++) y = y * (2.0f - x * y); return y; }"]
+  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
+  for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL)):
+    widths = sorted({n for o, n in uses if o is op})
+    if not widths: continue
+    assoc = []
+    for n in widths:
+      if n == 1:
+        assoc.append(f"float: __tg_{name}_s")
+        continue
+      t = vtype(dtypes.float32, n)
+      if n % 32 == 0:  # whole HVX registers, split / rebuilt with shufflevector (in registers)
+        k = n // 32
+        parts = [f"__tg_{name}_v({'x' if k == 1 else f'__builtin_shufflevector(x, x, {lanes(32*i, 32)})'})" for i in range(k)]
+        while len(parts) > 1:
+          w = 32 * (k // len(parts))
+          parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
+        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ return ({t}){parts[0]}; }}")
+      else:  # other widths: per lane (scalar helper)
+        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ {t} y; for (int i = 0; i < {n}; i++) y[i] = __tg_{name}_s(x[i]); return y; }}")
+      assoc.append(f"{t}: __tg_{name}_f{n}")
+    # the renderer only knows the scalar dtype; the C type picks the width (a function designator, then the call)
+    out.append(f"#define __TG_{name.upper()}(x) _Generic((x), {', '.join(assoc)})(x)")
+  return out
+
+def _qf_math_half(x:UOp) -> UOp|None:
+  # half EXP2 / RECIPROCAL go through float32 (the helpers are float32; scalar __fp16 can't be a function argument)
+  if x.dtype != dtypes.half: return None
+  return x.src[0].cast(dtypes.float32).alu(x.op).cast(dtypes.half)
+
 def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   # STACK(v[k], v[k+1], ..., v[k+n-1]) of one vector v -> (v, [k..k+n-1])
   if len(x.src) < 2 or any(s.op is not Ops.INDEX or len(s.src) != 2 or s.src[0] is not x.src[0].src[0] for s in x.src): return None
@@ -94,6 +160,11 @@ dsp_string = PatternMatcher([
 # arithmetic straight to HVX under -mhvx. Compares/WHERE are left scalar: C vector compares yield same-width int masks,
 # not _Bool vectors, so they'd need mask-dtype plumbing -- MAX (the common select) is native instead.
 HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
+# with qfloat (v68+) EXP2 / RECIPROCAL / float FDIV are rendered as vector helpers (_qf_math_helpers) instead of being
+# decomposed, so they re-vectorize too (added while QF_MATH is on, see _vec_ops)
+_QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV}
+
+def _vec_ops() -> set: return HVX_VEC_OPS | _QF_VEC_OPS if QF_MATH else HVX_VEC_OPS
 
 def _lane(u:UOp) -> int|None:
   if u.op is Ops.CAST: u = u.src[0]
@@ -108,9 +179,14 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
   if c0._shape != () or c0.dtype == dtypes.bool or depth > 32: return False
   if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
   if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
-    lanes = [_lane(c.src[1]) if c.op is Ops.INDEX and len(c.src) == 2 and c.src[0] is c0.src[0] else None for c in col]
-    return None not in lanes and lanes == list(range(lanes[0], lanes[0]+len(lanes)))
-  if c0.op in HVX_VEC_OPS and all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
+    # consecutive lanes of one vector, or of several vectors one after another (a row loaded as two 64-byte halves):
+    # the vector operand is then that lane constructor, which clang lowers to shuffles
+    if any(c.op is not Ops.INDEX or len(c.src) != 2 or c.src[0]._shape is None or len(c.src[0]._shape) != 1 for c in col): return False
+    lanes = [_lane(c.src[1]) for c in col]
+    if None in lanes: return False
+    return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
+                                                                       ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
+  if c0.op in _vec_ops() and all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
     return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
   return False
 
@@ -122,7 +198,7 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
-  if s0.op not in HVX_VEC_OPS or s0.dtype == dtypes.bool or s0._shape != (): return None
+  if s0.op not in _vec_ops() or s0.dtype == dtypes.bool or s0._shape != (): return None
   if s0.op is Ops.MAX and dtypes.is_float(s0.dtype): return None  # float max renders as a scalar statement expression
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
   if not _vec_column_ok(srcs): return None
@@ -355,6 +431,22 @@ static inline void __hmx_prefetch_panel(const __fp16* r0, const __fp16* r1, int 
   (void)r0; (void)r1; (void)rows;
 #endif
 }
+/* L2-prefetch the K panel of a 32-row operand (A: 32 rows of K columns): each row's `bytes` contiguous bytes at the row stride
+ * of r0, r1 (as 128-byte lines, <= 240 lines per l2fetch). __hmx_prefetch_panel is the 32-column (B) shape; used on A it
+ * fetched 32*kt rows -- far past the operand, which faults the PD on the phone once that lands on an unmapped page. */
+static inline void __hmx_prefetch_rows(const __fp16* r0, const __fp16* r1, int bytes) {
+#ifndef HMX_REF
+  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
+  int lines = (bytes + 127) / 128;
+  for (int i = 0; i < 32; i++)
+    for (int l = 0; l < lines; l += 240) {
+      unsigned h = (unsigned)(lines - l < 240 ? lines - l : 240);
+      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + i * stride + 128 * l), (128u << 16) | (128u << 8) | h);
+    }
+#else
+  (void)r0; (void)r1; (void)bytes;
+#endif
+}
 static inline void __hmx_call_start(void) {
   for (int i = 0; i < __HMX_CA; i++) { __hmx_tag_a[i] = 0; __hmx_rr_a[i] = 0; }
   for (int i = 0; i < __HMX_CB; i++) { __hmx_tag_b[i] = 0; __hmx_rr_b[i] = 0; }
@@ -401,7 +493,7 @@ def _hmx_const(u:UOp):
   while u.op is Ops.CAST: u = u.src[0]
   return u.arg if u.op is Ops.CONST else None
 
-def _hmx_direct_out(uops, pos, users, e, stores):
+def _hmx_direct_out(uops, pos, users, at:int, stores):
   # after the reduce loop tinygrad reloads the accumulator array and stores lane permutations of it to the output. If that
   # is all that happens to it, return (pointer uop for each tile row 0..31 as an "(expr+off)"-able uop list, uops to drop)
   buf = _hmx_param(stores[0].src[0])
@@ -409,7 +501,7 @@ def _hmx_direct_out(uops, pos, users, e, stores):
   for so in stores:
     if (off:=_hmx_const(so.src[0].src[1])) is None or len(so.src[0].src) < 2: return None
     for t, x in enumerate(so.src[1].src): elem_lane[off + t] = _hmx_lane(x)[1]
-  loads = [u for u in uops[pos[e]+1:] if u.op is Ops.LOAD and _hmx_param(u.src[0]) is buf]
+  loads = [u for u in uops[at+1:] if u.op is Ops.LOAD and _hmx_param(u.src[0]) is buf]
   if not loads: return None
   gone: set[UOp] = set(loads)
   rows: dict[int, UOp] = {}
@@ -471,11 +563,12 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if w.op is not Ops.WMMA or w.arg[1] != dtypes.half: continue
     ra, rb = _hmx_rows(w.src[0]), _hmx_rows(w.src[1])
     if ra is None or rb is None: return _hmx_bail(uops, 1)
-    # the reduce loop: the innermost RANGE whose END encloses the WMMA
-    ends = [e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE
+    # the reduce loop: the innermost REDUCE RANGE whose END encloses the WMMA. None when K is a single tile (e.g. an
+    # attention score q . k^T with head_dim 32): then the tile op runs once, begun right before the WMMA and stored after
+    # its accumulator stores (an enclosing output-tile loop must not be mistaken for the reduction)
+    ends = [e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE and e.src[1].arg[-1] == AxisType.REDUCE
             and pos[e.src[1]] < pos[w] < pos[e]]
-    if not ends: return _hmx_bail(uops, 2)
-    e = min(ends, key=lambda e: pos[e]-pos[e.src[1]])
+    e = min(ends, key=lambda e: pos[e]-pos[e.src[1]]) if ends else None
     # consumers: lane INDEXes of w -> STACKs -> STOREs into the accumulator array
     stores = []
     for lane in users.get(w, []):
@@ -493,7 +586,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     for so in stores: dead |= {so, so.src[1], *so.src[1].src}
     if any(any(v not in dead and v.op not in (Ops.GROUP, Ops.END) for v in users.get(d, [])) for d in dead): return _hmx_bail(uops, 8)
     drop |= dead
-    before.setdefault(pos[e.src[1]], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_begin();"))
+    end_at = pos[e] if e is not None else max(pos[so] for so in stores)  # where the reduction is complete
+    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_begin();"))
     rows = ra + rb
     vals = list(dict.fromkeys(v for v, _ in rows))
     if all(v.op is Ops.LOAD and len(v.src) == 1 and all(u in dead or u.op in (Ops.GROUP, Ops.END) for u in users.get(v, [])) for v in vals):
@@ -505,7 +599,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       srcs = tuple(v.src[0] for v in vals)
       # operands the kernel never writes are memoized in VTCM by their first row pointer (A repeats across the N tiles)
       ro = [all(_hmx_param(v.src[0]) not in written for v, _ in r) for r in (ra, rb)]
-      kr, kt = f"{{{len(srcs)}}}", int(e.src[1].vmax) + 1  # the reduce loop's variable and trip count
+      # the reduce loop's variable and trip count; no reduce loop: K index 0, one K tile (the placeholder slot is then
+      # filled with an already-rendered uop and never referenced)
+      kr, kt = (f"{{{len(srcs)}}}", int(e.src[1].vmax) + 1) if e is not None else ("0", 1)
       def cached(x, n, key, dst, pack):
         if kt > n: return pack  # fewer slots than K tiles: no set per K index, just pack
         return (f" __fp16* _c{dst} = __hmx_lookup(__hmx_tag_{x}, __hmx_rr_{x}, __hmx_c{x}, {key}, {kr}, {min(n // kt, 8)}, &_s);"
@@ -524,14 +620,17 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
             # adjacent outer tiles share every 128-byte row line: pack tiles n, n+1 together on even n (vshuff of full rows)
             p0 = 0 if x == "a" else 32
             pk = "".join(f" __hmx_pack2x2(_{x}+{64*q}, _{x}+{1024*kt+64*q}, {ptr[p0+2*q]}, {ptr[p0+2*q+1]});" for q in range(16))
-            pf = f" if (({kr})==0) __hmx_prefetch_panel({ptr[p0]}, {ptr[p0+1]}, {32*kt});"
+            pf = (f" if (({kr})==0) __hmx_prefetch_rows({ptr[p0]}, {ptr[p0+1]}, {64*kt});" if x == "a" else
+                  f" if (({kr})==0) __hmx_prefetch_panel({ptr[p0]}, {ptr[p0+1]}, {32*kt});")
             return (f" _{x} = __hmx_c{x}(({on})%2*{kt}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
                     f"({on})%2*{kt}")
           elif deps == {outer} and kt <= n: base, cond = "0", f"({iname})==0"
           elif not deps and kt <= n: base, cond = "0", f"({on})==0 && ({iname})==0"
           else: return None
           p0, p1 = (ptr[0], ptr[1]) if x == "a" else (ptr[32], ptr[33])
-          pf = f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});"  # the whole K panel, on its first fill
+          # the whole K panel, on its first fill: A = 32 rows x K columns, B = K rows x 32 columns
+          pf = (f" if (({kr})==0) __hmx_prefetch_rows({p0}, {p1}, {64*kt});" if x == "a" else
+                f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});")
           return f" _{x} = __hmx_c{x}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}", base
         ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
         eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
@@ -541,11 +640,11 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           ea, eb = ea[0], eb[0]
         else: ea, eb = ea and ea[0], eb and eb[0]
         pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
-        srcs = srcs + (e.src[1], outer, inner)
+        srcs = srcs + (e.src[1] if e is not None else outer, outer, inner)
       else:
         if ro[0]: pa = cached("a", _HMX_CA, ptr[0], "a", pa)
         if ro[1]: pb = cached("b", _HMX_CB, ptr[32], "b", pb)
-        if any(ro): srcs = srcs + (e.src[1],)
+        if any(ro) and e is not None: srcs = srcs + (e.src[1],)
       if any(ro): call_start = True
       # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs
       pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
@@ -573,9 +672,11 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         b0, b1 = blks[0], blks[-1]
         idx = ",".join(str(l - b0*128 if l//128 == b0 else 128 + l - b1*128) for l in lanes)
         outs.append(f" *(__hmx_h128*){{{k}}} = __builtin_shufflevector(_o[{b0}], _o[{b1}], {idx});")
-      else:
-        outs.append(f" *(__hmx_h128*){{{k}}} = (__hmx_h128){{{{{','.join(f'_p[{l}]' for l in lanes)}}}}};")
-    if (direct:=_hmx_direct_out(uops, pos, users, e, stores)) is not None:
+      else:  # a vector as wide as the store (a single-K-tile op stores straight to the output, 32 lanes per row)
+        vt = {32: "__hmx_h32", 64: "__hmx_h64", 128: "__hmx_h128"}.get(len(lanes))
+        if vt is None: return _hmx_bail(uops, 11)
+        outs.append(f" *({vt}*){{{k}}} = ({vt}){{{{{','.join(f'_p[{l}]' for l in lanes)}}}}};")
+    if (direct:=_hmx_direct_out(uops, pos, users, end_at, stores)) is not None:
       # the accumulator array is only copied to an output buffer after the loop: write the tile rows there directly
       rowptr, gone = direct
       drop |= gone
@@ -586,8 +687,20 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
                                       [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}")])
       continue
+    row_of = {}
+    for so in stores:  # stores that are exactly the tile's 32 rows (IDX(i, 0..31)): the HVX row-pair output
+      lanes = [l[1] for x in so.src[1].src if (l:=_hmx_lane(x)) is not None]
+      i = 2 * (lanes[0] // 64) + lanes[0] % 2 if lanes else -1
+      if len(lanes) != 32 or lanes != [64*(i//2) + 2*j + i%2 for j in range(32)] or i in row_of: break
+      row_of[i] = so.src[0]
+    if sorted(row_of) == list(range(32)):
+      rowptr = [row_of[i] for i in range(32)]
+      pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
+      sm, sx = span_mac(tuple(rowptr))
+      after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}"))
+      continue
     sm, sx = span_mac(tuple(so.src[0] for so in stores))
-    after.setdefault(pos[e], []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
+    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
       "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
   if not replace: return _hmx_bail(uops, 9)
   if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
@@ -670,10 +783,23 @@ class DSPRenderer(ClangRenderer):
                  # builtin's IEEE maxNum on NaN. The statement expression evaluates each operand once: a plain ternary
                  # repeats both, and since single-use ALU results are inlined, a chain of maxes (argmax) grows exponentially.
                  Ops.MAX: lambda a,b,dtype: f"({{__auto_type _a=({a}); __auto_type _b=({b}); _a<_b?_b:_a;}})" if dtypes.is_float(dtype) else
-                   f"__builtin_elementwise_max({a},{b})"}
+                   f"__builtin_elementwise_max({a},{b})",
+                 }
+  # QF_MATH (set per renderer instance, see __init__): float32 a / b renders as a * reciprocal(b) -- v68/v69 HVX has no float
+  # divide (LLVM scalarizes a vector one), and a lane stack whose top op is a division would keep the whole expression, EXP2s
+  # included, scalar
+  qf_code_for_op = {Ops.EXP2: lambda x,dtype: f"__TG_EXP2({x})", Ops.RECIPROCAL: lambda x,dtype: f"__TG_RECIP({x})",
+                    Ops.FDIV: lambda a,b,dtype: f"({a}*__TG_RECIP({b}))" if dtype == dtypes.float32 else f"({a}/{b})"}
   extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
+  qf_matcher = PatternMatcher([(UPat((Ops.EXP2, Ops.RECIPROCAL), name="x"), _qf_math_half)])
 
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), _dsp_tcs()
+  def __init__(self, target:Target):
+    self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), _dsp_tcs()
+    self._qf_math_on()
+
+  def _qf_math_on(self):
+    # the qfloat exp2 / reciprocal helpers: EXP2 / RECIPROCAL stay ops (not decomposed) and render as the helpers
+    if QF_MATH: self.code_for_op, self.extra_matcher = {**type(self).code_for_op, **self.qf_code_for_op}, self.qf_matcher + type(self).extra_matcher
 
   # HMX_ACC=0 keeps the plain per-K-block tile op (C round trip, 2 KB values) for comparison
   hmx_acc = bool(getenv("HMX_ACC", 1))
@@ -717,6 +843,9 @@ class DSPRenderer(ClangRenderer):
   return {call};
 }}""")
     prefix += _qf_helpers(uops, lambda n: self._render_dtype(dtypes.float32, n, AddrSpace.REG))
+    qm = _qf_math_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
+    if qm and not any("typedef float __hvx_f " in p for p in prefix): prefix += qm
+    elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
@@ -988,7 +1117,9 @@ static void *mmap2(void *addr, unsigned int length, int prot, int flags, int fd,
 return (void*)syscall((long)addr, length, prot, flags, fd, offset, 222); }}'''
 
 class MockDSPRenderer(DSPRenderer):
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), _dsp_tcs()
+  def __init__(self, target:Target):
+    self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), _dsp_tcs()
+    self._qf_math_on()
   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     # https://gpages.juszkiewicz.com.pl/syscalls-table/syscalls.html
@@ -1067,7 +1198,9 @@ HEXSIM_CLOCK_HZ = 1_000_000_000  # placeholder nominal clock (Hexagon v73 cDSP i
                                   # returned times matters for BEAM; this scales Pcycles into a plausible-looking float, nothing more.
 
 class HexagonSimRenderer(DSPRenderer):
-  def __init__(self, target:Target): self.target, self.compiler, self.tensor_cores = target, HexagonSimCompiler(), _dsp_tcs()
+  def __init__(self, target:Target):
+    self.target, self.compiler, self.tensor_cores = target, HexagonSimCompiler(), _dsp_tcs()
+    self._qf_math_on()
   def _render_defines(self, uops) -> list[str]: return ClangRenderer._render_defines(self, uops)
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     # Plain hosted main() (hexagon-sim's standalone-OS mode has real libc) -- no raw trap0 dance
