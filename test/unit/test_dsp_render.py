@@ -31,6 +31,13 @@ class TestDSPRender(unittest.TestCase):
         s8, s16 = len(dsp_source(max_chain(8, dt))), len(dsp_source(max_chain(16, dt)))
         self.assertLess(s16, 3 * s8, f"{dt}: source grew {s8} -> {s16} chars for 8 -> 16 chained maxes")
 
+  def test_reduce_upcasts_contiguous_output_axis(self):
+    # a per-element dot product (nothing broadcasts): the 128 contiguous outputs become one vector accumulator instead of the
+    # reduce being unrolled over scalar gathers
+    a, b = Tensor.empty(32, 1024, dtype=dtypes.half), Tensor.empty(32, 1024, dtype=dtypes.half)
+    src = dsp_source((a.float() * b.float()).sum(axis=0))
+    self.assertIn("float128", src)
+
   def test_int_add_is_one_vector_op(self):
     src = dsp_source(Tensor.empty(4096, dtype=dtypes.int32) + Tensor.empty(4096, dtype=dtypes.int32))
     self.assertIn("(val0+val1)", src)
@@ -54,6 +61,11 @@ class TestDSPQfloat(unittest.TestCase):
     a, b, w = Tensor.empty(4096), Tensor.empty(4096), Tensor.empty(4096)
     src = dsp_source(a * w + b * w)
     self.assertNotIn("__hvx_", src)
+
+  def test_float_max_is_a_vector_op(self):
+    # a row max (softmax) stays scalar as the (a<b)?b:a statement expression; on qfloat targets it is HVX's vmax
+    src = dsp_source(Tensor.empty(48, 2048, dtype=dtypes.half).max(axis=0))
+    self.assertIn("__builtin_elementwise_max(", src)
 
   def test_off_below_v68(self):
     ops_dsp.HVX_QFLOAT = False
@@ -150,6 +162,18 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("_a = __hmx_ca((Lidx1)*18+(Ridx0)); if ((Lidx2)==0)", kernel)
     self.assertIn("_b = __hmx_cb((Lidx2)%2*18+(Ridx0)); if ((Lidx1)==0 && (Lidx2)%2==0)", kernel)
     self.assertEqual(kernel.count("__hmx_pack2x2("), 16)
+
+  def test_large_vtcm_pool(self):
+    # HMX_VTCM_KB > 256: A and B share one pool of loop-indexed slots, B after A's from a 32-slot boundary, K panels at a
+    # window-safe stride (18 K tiles -> 32 slots), so B (inner-indexed after the interchange) no longer goes through the
+    # tag cache
+    old = ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB
+    ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = 4096, 1792, 128
+    try: kernel = self.src(384, 576, 64).split("__attribute__((noinline)) void", 1)[1]
+    finally: ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = old
+    self.assertIn("_b = __hmx_ca(32+(Lidx2)*32+(Ridx0))", kernel)  # after A (18 slots, rounded to 32), 32 per panel
+    self.assertNotIn("__hmx_lookup(", kernel)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
 
   def test_plain_tile_op(self):
     src = self.src(64, 96, 64, acc=False)  # a shape not rendered above (to_program caches by AST)

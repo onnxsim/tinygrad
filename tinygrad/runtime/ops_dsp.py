@@ -129,11 +129,13 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   return v, lanes
 
 # NOTE: this just increases readability of the generated code
+def _vec_fmax(ctx, x:UOp) -> str|None:
+  return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
+
 dsp_string = PatternMatcher([
   # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
   # operand) where the scalar form keeps tinygrad's (a<b)?b:a -- they only differ on NaN
-  (UPat(Ops.MAX, dtype=(dtypes.float32, dtypes.half), name="x"),
-   lambda ctx,x: f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None),
+  (UPat(Ops.MAX, dtype=(dtypes.float32, dtypes.half), name="x"), lambda ctx,x: _vec_fmax(ctx, x)),
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
   (UPat(Ops.MUL, dtypes.float32, name="x"), lambda ctx,x:
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
@@ -195,6 +197,10 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
   return False
 
+# pattern functions get a snapshot of their globals when the matcher is first built (deconstruct_function): module flags are
+# read through a function so they stay live
+def _hvx_qfloat() -> bool: return HVX_QFLOAT
+
 def hvx_revectorize(x:UOp) -> UOp|None:
   srcs, n = x.src, len(x.src)
   if n < 2 or x.dtype == dtypes.void: return None
@@ -205,7 +211,7 @@ def hvx_revectorize(x:UOp) -> UOp|None:
     return s0.src[0]
   if s0.op not in _vec_ops() or s0.dtype == dtypes.bool or s0._shape != (): return None
   # a scalar float max renders as a statement expression; a vector one (qfloat targets) as HVX's native max (dsp_string)
-  if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not HVX_QFLOAT: return None
+  if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not _hvx_qfloat(): return None
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
   if not _vec_column_ok(srcs): return None
   return UOp(s0.op, s0.dtype, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)
@@ -285,7 +291,17 @@ static inline {vt} __{name}({vt} a, {vt} b, {vt} c) {{
 #   each K block             pack A, B rows into VTCM (one 128-byte halfword interleave per row pair) + one load pair
 #   after the reduce loop    __hmx_out(dst...)               (one :after.hf store, then HVX loads/shuffles into the acc array)
 # so each output tile is rounded to fp16 once (exact accumulation, like hmx_block.h) and nothing 2 KB-sized lives on the stack.
-_HMX_CA, _HMX_CB = 76, 40  # VTCM tile cache slots (2 KB each) for A and B (16 KB + 116 * 2 KB <= 256 KB)
+# VTCM tile cache slots (2 KB each) for A and B. HMX_VTCM_KB=256 (default): 16 KB + 116 * 2 KB, one 256 KB window. Larger
+# (the runtime must then give that much VTCM, 256 KB aligned): A from 64 KB, a multiple of 128 slots, then 128 B slots, and
+# every K panel at a stride of _hmx_stride(kt) slots -- no load pair (<= 32 tiles) crosses a 256 KB window (a PD fault), so
+# whole weight matrices (fc2: 16 x 64 tiles) stay packed across a call instead of being repacked per output tile
+HMX_VTCM_KB = getenv("HMX_VTCM_KB", 256)
+_HMX_AO, _HMX_CA, _HMX_CB = (65536, (HMX_VTCM_KB // 2 - 32 - 128) // 128 * 128, 128) if HMX_VTCM_KB > 256 else (16384, 76, 40)
+def _hmx_stride(kt:int) -> int:
+  # slots per K panel: a power of two (<= 32 tiles) or a multiple of 32, so from a 32-slot aligned base no 32-tile load pair
+  # crosses a 128-slot (256 KB) window; the default layout packs panels densely (it is one window)
+  if HMX_VTCM_KB <= 256: return kt
+  return 1 << (kt - 1).bit_length() if kt <= 32 else round_up(kt, 32)
 _HMX_ACC_HELPERS = r"""#pragma clang diagnostic ignored "-Wunused-function"
 typedef __fp16 __hmx_h32 __attribute__((ext_vector_type(32)));
 typedef __fp16 __hmx_h64 __attribute__((aligned(128),ext_vector_type(64)));
@@ -359,11 +375,11 @@ static int __hmx_t;
 /* VTCM (2 KB aligned): A stage x2 @0, B stage x2 @4 KB, out @8 KB, bias table @10 KB */
 static inline __fp16* __hmx_sa(void) { return (__fp16*)(__hmx_vtcm + 2048 * __hmx_t); }
 static inline __fp16* __hmx_sb(void) { return (__fp16*)(__hmx_vtcm + 4096 + 2048 * __hmx_t); }
-/* tile caches: A slots from 16 KB, B slots after them (the runtime gives 256 KB inside one 256 KB window) */
+/* tile caches: A slots from @AO@ bytes, B slots after them (HMX_VTCM_KB: the runtime gives that much, 256 KB aligned) */
 #define __HMX_CA @CA@
 #define __HMX_CB @CB@
-static inline __fp16* __hmx_ca(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * i); }
-static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + 16384 + 2048 * (__HMX_CA + i)); }
+static inline __fp16* __hmx_ca(int i) { return (__fp16*)(__hmx_vtcm + @AO@ + 2048 * i); }
+static inline __fp16* __hmx_cb(int i) { return (__fp16*)(__hmx_vtcm + @AO@ + 2048 * (__HMX_CA + i)); }
 static inline void __hmx_begin(void) {
   static unsigned int init = 0;
   if (init != __hmx_gen) {
@@ -466,7 +482,7 @@ static inline __fp16* __hmx_lookup(const void** tags, unsigned char* rr, __fp16*
   for (int w = 0; w < ways; w++) if (t[w] == key) return at(k * ways + w);
   int v = rr[k]; rr[k] = (unsigned char)(v + 1 == ways ? 0 : v + 1);
   t[v] = key; *slot = at(k * ways + v); return 0;
-}""".replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB))
+}""".replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB)).replace("@AO@", str(_HMX_AO))
 
 def _hmx_lane(u:UOp):
   # lane j of a vector value: INDEX(value, CAST(CONST j)) -> (value, j)
@@ -618,31 +634,44 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         outer, inner = (loops[1], loops[0]) if loops[2] else (loops[0], loops[1])
         ti = int(inner.vmax) + 1
         on, iname = f"{{{len(srcs)+1}}}", f"{{{len(srcs)+2}}}"
-        def exact(r, n, x, pack):
-          # slots contiguous in K for each tile index, so one spanning load pair can read them after the loop
+        def exact(r, n, x, pack, acc=None, off=0):
+          # slots contiguous in K for each tile index, so one spanning load pair can read them after the loop. Returns (code,
+          # the panel base expression, slots used); acc / off: the slot accessor and first slot (B in A's pool: "ca", A's use)
+          acc, o = acc or f"c{x}", f"{off}+" if off else ""
           deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
-          if deps == {inner} and kt * ti <= n: base, cond = f"({iname})*{kt}", f"({on})==0"
-          elif deps == {outer} and 2 * kt <= n and _hmx_pairable(r, outer, ranges):
+          st = _hmx_stride(kt)
+          if deps == {inner} and st * ti <= n: base, cond, used = f"{o}({iname})*{st}", f"({on})==0", st * ti
+          elif deps == {outer} and 2 * st <= n and _hmx_pairable(r, outer, ranges):
             # adjacent outer tiles share every 128-byte row line: pack tiles n, n+1 together on even n (vshuff of full rows)
             p0 = 0 if x == "a" else 32
-            pk = "".join(f" __hmx_pack2x2(_{x}+{64*q}, _{x}+{1024*kt+64*q}, {ptr[p0+2*q]}, {ptr[p0+2*q+1]});" for q in range(16))
+            pk = "".join(f" __hmx_pack2x2(_{x}+{64*q}, _{x}+{1024*st+64*q}, {ptr[p0+2*q]}, {ptr[p0+2*q+1]});" for q in range(16))
             pf = (f" if (({kr})==0) __hmx_prefetch_rows({ptr[p0]}, {ptr[p0+1]}, {64*kt});" if x == "a" else
                   f" if (({kr})==0) __hmx_prefetch_panel({ptr[p0]}, {ptr[p0+1]}, {32*kt});")
-            return (f" _{x} = __hmx_c{x}(({on})%2*{kt}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
-                    f"({on})%2*{kt}")
-          elif deps == {outer} and kt <= n: base, cond = "0", f"({iname})==0"
-          elif not deps and kt <= n: base, cond = "0", f"({on})==0 && ({iname})==0"
+            return (f" _{x} = __hmx_{acc}({o}({on})%2*{st}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
+                    f"{o}({on})%2*{st}", 2 * st)
+          elif deps == {outer} and kt <= n: base, cond, used = f"{off}", f"({iname})==0", st
+          elif not deps and kt <= n: base, cond, used = f"{off}", f"({on})==0 && ({iname})==0", st
           else: return None
           p0, p1 = (ptr[0], ptr[1]) if x == "a" else (ptr[32], ptr[33])
           # the whole K panel, on its first fill: A = 32 rows x K columns, B = K rows x 32 columns
           pf = (f" if (({kr})==0) __hmx_prefetch_rows({p0}, {p1}, {64*kt});" if x == "a" else
                 f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});")
-          return f" _{x} = __hmx_c{x}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}", base
-        ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
-        eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
+          return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}",
+                  base, used)
+        eb_acc = "cb"
+        if HMX_VTCM_KB > 256 and ro[0] and ro[1]:
+          # one pool (the B slots follow A's): A takes what it needs, B the rest from the next 32-slot boundary; if B doesn't
+          # fit, back to the fixed split (B then goes through its tag cache)
+          ea = exact(ra, _HMX_CA + _HMX_CB, "a", pa)
+          eb = exact(rb, _HMX_CA + _HMX_CB - round_up(ea[2], 32), "b", pb, "ca", round_up(ea[2], 32)) if ea else None
+          if eb: eb_acc = "ca"
+          else: ea, eb = exact(ra, _HMX_CA, "a", pa), exact(rb, _HMX_CB, "b", pb)
+        else:
+          ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
+          eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
         if ea and eb:
           # K tiles stay in VTCM: no load pair per K block, one spanning pair after the loop (see the output statement)
-          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname)
+          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc)
           ea, eb = ea[0], eb[0]
         else: ea, eb = ea and ea[0], eb and eb[0]
         pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
@@ -666,9 +695,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     def span_mac(srcs0:tuple) -> tuple[str, tuple]:
       # after the loop: the spanning load pair(s) over all K tiles, rendered with the tile loops' indices
       if w not in span: return "", ()
-      ab, bb, kt_, o_, i_, on_, in_ = span[w]
+      ab, bb, kt_, o_, i_, on_, in_, bacc = span[w]
       for k_, v_ in ((on_, "{%d}" % len(srcs0)), (in_, "{%d}" % (len(srcs0)+1))): ab, bb = ab.replace(k_, v_), bb.replace(k_, v_)
-      return f" __hmx_mac_span(__hmx_ca({ab}), __hmx_cb({bb}), {kt_});", (o_, i_)
+      return f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});", (o_, i_)
     # after the loop: one store, then each accumulator-array vector = the same lanes of the output tile
     outs = []
     for k, so in enumerate(stores):
