@@ -1410,6 +1410,128 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
   drop |= dead
   return len(done)
 
+# ---- ORT's QLinearAdd, exactly: y = clamp(rne(rb*b + (ra*a + fixed)), 0, 255) in separate fp32 operations in that order (MLAS),
+# fixed = zy - (ra*za + rb*zb). Spelled as tinygrad float ops it can't be exact on any backend: symbolic reassociates the adds
+# ((a*ra + b*rb) + fixed, round()'s +-0.5 folded into the constant), and which input the constant pairs with is lost. So it is a
+# custom kernel over 2 KB chunks calling one helper per chunk (onnxsim's hmx_gemm/runner rn_add): HVX fixed point v * 2^F from
+# the exact products a * mantissa(ra) (12-bit halves), round half up, lanes within the window of ORT's four fp32 roundings of a
+# .5 recomputed with ORT's sequence on the scalar core; one vector -> scalar flag check per chunk
+_HMX_QADD_HELPERS = r"""#pragma clang diagnostic ignored "-Wunused-function"
+#ifndef __HMX_QADD
+#define __HMX_QADD
+#ifdef HMX_REF
+static void __hmx_qadd_chunk(unsigned char* y, const unsigned char* a, const unsigned char* b, int nvec, float ra, float rb, float fixed,
+                             int ah, int al, int bh, int bl, int sa, int sb, int fq, int F, int win) {
+  (void)ah; (void)al; (void)bh; (void)bl; (void)sa; (void)sb; (void)fq; (void)F; (void)win;
+  for (int i = 0; i < 128 * nvec; i++) {
+    volatile float t1 = ra * (float)a[i], t2 = t1 + fixed, t3 = rb * (float)b[i], v = t3 + t2;
+    float c = v < 0.0f ? 0.0f : v > 255.0f ? 255.0f : v;
+    volatile float r = c + 12582912.0f;
+    y[i] = (unsigned char)(int)(r - 12582912.0f);
+  }
+}
+#else
+typedef int __hmx_qv __attribute__((vector_size(128)));
+typedef int __hmx_qvp __attribute__((vector_size(256)));
+/* one word half: v = (a*ma >> sa) + (b*mb >> sb) + fq in 2^-F units from the 12-bit mantissa halves, r = round half up, f = 1
+ * where |frac - .5| < win (the sign bit of |frac - half| - win: no vector predicates, their builtins assert in this toolchain) */
+__attribute__((always_inline)) static inline __hmx_qv __hmx_qadd_w(__hmx_qv xa, __hmx_qv xl, __hmx_qv xb, __hmx_qv xm, int sa, int sb,
+                                                                    __hmx_qv fq, __hmx_qv half, __hmx_qv mask, __hmx_qv win, int F, __hmx_qv* f) {
+  __hmx_qv t = __builtin_HEXAGON_V6_vaddw_128B(__builtin_HEXAGON_V6_vaslw_128B(xa, 12 - sa), __builtin_HEXAGON_V6_vlsrw_128B(xl, sa));
+  __hmx_qv u = __builtin_HEXAGON_V6_vaddw_128B(__builtin_HEXAGON_V6_vaslw_128B(xb, 12 - sb), __builtin_HEXAGON_V6_vlsrw_128B(xm, sb));
+  __hmx_qv v = __builtin_HEXAGON_V6_vaddw_128B(__builtin_HEXAGON_V6_vaddw_128B(t, u), fq);
+  __hmx_qv d = __builtin_HEXAGON_V6_vabsw_128B(__builtin_HEXAGON_V6_vsubw_128B(__builtin_HEXAGON_V6_vand_128B(v, mask), half));
+  *f = __builtin_HEXAGON_V6_vlsrw_128B(__builtin_HEXAGON_V6_vsubw_128B(d, win), 31);
+  return __builtin_HEXAGON_V6_vasrw_128B(__builtin_HEXAGON_V6_vaddw_128B(v, half), F);
+}
+/* 64 halfword lanes (a, b unpacked): both word halves of the products, straight-line so the two chains interleave */
+__attribute__((always_inline)) static inline __hmx_qv __hmx_qadd_half(__hmx_qv va, __hmx_qv vb, int ah, int al, int bh, int bl, int sa, int sb,
+                                                                       __hmx_qv fq, __hmx_qv half, __hmx_qv mask, __hmx_qv win, int F, __hmx_qv* fl) {
+  __hmx_qvp pah = __builtin_HEXAGON_V6_vmpyh_128B(va, ah), pal = __builtin_HEXAGON_V6_vmpyh_128B(va, al);
+  __hmx_qvp pbh = __builtin_HEXAGON_V6_vmpyh_128B(vb, bh), pbl = __builtin_HEXAGON_V6_vmpyh_128B(vb, bl);
+  __hmx_qv f0, f1;
+  __hmx_qv r0 = __hmx_qadd_w(__builtin_HEXAGON_V6_lo_128B(pah), __builtin_HEXAGON_V6_lo_128B(pal), __builtin_HEXAGON_V6_lo_128B(pbh),
+                             __builtin_HEXAGON_V6_lo_128B(pbl), sa, sb, fq, half, mask, win, F, &f0);
+  __hmx_qv r1 = __hmx_qadd_w(__builtin_HEXAGON_V6_hi_128B(pah), __builtin_HEXAGON_V6_hi_128B(pal), __builtin_HEXAGON_V6_hi_128B(pbh),
+                             __builtin_HEXAGON_V6_hi_128B(pbl), sa, sb, fq, half, mask, win, F, &f1);
+  *fl = __builtin_HEXAGON_V6_vsatwh_128B(f1, f0);
+  return __builtin_HEXAGON_V6_vsatwh_128B(r1, r0);
+}
+static void __hmx_qadd_chunk(unsigned char* y, const unsigned char* a, const unsigned char* b, int nvec, float ra, float rb, float fixed,
+                             int ah, int al, int bh, int bl, int sa, int sb, int fq, int F, int win) {
+  __hmx_qv fl[16] __attribute__((aligned(128))), any = __builtin_HEXAGON_V6_vd0_128B();
+  /* the inputs stream from DDR: L2-prefetch the next chunk of both while this one computes (16 lines of 128 bytes) */
+  __builtin_HEXAGON_Y4_l2fetch((void*)(a + 2048), (128u << 16) | (128u << 8) | 16u);
+  __builtin_HEXAGON_Y4_l2fetch((void*)(b + 2048), (128u << 16) | (128u << 8) | 16u);
+  int ahh = (ah << 16) | ah, all = (al << 16) | al, bhh = (bh << 16) | bh, bll = (bl << 16) | bl;
+  __hmx_qv fqv = __builtin_HEXAGON_V6_lvsplatw_128B(fq), half = __builtin_HEXAGON_V6_lvsplatw_128B(1 << (F - 1));
+  __hmx_qv mask = __builtin_HEXAGON_V6_lvsplatw_128B((1 << F) - 1), winv = __builtin_HEXAGON_V6_lvsplatw_128B(win);
+  for (int k = 0; k < nvec; k++) {
+    __hmx_qvp ua = __builtin_HEXAGON_V6_vunpackub_128B(((const __hmx_qv*)a)[k]), ub = __builtin_HEXAGON_V6_vunpackub_128B(((const __hmx_qv*)b)[k]);
+    __hmx_qv f0, f1;
+    __hmx_qv y0 = __hmx_qadd_half(__builtin_HEXAGON_V6_lo_128B(ua), __builtin_HEXAGON_V6_lo_128B(ub), ahh, all, bhh, bll, sa, sb, fqv, half, mask, winv, F, &f0);
+    __hmx_qv y1 = __hmx_qadd_half(__builtin_HEXAGON_V6_hi_128B(ua), __builtin_HEXAGON_V6_hi_128B(ub), ahh, all, bhh, bll, sa, sb, fqv, half, mask, winv, F, &f1);
+    ((__hmx_qv*)y)[k] = __builtin_HEXAGON_V6_vpackhub_sat_128B(y1, y0);
+    fl[k] = __builtin_HEXAGON_V6_vpackhub_sat_128B(f1, f0);
+    any = __builtin_HEXAGON_V6_vor_128B(any, fl[k]);
+  }
+  for (int r = 64; r >= 4; r >>= 1) any = __builtin_HEXAGON_V6_vor_128B(any, __builtin_HEXAGON_V6_vror_128B(any, r));
+  if (__builtin_expect(!__builtin_HEXAGON_V6_extractw_128B(any, 0), 1)) return;
+  const unsigned long long* fw = (const unsigned long long*)fl;  /* 64-bit words, skipping the (almost always) zero ones */
+  for (int w = 0; w < 16 * nvec; w++) {
+    unsigned long long bits = fw[w];
+    while (bits) {
+      int j = __builtin_ctzll(bits) / 8, off = 8 * w + j;
+      bits &= ~(0xffull << (8 * j));
+      float t1 = __builtin_HEXAGON_F2_sfmpy(ra, __builtin_HEXAGON_F2_conv_w2sf(a[off]));
+      float t2 = __builtin_HEXAGON_F2_sfadd(t1, fixed);
+      float t3 = __builtin_HEXAGON_F2_sfmpy(rb, __builtin_HEXAGON_F2_conv_w2sf(b[off]));
+      int v = __builtin_HEXAGON_F2_conv_sf2w(__builtin_HEXAGON_F2_sfadd(t3, t2));
+      y[off] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
+    }
+  }
+}
+#endif
+#endif
+"""
+
+def _hmx_qadd_consts(ra:float, rb:float, fixed:float) -> tuple:
+  # the fixed-point form of ORT's add (onnxsim hmx_gemm/runner/rn_load.h): v * 2^F = a*ra*2^F + b*rb*2^F + fixed*2^F from
+  # 24-bit mantissas in 12-bit halves, and the window: our truncations (< 3 units) + half an ulp of each of ORT's 4 fp32 roundings
+  import math
+  bound = 255.0 * (ra + rb) + abs(fixed) + 1
+  F = min(21, math.floor(math.log2(2.0 ** 30 / bound)))
+  (fa, ea), (fb, eb) = math.frexp(ra), math.frexp(rb)
+  ma, mb = round(math.ldexp(fa, 24)), round(math.ldexp(fb, 24))
+  sa, sb = -(ea - 24) - F, -(eb - 24) - F
+  if not (0 <= sa <= 12 and 0 <= sb <= 12): raise ValueError(f"QLinearAdd scale ratios {ra} / {rb} out of the supported range")
+  fq = round(math.ldexp(fixed, F))
+  ulp = lambda x: math.ldexp(1.0, math.floor(math.log2(x)) - 23)
+  win = math.ceil(3.0 + math.ldexp(0.5 * (ulp(255.0 * ra) + ulp(255.0 * rb) + ulp(255.0 * ra + abs(fixed) + 1) + ulp(bound)), F)) + 2
+  return (ma >> 12, ma & 4095, mb >> 12, mb & 4095, sa, sb, fq, F, win)
+
+def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
+  """ORT's QLinearAdd on uint8 a, b (same shape; ra, rb, fixed as ORT computes them in fp32): exactly
+  clamp(rne(rb*b + (ra*a + fixed)), 0, 255), as one DSP kernel over 2 KB chunks. numel % 128 == 0."""
+  import struct
+  from tinygrad import Tensor
+  from tinygrad.uop.ops import KernelInfo
+  f32 = lambda x: struct.unpack("f", struct.pack("f", x))[0]
+  ra, rb, fixed = f32(ra), f32(rb), f32(fixed)
+  n = a.numel()
+  assert a.dtype == b.dtype == dtypes.uint8 and b.numel() == n and n % 128 == 0, "uint8 inputs of the same size, a multiple of 128"
+  c = ", ".join(str(x) for x in _hmx_qadd_consts(ra, rb, fixed))
+  fl = lambda x: f"{x.hex()}f" if x != 0 else "0.0f"
+  nv = n // 128
+  def kern(Y, A, B):
+    Y, A, B = Y.flatten(), A.flatten(), B.flatten()
+    i = UOp.range((n + 2047) // 2048, 0)
+    cu = UOp(Ops.CUSTOM, dtypes.void, (Y.index(i * 2048), A.index(i * 2048), B.index(i * 2048), i),
+             arg=f"__hmx_qadd_chunk({{0}}, {{1}}, {{2}}, {nv}-16*{{3}} < 16 ? {nv}-16*{{3}} : 16, {fl(ra)}, {fl(rb)}, {fl(fixed)}, {c});")
+    return cu.end(i).sink(arg=KernelInfo(name=f"qadd_{n}", opts_to_apply=()))
+  y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
+  return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
+
 def _hmx_bail(uops, why:int):
   if getenv("HMX_DEBUG"): print(f"hmx_acc rewrite skipped (check {why})")
   return uops, False
@@ -1823,6 +1945,7 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

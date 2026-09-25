@@ -349,5 +349,32 @@ class TestDSPHmxI8(unittest.TestCase):
     t = Tensor.empty(64, 64, dtype=dtypes.uint8).matmul(Tensor.empty(64, 64, dtype=dtypes.uint8), dtype=dtypes.int32)
     self.assertNotIn("__hmx_i8_", dsp_source(t, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65))
 
+class TestDSPQLinearAdd(unittest.TestCase):
+  # ORT's QLinearAdd as a custom kernel (tinygrad float ops would reassociate the adds): one helper call per 2 KB chunk with the
+  # fixed-point constants rendered as immediates, the fp32 scales as exact hex floats
+  def test_qadd_custom_kernel(self):
+    import struct
+    a, b = Tensor.empty(56 * 56 * 64, dtype=dtypes.uint8), Tensor.empty(56 * 56 * 64, dtype=dtypes.uint8)
+    src = dsp_source(ops_dsp.hmx_qlinear_add(a, b, 0.6052, 0.8630, -120.4))
+    kernel = src[src.index("void qadd_200704"):]
+    self.assertIn("for (int Lidx0 = 0; Lidx0 < 98; Lidx0++)", kernel)
+    self.assertIn("__hmx_qadd_chunk((data0_200704+alu0), (data1_200704+alu0), (data2_200704+alu0), 1568-16*Lidx0 < 16 ? ", kernel)
+    self.assertIn(struct.unpack("f", struct.pack("f", 0.6052))[0].hex() + "f", kernel)  # the fp32 scale, exactly
+    self.assertIn("static void __hmx_qadd_chunk(", src)
+
+  def test_qadd_consts(self):
+    # a * ra exactly as (a * ah << (12 - sa)) + (a * al >> sa) in 2^-F units (ra's 24-bit mantissa in 12-bit halves), the constant
+    # at 2^-F, and F as large as fits the sum in 31 bits (<= 21)
+    import math
+    ra, rb, fixed = 0.6052000117301941, 0.8629999756813049, -120.4000015258789
+    ah, al, bh, bl, sa, sb, fq, F, win = ops_dsp._hmx_qadd_consts(ra, rb, fixed)
+    for m, h, l, sh, r in ((ah << 12 | al, ah, al, sa, ra), (bh << 12 | bl, bh, bl, sb, rb)):
+      self.assertEqual(m, round(math.ldexp(math.frexp(r)[0], 24)))
+      self.assertTrue(0 <= sh <= 12)
+      for x in (1, 77, 255): self.assertEqual((x * h << (12 - sh)) + (x * l >> sh), math.floor(x * m / 2 ** sh))
+    self.assertEqual(fq, round(fixed * 2 ** F))
+    self.assertEqual(F, min(21, math.floor(math.log2(2 ** 30 / (255 * (ra + rb) + abs(fixed) + 1)))))
+    self.assertGreater(win, 3)
+
 if __name__ == '__main__':
   unittest.main()
