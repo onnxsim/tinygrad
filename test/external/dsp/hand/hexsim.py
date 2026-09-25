@@ -34,22 +34,26 @@ def _cc(work:pathlib.Path, srcs, out:str, extra=()):
 
 @contextlib.contextmanager
 def capture_dsp(match=("__hmx_", "WMMA")):
-  """record MOCKDSP kernel calls whose source contains one of `match` as (source, [argument bytes]) instead of running them"""
+  """record MOCKDSP kernel calls whose source contains one of `match` as (source, [argument bytes]) instead of running them.
+  Sources are keyed by the compiled binary (compile_cached sees every source, cached or not; tinygrad compiles a whole schedule
+  before it creates any runtime, so "the last rendered source" would be wrong)"""
   from tinygrad.helpers import to_mv
   from tinygrad.runtime import ops_dsp
   calls: list[tuple[str, list[bytes]]] = []
-  srcs: list[str] = []
-  o_render, o_init, o_call = ops_dsp.DSPRenderer.render, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__
-  def render(self, uops):
-    s = o_render(self, uops); srcs.append(s); return s
-  def init(self, dev, obj): o_init(self, dev, obj); self._src = srcs[-1] if srcs else ""
+  src_of: dict[bytes, str] = {}
+  o_cc, o_init, o_call = ops_dsp.DSPCompiler.compile_cached, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__
+  def compile_cached(self, src:str) -> bytes:
+    lib = o_cc(self, src); src_of[bytes(lib)] = src; return lib
+  def init(self, dev, obj): o_init(self, dev, obj); self._src = src_of.get(bytes(obj.lib), "")
   def call(self, *bufs, vals=(), **kw):
     if any(m in getattr(self, "_src", "") for m in match):
       calls.append((self._src, [bytes(to_mv(b.va_addr, b.size)) for b in bufs])); return 0.0
     return o_call(self, *bufs, vals=vals, **kw)
-  ops_dsp.DSPRenderer.render, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__ = render, init, call
-  try: yield calls
-  finally: ops_dsp.DSPRenderer.render, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__ = o_render, o_init, o_call
+  ops_dsp.DSPCompiler.compile_cached, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__ = compile_cached, init, call
+  from tinygrad.helpers import Context
+  try:
+    with Context(PARALLEL=0): yield calls  # compile in this process, where the hook is
+  finally: ops_dsp.DSPCompiler.compile_cached, ops_dsp.MockDSPProgram.__init__, ops_dsp.MockDSPProgram.__call__ = o_cc, o_init, o_call
 
 MAIN = r"""#include <stdio.h>
 unsigned char* __hmx_vtcm;

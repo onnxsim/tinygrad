@@ -4,7 +4,7 @@ import dataclasses, functools, io, math, types, warnings, pathlib, sys, os, stru
 from tinygrad.nn.state import TensorIO
 from tinygrad.tensor import Tensor, is_numpy_ndarray
 from tinygrad.mixin.op import ReductionStr
-from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context
+from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, TC_OPT
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
 from tinygrad.uop.ops import sint, _broadcast_shape
@@ -439,7 +439,26 @@ class OnnxRunner:
     if (cached := self._python_const_cache.get(name)) is None: cached = self._python_const_cache[name] = _to_python_const(t)
     return cached
 
+  def _qdq_grid(self):
+    # a static QDQ graph (onnxsim full_qdq + quantized_io NHWC input) on the DSP's HMX: lowered as a whole (nn/onnx_qdq.py),
+    # bit-exact against ORT CPU; any node it doesn't cover keeps the generic per-node path. QDQ_HMX=1 forces it on any device
+    # (the kernels only render on DSP), QDQ_HMX=0 turns it off
+    if not hasattr(self, "_qdq_net"):
+      self._qdq_net = None
+      from tinygrad.device import Device
+      if getenv("QDQ_HMX", int(Device.DEFAULT == "DSP" and bool(getenv("HMX")))) and not self.graph_name:
+        from tinygrad.nn.onnx_qdq import QDQGridNet
+        try: self._qdq_net = QDQGridNet(self.graph_nodes, self.graph_values, self.graph_inputs)
+        except NotImplementedError as e:
+          if debug >= 1: print(f"QDQ grid lowering not used: {e}")
+    return self._qdq_net
+
   def __call__(self, inputs:dict[str, Any], debug=debug):
+    if (net:=self._qdq_grid()) is not None:
+      name = net.in_name
+      if name not in inputs: raise RuntimeError(f"Please provide input data for {name}")
+      x = self._parse_input(name, inputs[name], self.graph_inputs[name])
+      with Context(TC_OPT=max(1, TC_OPT.value)): return {self.graph_outputs[0]: net(x).realize()}
     with Context(TRAINING=int(self.is_training)):
       for name, input_spec in self.graph_inputs.items():
         if name not in inputs: raise RuntimeError(f"Please provide input data for {name}")
