@@ -265,8 +265,9 @@ class TestDSPHmxI8(unittest.TestCase):
     self.assertIn("#ifdef HMX_REF", src)
     self.assertEqual(kernel.count("__hmx_i8_begin();"), 1)
     self.assertNotIn("__WMMA_", kernel)
-    # A: packed once per M tile into loop-indexed VTCM slots
-    self.assertEqual(kernel.count("__hmx_i8_pack_a4("), 16)
+    # A: packed once per M tile into loop-indexed VTCM slots, four K blocks at a time (row-major A: consecutive K blocks are
+    # the four 32-byte quarters of the same 128-byte row lines)
+    self.assertEqual(kernel.count("__hmx_i8_pack_a4x4("), 16)
     self.assertIn("__hmx_ca(0+(Lidx1)*8+(Ridx0))", kernel)
 
   def test_i8_quad_b_deep_and_planes(self):
