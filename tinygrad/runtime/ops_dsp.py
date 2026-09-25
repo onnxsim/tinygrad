@@ -744,6 +744,7 @@ static inline void __hmx_i8_begin(void) { for (int i = 0; i < 2048; i++) __hmx_i
 static inline void __hmx_i8_pack_a4(unsigned char* d, const unsigned char* r0, const unsigned char* r1, const unsigned char* r2, const unsigned char* r3) {
   for (int j = 0; j < 32; j++) { d[j] = r0[j]; d[32 + j] = r1[j]; d[64 + j] = r2[j]; d[96 + j] = r3[j]; }
 }
+static inline void __hmx_i8_copy_a(unsigned char* d, const unsigned char* src) { for (int i = 0; i < 2048; i++) d[i] = src[i]; }
 static inline void __hmx_i8_pack_b4(signed char* d, const signed char* r0, const signed char* r1, const signed char* r2, const signed char* r3) {
   for (int n = 0; n < 32; n++) { d[4 * n] = r0[n]; d[4 * n + 1] = r1[n]; d[4 * n + 2] = r2[n]; d[4 * n + 3] = r3[n]; }
 }
@@ -818,6 +819,12 @@ static inline void __hmx_i8_pack_b4(signed char* d, const signed char* r0, const
   __hmx_vp x = __builtin_HEXAGON_V6_vshuffvdd_128B(__hmx_row32(r1), __hmx_row32(r0), -1);
   __hmx_vp y = __builtin_HEXAGON_V6_vshuffvdd_128B(__hmx_row32(r3), __hmx_row32(r2), -1);
   *(__hmx_v*)d = __builtin_HEXAGON_V6_lo_128B(__builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(y), __builtin_HEXAGON_V6_lo_128B(x), -2));
+}
+/* 64 activation rows that are one contiguous 2 KB (rows at a 32-byte stride: a 32-channel-block layout) -> the tile: 16
+ * unaligned 128-byte loads, 16 aligned stores */
+typedef int __hmx_i8vu __attribute__((vector_size(128), aligned(1)));
+static inline void __hmx_i8_copy_a(unsigned char* d, const unsigned char* src) {
+  for (int q = 0; q < 16; q++) ((__hmx_v*)d)[q] = (__hmx_v)((const __hmx_i8vu*)src)[q];
 }
 static inline void __hmx_i8_mac(const void* a, const void* b) {
   __asm__ volatile("{ activation.ub = mxmem(%0,%1):cm\n weight.b = mxmem(%2,%3) }" :: "r"(a), "r"(0x7ff), "r"(b), "r"(0x3ff) : "memory");
@@ -1161,6 +1168,8 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
   ptr = [f"((const unsigned char*){{{vals.index(v)}}}+{b})" if b else f"((const unsigned char*){{{vals.index(v)}}})" for v, b in ra] + \
         [f"((const signed char*){{{vals.index(v)}}}+{b})" if b else f"((const signed char*){{{vals.index(v)}}})" for v, b in rb]
   pa = "".join(f" __hmx_i8_pack_a4((unsigned char*)_a+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
+  # the 64 rows contiguous (row r at row 0 + 32 r bytes): one 2 KB copy instead of 64 row gathers
+  if getenv("HMX_I8_CONTIG_A", 1) and _hmx_contig_rows(ra, [u for u in uops if u.op is Ops.RANGE]): pa = f" __hmx_i8_copy_a((unsigned char*)_a, {ptr[0]});"
   pb = "".join(f" __hmx_i8_pack_b4((signed char*)_b+{128*q}, {ptr[64+4*q]}, {ptr[65+4*q]}, {ptr[66+4*q]}, {ptr[67+4*q]});" for q in range(8))
   srcs = tuple(v.src[0] for v in vals)
   code = "{{ void* _a = __hmx_i8sa(); void* _b = __hmx_i8sb();" + pa + pb + " __hmx_i8_mac(_a, _b); }}"
@@ -1814,6 +1823,19 @@ def _hmx_quad_rows(rows, n:UOp, ranges:list[UOp]) -> bool:
     return _hmx_const_delta(g, ranges)
   stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, n: env[n] + 1}))
   return stride is not None and stride % 128 == 0 and nxt == 32
+
+def _hmx_contig_rows(rows, ranges:list[UOp]) -> bool:
+  # the operand's rows at a 32-byte stride from row 0, for any loop values: one contiguous 2 KB tile
+  def addr(v, b):
+    ix = v.src[0].src[1] if len(v.src) >= 1 and v.src[0].op in (Ops.INDEX, Ops.SHRINK) and len(v.src[0].src) >= 2 else None
+    return (lambda env: None if ix is None or (a:=_hmx_eval(ix, env)) is None else a + b), (v.src[0].src[0] if ix is not None else None)
+  a0, base0 = addr(*rows[0])
+  if base0 is None: return False
+  for r, (v, b) in enumerate(rows[1:], start=1):
+    ar, base = addr(v, b)
+    if base is not base0 or _hmx_const_delta(lambda env: None if (x:=ar(env)) is None or (y:=a0(env)) is None else x - y, ranges) != 32 * r:
+      return False
+  return True
 
 def _hmx_quad_k_rows(rows, k:UOp, ranges:list[UOp]) -> bool:
   # 32-byte row windows (their own loads) that move 32 bytes on per K block (loop k) and sit 128-byte aligned at k % 4 == 0: K
