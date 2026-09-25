@@ -2003,8 +2003,13 @@ class DSPRenderer(ClangRenderer):
     return ret
 
   def render_vector_prefix(self, dt, count:int) -> str:
+    if dtypes.is_bool(dt):
+      # a clang ext_vector_type of _Bool is a *bit* vector (N bools packed into N bits in memory), so storing a
+      # "_Bool8" writes one byte where tinygrad's bool buffer has eight, and a 128-lane one aborts the Hexagon backend
+      # ("Cannot select: store (s128)"). A byte per lane, 0 or 1, is tinygrad's bool layout: keep the name, change the lane.
+      vec = self._render_dtype(dt, count, AddrSpace.REG)
+      return "\n".join(f"typedef unsigned char {v} __attribute__((aligned(1),ext_vector_type({count})));" for v in (vec, vec+"_u"))
     ret = super().render_vector_prefix(dt, count)
-    if dtypes.is_bool(dt): return ret
     vec = self._render_dtype(dt, count, AddrSpace.REG)
     return ret + f"\ntypedef {self.render_dtype(dt)} {vec}_u __attribute__((aligned({dt.itemsize}),ext_vector_type({count})));"
 
@@ -2135,7 +2140,9 @@ class DSPCompiler(Compiler):
   def compile(self, src:str) -> bytes:
     # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
     with tempfile.NamedTemporaryFile(delete=True) as f:
-      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -fno-stack-protector -x c -fPIC " +
+      # -Wno-unused-variable: _splat_of_loaded_lane re-reads a splatted lane as a scalar, which can leave the vector load it
+      # replaced declared but unused (dead at -O2, but -Werror rejects the kernel)
+      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -Wno-unused-variable -fno-stack-protector -x c -fPIC " +
              f"-ffreestanding -nostdlib - -o {f.name}" + (f" -x none {self.libgcc}" if self.libgcc else ""), input=src.encode())
       return pathlib.Path(f.name).read_bytes()
 
@@ -2268,7 +2275,26 @@ static unsigned int inscount(void) {{ unsigned int ret; __asm__ volatile(".word 
 static void *mmap2(void *addr, unsigned int length, int prot, int flags, int fd, unsigned long offset) {{
 return (void*)syscall((long)addr, length, prot, flags, fd, offset, 222); }}'''
 
+# float32 trunc without libm: the freestanding qemu link (-nostdlib) has no truncf, which clang emits for
+# __builtin_truncf on Hexagon (floor/ceil/round decompose to TRUNC). Exact for every input (clears the fraction bits;
+# |x| < 1 keeps only the sign, so -0.5 -> -0.0; |x| >= 2^23, inf and NaN pass through).
+_TRUNCF = "({union{float f;unsigned u;} _v={(%s)}; int _e=(int)((_v.u>>23)&255u)-127; " \
+          "_v.u&=_e<0?0x80000000u:(_e<23?~((1u<<(23-_e))-1u):0xffffffffu); _v.f;})"
+
+# LLVM 19's Hexagon backend aborts ("Cannot select: v8i8 = bitcast <v8i1 HexagonISD::V2Q>") when a few scalar float compares,
+# ANDed with other bools, get packed into one small (4/8-lane) char/int vector -- a lane-stacked store of compare results,
+# e.g. a pairwise IoU test. Without HVX float (v65/v66) the compares can't be vectorized profitably anyway: an empty asm on
+# each scalar float compare result keeps it a scalar predicate and the backend never forms the v8i1.
+_FCMP = "({_Bool _c=(%s); __asm__(\"\" : \"+r\"(_c)); _c;})"
+def _scalar_fcmp(ctx, x:UOp) -> str|None:
+  if HVX_QFLOAT or x.max_numel() != 1 or x.src[0].max_numel() != 1 or not dtypes.is_float(x.src[0].dtype): return None
+  return _FCMP % ctx.code_for_op[x.op](*[ctx[s] for s in x.src], x.src[0].dtype)
+mock_dsp_string = PatternMatcher([(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="x"), _scalar_fcmp)])
+
 class MockDSPRenderer(DSPRenderer):
+  string_rewrite = mock_dsp_string+DSPRenderer.string_rewrite
+  code_for_op = {**DSPRenderer.code_for_op,
+                 Ops.TRUNC: lambda x,dtype: _TRUNCF % x if dtype == dtypes.float32 else ClangRenderer.code_for_op[Ops.TRUNC](x, dtype)}
   def __init__(self, target:Target):
     self.target, self.compiler, self.tensor_cores = target, DSPCompiler(mock=True), _dsp_tcs()
     self._qf_math_on()
