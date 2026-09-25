@@ -1327,20 +1327,28 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
   # uint8 row stores of 32 lanes that are each an ORT-exact requantization of the same lane of the same vector loads
   # (accumulator, bias, per-column scale): the lanes go; the four rows of one 128-lane accumulator load (same bias, scale,
   # zero point) become one HVX __hmx_rq4, any other row one __hmx_rq1
+  # a row: (store, j) = lanes 32j .. 32j+31 of a uint8 store of 32k lanes (k rows of 32 contiguous bytes: a 32-channel-block
+  # output layout stores 4 pixels at once), at the store's address + 32j
   rows = []
   for st in uops:
-    if st.op is not Ops.STORE or st.src[1].op is not Ops.STACK or st.src[1].dtype != dtypes.uchar or len(st.src[1].src) != 32: continue
-    ms = [_hmx_rq_lane(x) for x in st.src[1].src]
-    if any(m is None for m in ms) or len({(m[3], m[4]) for m in ms}) != 1: continue
-    cols = [tuple(m[i] for m in ms) for i in range(3)]
-    if cols[1][0] is None: cols[1] = None
-    picks = []
-    for c in cols:
-      if c is None: picks.append(None); continue
-      o, ld = c[0][1], c[0][0]
-      if len({t[0] for t in c}) != 1 or [t[1] for t in c] != list(range(o, o + 32)) or o % 32 or len(ld.shape) != 1 or ld.shape[0] % 32: break
-      picks.append((ld, o))
-    else: rows.append((st, picks, ms[0][3], ms[0][4]))
+    if st.op is not Ops.STORE or st.src[1].op is not Ops.STACK or st.src[1].dtype != dtypes.uchar or len(st.src[1].src) % 32: continue
+    srows = []
+    for j in range(len(st.src[1].src) // 32):
+      ms = [_hmx_rq_lane(x) for x in st.src[1].src[32 * j:32 * j + 32]]
+      if any(m is None for m in ms) or len({(m[3], m[4]) for m in ms}) != 1: break
+      cols = [tuple(m[i] for m in ms) for i in range(3)]
+      if cols[1][0] is None: cols[1] = None
+      picks = []
+      for c in cols:
+        if c is None: picks.append(None); continue
+        o, ld = c[0][1], c[0][0]
+        if len({t[0] for t in c}) != 1 or [t[1] for t in c] != list(range(o, o + 32)) or o % 32 or len(ld.shape) != 1 or ld.shape[0] % 32: break
+        picks.append((ld, o))
+      else:
+        srows.append(((st, j), picks, ms[0][3], ms[0][4])); continue
+      break
+    if len(srows) == len(st.src[1].src) // 32: rows += srows  # all of the store's rows, or none of it
+  rp = lambda k, j: f"({{{k}}}+{32 * j})" if j else f"{{{k}}}"  # row j's pointer from its store's (placeholder k)
   def pick(k:int, o:int, n:int) -> str:
     return f"{{{k}}}" if n == 32 else f"__builtin_shufflevector({{{k}}}, {{{k}}}, {', '.join(str(o+i) for i in range(32))})"
   groups: dict[tuple, dict[int, tuple]] = {}
@@ -1348,20 +1356,21 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
     st, (a, b, m), zy, lo = r
     if a[0].shape == (128,) and (b is None or b[1] == 0) and m[1] == 0:
       groups.setdefault((a[0], b and b[0], m[0], zy, lo), {})[a[1] // 32] = r
-  done = set()
+  done_rows: set = set()
   quads = []
   for (al, bl, ml, zy, lo), g in groups.items():
     if sorted(g) != [0, 1, 2, 3]: continue
-    sts = [g[j][0] for j in range(4)]
+    rws = [g[j][0] for j in range(4)]
+    sts = [r[0] for r in rws]
     # the accumulator rows go in by address (al's pointer into the accumulator array), not as the loaded 128 lanes
     loads = [al.src[0], ml] + ([bl] if bl is not None else [])
     ptrs = tuple(x.src[0] for x in sts)
     bias = pick(2, 0, bl.shape[0]) if bl is not None else "(__hmx_i32x32)(0)"
     k = len(loads)
-    args = f"{{{k}}}, {{{k+1}}}, {{{k+2}}}, {{{k+3}}}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo}"
+    args = f"{rp(k, rws[0][1])}, {rp(k+1, rws[1][1])}, {rp(k+2, rws[2][1])}, {rp(k+3, rws[3][1])}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo}"
     quads.append((max(sts, key=lambda x: pos[x]), tuple(loads) + ptrs, args))
     drop.update(sts)
-    done.update(sts)
+    done_rows.update(rws)
   # fast path per group, flags ORed per run of groups between two uses of the same accumulator row (an output tile); one check
   # after the run redoes all of it exactly when anything flagged
   quads.sort(key=lambda q: pos[q[0]])
@@ -1415,13 +1424,28 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
         srcs = allsrc
       replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st)
-  for st, (a, b, m), zy, lo in rows:
-    if st in done: continue
-    loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
-    bias = pick(2, b[1], b[0].shape[0]) if b is not None else "(__hmx_i32x32)(0)"
-    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + (st.src[0],),
-                      f"__hmx_rq1({{{len(loads)}}}, {pick(0, a[1], a[0].shape[0])}, {bias}, {pick(1, m[1], m[0].shape[0])}, {zy}, {lo});")
-    done.add(st)
+  # rows no group took: one __hmx_rq1 each, one CUSTOM per store (a store none of whose rows is grouped)
+  grouped = {r[0] for r in done_rows}
+  singles: dict = {}
+  for (st, j), abm, zy, lo in rows:
+    if st not in grouped: singles.setdefault(st, []).append((j, abm, zy, lo))
+  for st, rs in singles.items():
+    srcs, code = [], []
+    for j, (a, b, m), zy, lo in rs:
+      loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
+      k0 = len(srcs)
+      srcs += loads
+      bias = pick(k0 + 2, b[1], b[0].shape[0]) if b is not None else "(__hmx_i32x32)(0)"
+      code.append(f"__hmx_rq1(PTR, {pick(k0, a[1], a[0].shape[0])}, {bias}, {pick(k0 + 1, m[1], m[0].shape[0])}, {zy}, {lo});".replace(
+        "PTR", rp(len(srcs), j) if False else f"@P{j}@"))
+    kp = len(srcs)
+    srcs.append(st.src[0])
+    code_s = " ".join(code)
+    for j, *_ in rs: code_s = code_s.replace(f"@P{j}@", rp(kp, j))
+    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(srcs), code_s)
+  # a store half grouped (its other rows single) isn't expected: leave it, and its lanes, to the plain rendering
+  done = {st for st in grouped if all(((st, j) in done_rows) for j in range(len(st.src[1].src) // 32))} | set(singles)
+  for st in grouped - done: drop.discard(st)
   # the lanes' own uops, down to the loads, go when nothing else uses them
   keep_loads = {x for u in replace.values() if u.op is Ops.CUSTOM for x in u.src}
   dead, stack = set(), [x for st in done for x in st.src[1:]]
