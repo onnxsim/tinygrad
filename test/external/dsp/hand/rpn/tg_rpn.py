@@ -59,36 +59,69 @@ def proposal_decode(nchw:Tensor, idx:Tensor, H:int, W:int, P:dict, C:dict) -> Te
 # ------------------------------------------------------------------------------------------------- TopK
 
 def _bitonic_desc(x:Tensor) -> Tensor:
-  """Tensor.sort's bitonic network (descending, 1-D) without its index recovery: Tensor.sort finds each sorted
-  value's index with an n x n equality mask, which is O(n^2) memory (26.6 G elements at the real n = 163200). Here the
-  index rides inside the key instead, so the network alone is enough."""
-  n = x.shape[0]
-  n_stages = (n - 1).bit_length()
-  x = x.pad(((0, 2 ** n_stages - n),), value=x.dtype.min).reshape((2,) * n_stages)
+  """Tensor.sort's bitonic network (descending, along the last axis, which must be a power of two) without its index
+  recovery: Tensor.sort finds each sorted value's index with an n x n equality mask, which is O(n^2) memory (26.6 G
+  elements at the real n = 163200). Here the index rides inside the key instead, so the network alone is enough."""
+  *batch, n = x.shape
+  n_stages = n.bit_length() - 1
+  assert 1 << n_stages == n
+  b = len(batch)
+  x = x.reshape(*batch, *((2,) * n_stages))
   for stage in range(1, n_stages + 1):
     if stage != n_stages:
-      cdim = n_stages - stage - 1
+      cdim = b + n_stages - stage - 1
       blue, green = x.split(1, cdim)
       flip_dims = tuple(-i for i in range(1, stage + 2))
       x = blue.cat(green.flip(flip_dims), dim=cdim).contiguous()
     for substage in range(stage - 1, -1, -1):
-      pdim = n_stages - substage - 1
+      pdim = b + n_stages - substage - 1
       top, bottom = x.split(1, pdim)
       x = top.maximum(bottom).cat(top.minimum(bottom), dim=pdim).contiguous()
     if stage != n_stages:
       blue, fgreen = x.split(1, cdim)
       x = blue.cat(fgreen.flip(flip_dims), dim=cdim)
-  return x.flatten()[:n]
+  return x.reshape(*batch, n)
+
+def _merge_desc(x:Tensor) -> Tensor:
+  """x (..., 2m): two descending runs of m. Reversing the second makes the whole row bitonic; log2(2m) half-cleaner
+  stages then sort it descending."""
+  *batch, n = x.shape
+  m = n // 2
+  x = x[..., :m].cat(x[..., m:].flip(-1), dim=-1)
+  s = n.bit_length() - 1
+  b = len(batch)
+  x = x.reshape(*batch, *((2,) * s))
+  for sub in range(s - 1, -1, -1):
+    pdim = b + s - sub - 1
+    top, bottom = x.split(1, pdim)
+    x = top.maximum(bottom).cat(top.minimum(bottom), dim=pdim).contiguous()
+  return x.reshape(*batch, n)
+
+def _topk_keys(key:Tensor, k:int) -> Tensor:
+  """The k largest uint64 keys of a 1-D tensor, descending. A tournament instead of one sort of all n: sort chunks of
+  B = next_pow2(k) keys, then repeatedly merge pairs of sorted chunks and keep each merge's top B -- ~n log2(B)^2 / 2
+  compare-exchanges plus log2(n/B) merge rounds, instead of n log2(n)^2 / 2 for the full network."""
+  n = key.shape[0]
+  B = 1 << max(0, (k - 1).bit_length())
+  nc = 1 << max(0, (-(-n // B) - 1).bit_length())                 # chunk count, a power of two
+  x = key.pad(((0, nc * B - n),), value=0).reshape(nc, B)          # key 0 sorts last (see topk_desc)
+  x = _bitonic_desc(x)
+  while x.shape[0] > 1:
+    x = _merge_desc(x.reshape(x.shape[0] // 2, 2 * B))[:, :B]
+  return x.reshape(B)[:k]
 
 def topk_desc(x:Tensor, k:int) -> tuple[Tensor, Tensor]:
   """ORT TopK (largest, sorted) with its tie order -- value descending, then index ascending -- as one uint64 sort key
-  (tk_key(value) << 32 | ~index): a descending sort of the keys is exactly that order, no stability needed."""
+  (tk_key(value) << 32 | ~index): a descending sort of the keys is exactly that order, no stability needed. Every real
+  key is > 0 (tk_key sets the top bit of non-negative floats and ~index > 0 below 2^32 - 1), so padding with 0 is safe.
+  The index comes from an arange over x's own length: an arange that is later padded isn't folded by tinygrad's
+  symbolic and stays an O(n^2) reduce (the n = 2550 case spent 99% of its instructions there)."""
   n = x.shape[0]
   u = x.bitcast(dtypes.uint32)
   u = (u == 0x80000000).where(0, u)                                           # -0 ties with +0, like tk_key
   key = (u >= 0x80000000).where(u ^ 0xFFFFFFFF, u | 0x80000000)
   i = Tensor.arange(n, dtype=dtypes.uint32)
-  s = _bitonic_desc((key.cast(dtypes.uint64) << 32) | (i ^ 0xFFFFFFFF).cast(dtypes.uint64))[:k]
+  s = _topk_keys(((key.cast(dtypes.uint64) << 32) | (i ^ 0xFFFFFFFF).cast(dtypes.uint64)).contiguous(), k)
   hi, lo = (s >> 32).cast(dtypes.uint32), (s & 0xFFFFFFFF).cast(dtypes.uint32)
   vals = (hi >= 0x80000000).where(hi ^ 0x80000000, hi ^ 0xFFFFFFFF).bitcast(dtypes.float32)
   return vals, (lo ^ 0xFFFFFFFF).cast(dtypes.int64)

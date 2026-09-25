@@ -76,10 +76,13 @@ Shapes are the real graph's (800x1088 input, FPN P2..P6, k = 1000); values synth
 | proposal decode P2 (163 200 anchors, k 1000) | exact | 343 539 | 16 852 735 | 49x | 22 |
 | proposal decode P5 (2 550 anchors, k 1000) | exact | 323 074 | 6 673 454 | 21x | 18 |
 | proposal decode P6 (663 anchors, k 663) | exact | 218 070 | 4 414 001 | 20x | 18 |
-| TopK n 163 200, k 1000 | exact | 1 710 527 | 3 874 019 724 | 2265x | 190 |
-| TopK n 10 200, k 1000 | exact | 223 817 | 725 581 225 | 3242x | 120 |
-| TopK n 1 465, k 1000 | exact | 112 446 | 521 571 | 4.6x | 78 |
-| TopK n 663, k 663 | exact | 61 666 | 220 816 | 3.6x | 66 |
+| TopK n 163 200, k 1000 | exact | 1 710 527 | 71 359 937 (was 3 874 019 724) | 42x (was 2265x) | 155 |
+| TopK n 40 800, k 1000 | exact | 506 655 | 17 703 673 (was 1 369 516 127) | 35x (was 2703x) | 133 |
+| TopK n 10 200, k 1000 | exact | 223 817 | 4 383 131 (was 725 581 225) | 20x (was 3242x) | 111 |
+| TopK n 2 550, k 1000 | exact | 153 759 | 1 077 481 (was 78 335 193) | 7.0x (was 509x) | 89 |
+| TopK n 1 465, k 1000 | exact | 112 446 | 512 813 | 4.6x | 78 |
+| TopK n 663, k 663 | exact | 61 666 | 221 934 | 3.6x | 67 |
+| TopK n 106, k 100 | exact | 17 107 | 16 664 | 0.97x | 37 |
 | NMS pairwise SuppressByIOU, 1000 boxes (iou 0.7) | exact | 26 005 765 | 84 413 024 | 3.2x | 1 |
 | NMS pairwise SuppressByIOU, 300 boxes (iou 0.5) | exact | 2 448 821 | 6 759 624 | 2.8x | 1 |
 | NMS greedy, 96 boxes, 96 unrolled sweeps | exact | 109 302 | 32 704 413 | 299x | 137 |
@@ -89,11 +92,16 @@ Shapes are the real graph's (800x1088 input, FPN P2..P6, k = 1000); values synth
   and its symbolic rewrites treat float algebra as real algebra, so `round(x / scale)` can't be written directly) and
   the hand kernel's own Cephes `expf` polynomial written as Tensor ops. The gap is the gathers: each of the 4 deltas and
   the anchor base is a separate one-hot-folded gather kernel.
-- TopK: one `uint64` sort key (`tk_key(value) << 32 | ~index`) through the bitonic network is exactly ORT's order,
-  ties included, without `Tensor.sort`'s O(n^2) index recovery (26.6 G mask elements at n = 163 200). The hand kernel
-  is select-then-sort (threshold, stream compaction of ~1.5 k survivors, counting sort): tinygrad has no stream
-  compaction (data-dependent output size), so it sorts all n. The jump between n = 1 465 and n = 2 550 (0.5 M to 78 M
-  instructions) is worth a look.
+- TopK: one `uint64` sort key (`tk_key(value) << 32 | ~index`) through a bitonic network is exactly ORT's order,
+  ties included, without `Tensor.sort`'s O(n^2) index recovery (26.6 G mask elements at n = 163 200). Two fixes took
+  it from 2265x to 42x at the real P2 size:
+  - **an arange that gets padded isn't folded** by tinygrad's symbolic: `pad(f(x, arange(n)))` stayed the O(n^2)
+    reduce form of arange (99% of the n = 2 550 case). The index is now built from an arange over the unpadded
+    length and the *key* is padded. (A tinygrad gap worth fixing generally; not fixed here.)
+  - a tournament instead of one full sort: sort chunks of next_pow2(k) keys, then merge pairs and keep each merge's
+    top chunk -- n log2(k)^2 / 2 compare-exchanges instead of n log2(n)^2 / 2.
+  The hand kernel is still ahead because it is select-then-sort (threshold, stream compaction of ~1.5 k survivors,
+  counting sort): tinygrad has no stream compaction (data-dependent output size).
 - NMS: the pairwise test is the same fp32 ops in the same order as ORT's `SuppressByIOU` (tinygrad renders
   `a * (1/b)` as a true division, `FDIV`, on the C backends). Greedy selection is the lexicographically-first
   maximal independent set -- inherently sequential. **Missing capability: a device-side data-dependent loop** (sweep
