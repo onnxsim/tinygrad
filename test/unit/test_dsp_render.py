@@ -34,6 +34,15 @@ class TestDSPRender(unittest.TestCase):
     self.assertIn("(val0+val1)", src)
     self.assertNotIn("val0[1]", src)  # no per-lane constructor
 
+class TestDSPHalf(unittest.TestCase):
+  # __fp16 is storage-only on Hexagon and clang miscompiles it (vector converts become uitofp of the bits), so half is
+  # emulated: fp16 bits in memory, float32 math, no __fp16 anywhere in the kernel source
+  def test_half_is_emulated(self):
+    x = Tensor.empty(256, dtype=dtypes.half)
+    src = dsp_source((x.sigmoid() * x).cast(dtypes.half))
+    self.assertNotIn("__fp16", src)
+    self.assertIn("float", src)
+
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True

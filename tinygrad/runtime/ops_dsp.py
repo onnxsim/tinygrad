@@ -213,7 +213,11 @@ class DSPRenderer(ClangRenderer):
     msrc += ["return 0; }"]
     return '\n'.join(msrc)
 
-  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
+  # half is emulated (stored as fp16 bits, computed in float32; codegen/decomp/dtype.py): __fp16 is storage-only on
+  # Hexagon without _Float16 support (V65 HVX has no half float), and clang miscompiles it here -- vector conversions become
+  # uitofp of the raw bits (1.5h -> 15872.0f), and the scalar __extendhfsf2/__truncsfhf2 libcalls resolve to the
+  # toolchain libgcc.a's copies, which use a different calling convention. openpilot's fp16 ONNX graphs hit both.
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16, dtypes.half)}
 
 def rpc_sc(method=0, ins=0, outs=0, fds=0): return (method << 24) | (ins << 16) | (outs << 8) | fds
 def rpc_prep_args(ins=None, outs=None, in_fds=None):
