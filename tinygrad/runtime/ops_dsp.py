@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
+import ctypes, os, mmap, math, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
 assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
@@ -1873,6 +1873,22 @@ def _hmx_interchange(uops:list[UOp], o:UOp, i:UOp) -> list[UOp]:
   pos = {u:k for k,u in enumerate(uops)}
   return uops[:pos[o]] + [i, o] + uops[pos[o]+1:pos[i]] + uops[pos[i]+1:]
 
+def _dsp_cint(u:UOp):
+  while u.op is Ops.CAST: u = u.src[0]
+  return u.arg if u.op is Ops.CONST and isinstance(u.arg, int) else None
+
+def _dsp_align(u:UOp, depth:int=0) -> int:
+  # the largest power of two (up to 2^20) that is sure to divide the integer index u; 1 when unknown
+  CAP = 1 << 20
+  if depth > 32: return 1
+  if (c:=_dsp_cint(u)) is not None: return CAP if c == 0 else min(CAP, c & -c)
+  if u.op is Ops.CAST: return _dsp_align(u.src[0], depth + 1)
+  if u.op in (Ops.ADD, Ops.SUB, Ops.MAX): return min(_dsp_align(x, depth + 1) for x in u.src)
+  if u.op is Ops.MUL: return min(CAP, _dsp_align(u.src[0], depth + 1) * _dsp_align(u.src[1], depth + 1))
+  if u.op is Ops.SHL and (c:=_dsp_cint(u.src[1])) is not None: return min(CAP, _dsp_align(u.src[0], depth + 1) << c)
+  if u.op is Ops.AND and (c:=_dsp_cint(u.src[1])) is not None: return max(_dsp_align(u.src[0], depth + 1), min(CAP, c & -c) if c else CAP)
+  return 1
+
 class DSPRenderer(ClangRenderer):
   has_threads = False
   def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
@@ -1972,6 +1988,25 @@ class DSPRenderer(ClangRenderer):
     ret = super().render_buffer(x)
     if x.addrspace != AddrSpace.REG or x.max_numel() == 1 or "aligned(128)" in ret: return ret
     return ret[:-1] + " __attribute__((aligned(128)));"
+
+  # a vector access through the natural-alignment typedef assumes an address aligned to min(vector bytes, 128): HVX vmem drops the
+  # low address bits, so a misaligned one silently reads / writes the aligned vector around it. An index not provably aligned
+  # (buffers are 128-byte aligned) goes through the type's unaligned twin (<type>_u, element alignment) instead
+  def render_access(self, u:UOp):
+    ret = super().render_access(u)
+    n = u.max_numel()
+    if n > 1 and u.op in (Ops.INDEX, Ops.SHRINK) and len(u.src) >= 2:
+      need = min(128, 2 ** int(math.log2(u.dtype.itemsize * n)))
+      if _dsp_align(u.src[1]) * u.dtype.itemsize < need:
+        vec = self._render_dtype(u.dtype, n, AddrSpace.REG)
+        ret = ret.replace(f"(({self._render_dtype(u.dtype, n, u.addrspace, override_ptr=True, shape=u._shape)})", f"(({vec}_u*)", 1)
+    return ret
+
+  def render_vector_prefix(self, dt, count:int) -> str:
+    ret = super().render_vector_prefix(dt, count)
+    if dtypes.is_bool(dt): return ret
+    vec = self._render_dtype(dt, count, AddrSpace.REG)
+    return ret + f"\ntypedef {self.render_dtype(dt)} {vec}_u __attribute__((aligned({dt.itemsize}),ext_vector_type({count})));"
 
   def _render_defines(self, uops) -> list[str]:
     return ['''/* DSP boilerplate */ struct dcvs_v2_req { int type; int _pad; _Bool dcvs_enable; char dcvs_option; _Bool set_latency; int latency;
