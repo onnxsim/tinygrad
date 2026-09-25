@@ -800,8 +800,14 @@ static inline void __hmx_i8_begin(void) {
   }
   __asm__ volatile("mxclracc" ::: "memory");
 }
-static inline __hmx_v __hmx_row32(const void* r) {  /* the 32 bytes at r (32-byte aligned) in lanes 0..31 */
-  return __builtin_HEXAGON_V6_vror_128B(*(const __hmx_v*)((unsigned)r & ~127u), (int)((unsigned)r & 127u));
+typedef int __hmx_vu __attribute__((vector_size(128), aligned(1)));
+static inline __hmx_v __hmx_row32(const void* r) {
+  /* the 32 bytes at r in lanes 0..31. A row inside its 128-byte line: the aligned line rotated. Otherwise (rows at 8-byte
+   * steps, e.g. a stride-2 stem's overlapping windows) an unaligned load -- which reads up to 96 bytes past the row: the
+   * runtime keeps 128 bytes of slack after every buffer */
+  unsigned o = (unsigned)r & 127u;
+  if (__builtin_expect(o <= 96u, 1)) return __builtin_HEXAGON_V6_vror_128B(*(const __hmx_v*)((unsigned)r & ~127u), (int)o);
+  return (__hmx_v)*(const __hmx_vu*)r;
 }
 static inline void __hmx_i8_pack_a4(unsigned char* d, const unsigned char* r0, const unsigned char* r1, const unsigned char* r2, const unsigned char* r3) {
   __hmx_vp x = __builtin_HEXAGON_V6_vshuffvdd_128B(__hmx_row32(r1), __hmx_row32(r0), -32);
@@ -1089,14 +1095,26 @@ def _hmx_direct_out(uops, pos, users, at:int, stores):
 def _hmx_rows_i8(stack:UOp, n:int, lane_of):
   # the rows of an int8 operand: lane_of(r, j) = the fragment lane of row r, column j (32 columns) -> [(value, base)] per
   # row when every row is 32 consecutive lanes of one loaded vector, else None
+  # a row may also run on from the end of one load into lane 0 of the load right after it in memory (a stride-2 conv's
+  # overlapping rows): only the row's start address is used, and the bytes are contiguous
   if stack.op is not Ops.STACK: return None
-  rows = []
+  rows, nxt = [], {}
+  def follows(v:UOp, v2:UOp) -> bool:
+    if (v, v2) not in nxt:
+      ok = v.src[0].op in (Ops.INDEX, Ops.SHRINK) and v2.src[0].op is v.src[0].op and v.src[0].src[0] is v2.src[0].src[0]
+      if ok:
+        i0, i1 = v.src[0].src[1], v2.src[0].src[1]
+        rng = list({u for u in (*i0.toposort(), *i1.toposort()) if u.op is Ops.RANGE})
+        ok = _hmx_const_delta(lambda env: None if (a:=_hmx_eval(i1, env)) is None or (z:=_hmx_eval(i0, env)) is None else a - z,
+                              rng) == v.max_numel()
+      nxt[(v, v2)] = ok
+    return nxt[(v, v2)]
   for r in range(n):
     lj = [_hmx_lane(stack.src[lane_of(r, j)]) for j in range(32)]
-    if any(x is None for x in lj) or len({x[0] for x in lj}) != 1: return None
-    b = lj[0][1]
-    if [x[1] for x in lj] != list(range(b, b + 32)): return None
-    rows.append((lj[0][0], b))
+    if any(x is None for x in lj): return None
+    for (v0, b0), (v1, b1) in zip(lj, lj[1:]):
+      if not ((v1 is v0 and b1 == b0 + 1) or (b0 == v0.max_numel() - 1 and b1 == 0 and follows(v0, v1))): return None
+    rows.append(lj[0])
   return rows
 
 def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_out:list):
