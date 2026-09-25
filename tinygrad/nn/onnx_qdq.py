@@ -7,8 +7,9 @@ What ORT computes after its QDQ fusion, and what this reproduces exactly:
   Add (QLinearAdd): y = clamp(rne(rb*b + (ra*a + fixed))) in separate fp32 ops (ops_dsp.hmx_qlinear_add)
   MaxPool 3x3 s2 p1 (same scale in and out)
 
-Layout: every activation is a padded flat grid -- NHWC, a ring of pixels holding its zero point, flattened to (rows, C) at a
-row stride Wp (W + 2 by default), plus a tail its consumers' windows may overrun into. A k x k / stride s conv is the ordinary
+Layout: every activation is a padded flat grid in 32-channel blocks -- (C/32, rows, 32): per block NHWC with a ring of pixels
+holding its zero point, flattened at a row stride Wp (W + 2 by default), plus a tail its consumers' windows may overrun into.
+In that layout a stride-1 conv's activation tile (64 grid pixels x one channel block) is one contiguous 2 KB. A k x k / stride s conv is the ordinary
 (A * W).sum() over the windowed view A(p, dy, dx, c) = x[base + s*p + dy*Wp + dx, c] (movement ops only), on an output grid
 at the input's row stride, so the pixel axis is one axis for the TensorCore (TC_OPT=1: two reduce axes). A stride-1 conv's
 grid is written straight into the next padded grid (its garbage columns land on the pad columns, then the ring is rewritten);
@@ -106,7 +107,8 @@ def add_ref(a, ta, b, tb, ty):
   return np.clip(np.rint(v).astype(np.int64), 0, 255).astype(np.uint8)
 
 class Act:
-  """a padded flat grid: t (L, C) uint8, H x W pixels inside a ring of `pad` (wider on the right when Wp > W + 2 pad)"""
+  """a padded flat grid in channel blocks: t (C/32, L, 32) uint8, H x W pixels inside a ring of `pad` (wider on the right
+  when Wp > W + 2 pad)"""
   def __init__(self, t, H, W, C, pad, zp, Wp=None):
     self.t, self.H, self.W, self.C, self.pad, self.zp = t, H, W, C, pad, zp
     self.Wp = Wp or W + 2 * pad
@@ -117,27 +119,30 @@ def need_rows(H, W, pad, k, s, Wp=None):
   return (pad - k // 2) * (Wp + 1) + s * (r64(Ho * Wp) - 1) + (k - 1) * Wp + k
 
 def window(x:Tensor, Wp, k, s, P64, base) -> Tensor:
-  """(L, C) -> (P64, dy, dx, C): x[base + s*p + dy*Wp + dx]"""
-  C = x.shape[1]
-  v = x[base:].permute(1, 0)._pool((k,), 1, 1)                     # (C, L', k): dx
-  v = v.permute(0, 2, 1)._pool((k,), s, Wp)                        # (C, k, P', k): dy, stride s over the grid
-  return v.shrink(((0, C), (0, k), (0, P64), (0, k))).permute(2, 3, 1, 0)
+  """(Cb, L, 32) -> (P64, dy, dx, Cb, 32): x[cb, base + s*p + dy*Wp + dx, c]"""
+  Cb = x.shape[0]
+  v = x[:, base:].permute(0, 2, 1)._pool((k,), 1, 1)               # (Cb, 32, L', k): dx
+  v = v.permute(0, 1, 3, 2)._pool((k,), s, Wp)                     # (Cb, 32, k, P', k): dy, stride s over the grid
+  return v.shrink(((0, Cb), (0, 32), (0, k), (0, P64), (0, k))).permute(3, 4, 2, 0, 1)
 
-def canon(g:Tensor, Ho, Wo, Wg, C, zp, L) -> Tensor:
-  """an output grid (row stride Wg, Ho x Wo valid) -> a padded flat grid of L rows (ring 1 and tail = zp), one copy"""
-  x = g[: Ho * Wg].reshape(Ho, Wg, C)[:, :Wo].pad(((1, 1), (1, 1), (0, 0)), value=zp).reshape(-1, C)
-  return x.pad(((0, L - x.shape[0]), (0, 0)), value=zp).contiguous()
+def canon(g:Tensor, Ho, Wo, Wg, zp, L) -> Tensor:
+  """an output grid (Cb, rows at stride Wg, 32; Ho x Wo valid) -> a padded flat grid of L rows (ring 1, tail = zp), one copy"""
+  Cb = g.shape[0]
+  x = g[:, : Ho * Wg].reshape(Cb, Ho, Wg, 32)[:, :, :Wo].pad(((0, 0), (1, 1), (1, 1), (0, 0)), value=zp).reshape(Cb, -1, 32)
+  return x.pad(((0, 0), (0, L - x.shape[1]), (0, 0)), value=zp).contiguous()
 
-def into_grid(y:Tensor, H, W, C, zp, L, Wp=None) -> Tensor:
-  """a stride-1 output grid (row stride Wp) straight into the next padded grid at offset Wp + 1: pixel (i, j) belongs at
-  (i+1)*Wp + (j+1) = p + Wp + 1, so the grid's garbage columns land on the pad columns; then the ring is rewritten with zp"""
-  Wp, P64 = Wp or W + 2, y.shape[0]
+def into_grid(y:Tensor, H, W, zp, L, Wp=None) -> Tensor:
+  """a stride-1 output grid (Cb, P64, 32; row stride Wp) straight into the next padded grid at offset Wp + 1: pixel (i, j)
+  belongs at (i+1)*Wp + (j+1) = p + Wp + 1, so the grid's garbage columns land on the pad columns; then the ring is rewritten"""
+  Cb, P64 = y.shape[0], y.shape[1]
+  Wp = Wp or W + 2
   assert L >= Wp + 1 + P64
-  g = Tensor.empty(L, C, dtype=dtypes.uint8, device=y.device)
-  g[Wp + 1: Wp + 1 + P64].assign(y)
-  v = g[: (H + 2) * Wp].reshape(H + 2, Wp, C)
+  g = Tensor.empty(Cb, L, 32, dtype=dtypes.uint8, device=y.device)
+  g[:, Wp + 1: Wp + 1 + P64].assign(y)
+  v = g[:, : (H + 2) * Wp].reshape(Cb, H + 2, Wp, 32)
   for sl in ((slice(0, 1), slice(0, Wp)), (slice(H + 1, H + 2), slice(0, Wp)), (slice(1, H + 1), slice(0, 1)), (slice(1, H + 1), slice(W + 1, Wp))):
-    v[sl].assign(Tensor.full(v[sl].shape, zp, dtype=dtypes.uint8, device=y.device))
+    vs = v[:, sl[0], sl[1]]
+    vs.assign(Tensor.full(vs.shape, zp, dtype=dtypes.uint8, device=y.device))
   return g
 
 def _requant(acc:Tensor, m:Tensor, zy:int) -> Tensor:
@@ -171,7 +176,7 @@ class QDQGridNet:
       for o in self.ops:
         if o["op"] == "add":
           n = max(L[o[k].name] for k in ("a", "b", "y"))
-          while (n * o["y"].c) % 128: n += 1
+          while (n * 32 * (o["y"].c // 32)) % 128: n += 1
           for k in ("a", "b", "y"): L[o[k].name] = n
     self.L, self.Wg = L, Wg
     self._build_consts()
@@ -198,11 +203,14 @@ class QDQGridNet:
       self.consts += list(self.w[i])
 
   def _conv(self, a:Act, i:int, k:int, s:int, base:int, Wp:int, C:int, P64:int) -> Tensor:
+    # -> the output grid in channel blocks (N/32, P64, 32)
     W_, B_, M_ = self.w[i]
-    N = W_.shape[3]
+    N, Cb = W_.shape[3], C // 32
     v = window(a.t, Wp, k, s, P64, base)
-    acc = (v.reshape(P64, 1, k, k, C).cast(dtypes.int32) * W_.permute(3, 0, 1, 2).reshape(1, N, k, k, C).cast(dtypes.int32)).sum((2, 3, 4))
-    return _requant(acc + B_, M_, self.ops[i]["y"].zp)
+    acc = (v.reshape(P64, 1, k, k, Cb, 32).cast(dtypes.int32) *
+           W_.reshape(k, k, Cb, 32, N).permute(4, 0, 1, 2, 3).reshape(1, N, k, k, Cb, 32).cast(dtypes.int32)).sum((2, 3, 4, 5))
+    y = _requant(acc + B_, M_, self.ops[i]["y"].zp)
+    return y.reshape(P64, N // 32, 32).permute(1, 0, 2)
 
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.runtime.ops_dsp import hmx_qlinear_add
@@ -210,20 +218,20 @@ class QDQGridNet:
     # stem: the 2x2 phase split of the padded input (one copy), a stride-1 sk x sk conv on it, straight into its consumer's grid
     k0, p0, Hs, Ws, sk = st["k"], st["k"] // 2, self.Hs, self.Ws, self.sk
     xp = x.reshape(xin.h, xin.w, xin.c).pad(((p0, 2 * Hs - xin.h - p0), (p0, 2 * Ws - xin.w - p0), (0, 8 - xin.c)), value=xin.zp)
-    S = xp.reshape(Hs, 2, Ws, 2, 8).permute(0, 2, 1, 3, 4).reshape(Hs * Ws, 32)
-    S = Act(S.pad(((0, L["S"] - Hs * Ws), (0, 0)), value=xin.zp).contiguous(), Hs, Ws, 32, 0, xin.zp, Ws)
+    S = xp.reshape(Hs, 2, Ws, 2, 8).permute(0, 2, 1, 3, 4).reshape(1, Hs * Ws, 32)
+    S = Act(S.pad(((0, 0), (0, L["S"] - Hs * Ws), (0, 0)), value=xin.zp).contiguous(), Hs, Ws, 32, 0, xin.zp, Ws)
     yt = st["y"]
     y = self._conv(S, 0, sk, 1, 0, Ws, 32, r64(yt.h * Ws))
-    vals = {yt.name: Act(into_grid(y, yt.h, yt.w, yt.c, yt.zp, L[yt.name], Ws), yt.h, yt.w, yt.c, 1, yt.zp, Ws)}
+    vals = {yt.name: Act(into_grid(y, yt.h, yt.w, yt.zp, L[yt.name], Ws), yt.h, yt.w, yt.c, 1, yt.zp, Ws)}
     for i, o in enumerate(self.ops[1:], start=1):
       yt = o["y"]
       if o["op"] == "conv":
         a, k, s = vals[o["x"].name], o["k"], o["s"]
         Ho, Wo = yt.h, yt.w
         y = self._conv(a, i, k, s, (a.pad - k // 2) * (a.Wp + 1), a.Wp, a.C, r64(Ho * a.Wp))
-        if s == 1 and a.Wp == a.W + 2 and getenv("QDQ_INTO_GRID", 1): t = into_grid(y, Ho, Wo, yt.c, yt.zp, L[yt.name])
+        if s == 1 and a.Wp == a.W + 2 and getenv("QDQ_INTO_GRID", 1): t = into_grid(y, Ho, Wo, yt.zp, L[yt.name])
         # a copy crops the grid: materialized first (fused with the crop, tinygrad splits the pixel axis again)
-        else: t = canon(y.contiguous(), Ho, Wo, a.Wp, yt.c, yt.zp, L[yt.name])
+        else: t = canon(y.contiguous(), Ho, Wo, a.Wp, yt.zp, L[yt.name])
         vals[yt.name] = Act(t, Ho, Wo, yt.c, 1, yt.zp)
       elif o["op"] == "add":
         a, b = vals[o["a"].name], vals[o["b"].name]
@@ -236,11 +244,11 @@ class QDQGridNet:
       else:  # maxpool 3x3 s2 p1: the ring holds the input's zero point, 0 (post-Relu): the pooling minimum
         a = vals[o["x"].name]
         if a.zp != 0: raise NotImplementedError("MaxPool needs a zero-point-0 input (its ring is the pooling minimum)")
-        y = window(a.t, a.Wp, 3, 2, r64(yt.h * a.Wp), 0).max(axis=(1, 2)).contiguous()
-        vals[yt.name] = Act(canon(y, yt.h, yt.w, a.Wp, yt.c, yt.zp, L[yt.name]), yt.h, yt.w, yt.c, 1, yt.zp)
+        y = window(a.t, a.Wp, 3, 2, r64(yt.h * a.Wp), 0).max(axis=(1, 2)).permute(1, 0, 2).contiguous()
+        vals[yt.name] = Act(canon(y, yt.h, yt.w, a.Wp, yt.zp, L[yt.name]), yt.h, yt.w, yt.c, 1, yt.zp)
     out = vals[self.yout.name]
-    y = out.t[: (out.H + 2) * out.Wp].reshape(out.H + 2, out.Wp, out.C)[1:out.H + 1, 1:out.W + 1]
-    return y.permute(2, 0, 1).reshape(1, out.C, out.H, out.W).contiguous()
+    y = out.t[:, : (out.H + 2) * out.Wp].reshape(out.C // 32, out.H + 2, out.Wp, 32)[:, 1:out.H + 1, 1:out.W + 1]
+    return y.permute(0, 3, 1, 2).reshape(1, out.C, out.H, out.W).contiguous()
 
 def qdq_emulate(net:QDQGridNet, x_nhwc:np.ndarray) -> np.ndarray:
   """ORT CPU's semantics for the lowered program, in numpy (the tests' reference): x (1, H, W, C) -> (1, C, H, W)"""
