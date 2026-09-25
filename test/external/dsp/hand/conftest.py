@@ -16,4 +16,8 @@ if int(os.environ.get("HVX_ARCH", "v65").lstrip("v")) < 68:
   os.environ.setdefault("FLOAT_REASSOC", "0")
   cc = os.environ.get("CC") or clang()
   if cc is not None and "-ffp-contract" not in cc: os.environ["CC"] = f"{cc} -ffp-contract=off"
-elif clang() is not None: os.environ.setdefault("CC", clang())
+else:
+  if clang() is not None: os.environ.setdefault("CC", clang())
+  # the qemu (v65) families don't run under the HMX families' HVX_ARCH=v69: don't collect them at all (instead of a
+  # skip per test), so an HMX run reports only HMX results
+  collect_ignore = ["rpn", "roialign", "msda", "layout", "mcc"]

@@ -7,6 +7,11 @@ from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 
+def _unit_stride(k:Scheduler, axis:int) -> bool:
+  # some buffer's index has this axis's range as a bare term (stride 1): upcasting it gives contiguous vector accesses
+  rng = k.rngs[axis]
+  return any(c is rng for b in k.bufs for c in b.src[1].get_idx().split_uop(Ops.ADD))
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -115,10 +120,19 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         if resolve(global_items_after < getenv("OCCUPANCY_FLOOR", 4096), False): continue
       if DEBUG >= 4: print(f"upcasting masked axis : {axis}")
       to_upcast.append(axis)
+  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  # on the DSP, the full upcast of small masked axes (up to 7x7 = 49 lanes) fills the upcast budget below (< 32), so a
+  # unit-stride axis never gets its 128-lane HVX vector -- a RoiAlign's 7x7 bins x 2x2 samples ended up 784 scalar
+  # gathers per channel with the 256-channel loop scalar. Keep the masked upcasts only when no axis can take a
+  # contiguous HVX-width upcast (HVX_UPCAST_CONTIG). Only for reductions: for elementwise kernels (a bitonic sort's
+  # split/cat stages) the masked upcasts are what keep the cat's selects out of the inner loop, and dropping them doubled
+  # a TopK's instructions
+  if is_dsp and HVX_UPCAST_CONTIG and k.axes_of(AxisType.REDUCE) and to_upcast and any(
+      k.full_shape[a] % w == 0 and a not in to_upcast and _unit_stride(k, a) for a in k.upcastable_dims for w in (128, 64, 32)):
+    to_upcast = []
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.UPCAST, axis, 0))
 
   # potentially do more upcasts of non reduce axes based on a heuristic
-  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []

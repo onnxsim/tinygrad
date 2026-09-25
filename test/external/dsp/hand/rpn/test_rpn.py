@@ -141,28 +141,16 @@ def test_nms_suppress_matrix(nms_exe, group, n, thr, max_out):
          tg_insns=tg.insns, tg_kernels=tg.kernels)
   assert bad == 0, f"{bad} of {n*n} pairwise decisions differ"
 
-@pytest.mark.parametrize("n", [40, 96])
-def test_nms_greedy_exact_small(nms_exe, n):
-  """Greedy NMS with rounds = n Jacobi sweeps: exact for any input by construction, at O(n^3) work."""
-  from tg_rpn import nms_greedy
-  boxes, scores = nms_case(n, 1000 + n)
-  hand = _nms_hand(nms_exe, boxes, scores, 0.5, 100)
-  tg = run_tinygrad(lambda b, s: nms_greedy(b, s, 0.5, 100, rounds=n), boxes, scores)
-  bad = mismatch(tg.outputs[0], hand.outputs[0]) + mismatch(tg.outputs[1], hand.outputs[1])
-  record("rpn", f"nms_greedy_n{n}_rounds{n}", mismatched=bad, hand_insns=hand.insns["hvx_portable"], tg_insns=tg.insns,
-         tg_kernels=tg.kernels)
-  assert bad == 0
-
-@pytest.mark.xfail(strict=True, run=False, reason=(
-  "missing capability: a device-side data-dependent loop (iterate the keep-mask sweep until it stops changing). "
-  "Greedy NMS is a lexicographically-first maximal independent set, inherently sequential: tinygrad can only unroll a "
-  "fixed number of sweeps, and exactness for any input needs rounds = n (1000 kernels x n^2 work at the real RPN size, "
-  "vs the hand kernel's one pass); a fixed smaller bound is exact only when no suppression chain is longer, which "
-  "nothing on device can check. The hand kernel's early exit (`break` on the first suppressing kept box) is the same gap."))
-@pytest.mark.parametrize("group,n,thr,max_out", NMS_CASES[:2], ids=[f"{g}_n{n}" for g, n, _, _ in NMS_CASES[:2]])
-def test_nms_greedy_real(nms_exe, group, n, thr, max_out):
-  from tg_rpn import nms_greedy
+@pytest.mark.parametrize("group,n,thr,max_out", NMS_CASES, ids=[f"{g}_n{n}" for g, n, _, _ in NMS_CASES])
+def test_nms_greedy_blocked(nms_exe, group, n, thr, max_out):
+  """Greedy NMS at the real sizes, exact for any input: blocks of 32 in visit order, each checked against the earlier
+  blocks' kept boxes in one reduction, then at most 32 sweeps inside the block (tg_rpn.nms_greedy_blocked). This is what
+  replaced the old xfail (a device-side data-dependent loop is still missing, but the blocked form doesn't need one)."""
+  from tg_rpn import nms_greedy_blocked
   boxes, scores = nms_case(n, n)
   hand = _nms_hand(nms_exe, boxes, scores, thr, max_out)
-  tg = run_tinygrad(lambda b, s: nms_greedy(b, s, thr, max_out, rounds=8), boxes, scores)
-  assert mismatch(tg.outputs[0], hand.outputs[0]) == 0
+  tg = run_tinygrad(lambda b, s: nms_greedy_blocked(b, s, thr, max_out), boxes, scores)
+  bad = mismatch(tg.outputs[0], hand.outputs[0]) + mismatch(tg.outputs[1], hand.outputs[1])
+  record("rpn", f"nms_greedy_blocked_{group}_n{n}", mismatched=bad, hand_insns=hand.insns["hvx_portable"], tg_insns=tg.insns,
+         tg_kernels=tg.kernels)
+  assert bad == 0

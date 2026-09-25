@@ -91,10 +91,15 @@ def roialign_u8(fmap:Tensor, rois:Tensor, scale:float, OH:int, OW:int, sr:int, z
   q = [((f * float(RU8_ONE)) + 0.5).cast(dtypes.int32) for f in (hy * hx, hy * lx, ly * hx)]
   w3 = RU8_ONE - q[0] - q[1] - q[2]
   w = [(w3 < 0).where(q[0] + w3, q[0]), q[1], q[2], (w3 < 0).where(0, w3)]
-  p = _taps(fmap.reshape(H * W, C), W, ya, xa)
   valid = yv & xv                                                # [R, OH, sr, OW, sr]
+  # the per-sample weights / tap rows are realized first (a few KB): fused into the gather kernel, their float math is
+  # recomputed for every channel, and the channel loop stays scalar
+  w = [(valid.where(wt, 0)).contiguous() for wt in w]
+  (_, ylo, yhi, _, _), (_, xlo, xhi, _, _) = ya, xa
+  rows = [(y * W + x).contiguous() for y, x in ((ylo, xlo), (ylo, xhi), (yhi, xlo), (yhi, xhi))]
+  p = [fmap.reshape(H * W, C)[r] for r in rows]
   s = sum(p[t].cast(dtypes.int32) * w[t].unsqueeze(-1) for t in range(4))
-  acc = valid.unsqueeze(-1).where(s, 0).sum((2, 4), dtype=dtypes.int32)       # [R, OH, OW, C]
+  acc = s.sum((2, 4), dtype=dtypes.int32)                         # [R, OH, OW, C]; invalid samples have zero weights
   nvalid = valid.cast(dtypes.int32).sum((2, 4)).unsqueeze(-1)
   a = (acc - z_in * nvalid * RU8_ONE + (1 << (RU8_PRESHIFT - 1))) >> RU8_PRESHIFT
   a = ((a * mult + (1 << (shift - 1))) >> shift) + z_out

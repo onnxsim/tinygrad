@@ -30,6 +30,16 @@ def pd_expf(x:Tensor) -> Tensor:
   s = ((n.cast(dtypes.int32) + 127) << 23).bitcast(dtypes.float32)
   return (x < -87.0).where(0.0, p * s)
 
+def _count_ge(v:Tensor, t:Tensor) -> Tensor:
+  """count(v >= t) for the 255 ascending QuantizeLinear thresholds, as a branch-free binary search: 8 table loads and
+  compares per value instead of 255 (the thresholds are sorted, so the count is the insertion position)."""
+  pos = v.zeros_like(dtype=dtypes.int32)
+  for step in (128, 64, 32, 16, 8, 4, 2, 1):
+    cand = pos + step
+    take = (cand <= 255) & (v >= t[(cand - 1).clip(0, 254)])
+    pos = take.where(cand, pos)
+  return pos
+
 def proposal_decode(nchw:Tensor, idx:Tensor, H:int, W:int, P:dict, C:dict) -> Tensor:
   """pd_decode's shipped path: anchors computed from the level grid, deltas gathered straight from the backbone's
   uint8 [1, 3*4, H, W] map through the LUT, decode, clip, box-grid QDQ. Returns [k, 4] float32."""
@@ -53,7 +63,7 @@ def proposal_decode(nchw:Tensor, idx:Tensor, H:int, W:int, P:dict, C:dict) -> Te
   box = [(v < 0.0).where(0.0, (v > lim).where(lim, v)) for v, lim in zip(box, (cxl, cyl, cxl, cyl))]
   t = Tensor(C["box_t"], device=nchw.device)
   bz, bs = float(P["box_z"]), float(np.float32(P["box_s"]))
-  q = [(v.unsqueeze(-1) >= t).sum(-1, dtype=dtypes.int32).cast(dtypes.float32) for v in box]
+  q = [_count_ge(v, t).cast(dtypes.float32) for v in box]
   return Tensor.stack(*[(qc - bz) * bs for qc in q], dim=-1)
 
 # ------------------------------------------------------------------------------------------------- TopK
@@ -152,24 +162,33 @@ def suppress_matrix(boxes:Tensor, thr:float) -> Tensor:
   iou = inter / ok.where(union, 1.0)                          # IEEE division: tinygrad lowers a*(1/b) to a/b (FDIV)
   return ok & (iou > float(np.float32(thr)))
 
-def nms_greedy(boxes:Tensor, scores:Tensor, thr:float, max_out:int, rounds:int) -> tuple[Tensor, Tensor]:
-  """Greedy NMS without a data-dependent loop: in ORT's visit order (score desc, index asc), box a is kept iff no
-  earlier kept box suppresses it -- a lower-triangular Boolean recurrence, solved by `rounds` Jacobi sweeps from
-  "all kept". After r sweeps the first r decisions are final, so rounds = n is exact for any input; fewer rounds are
-  exact only if no suppression chain is longer than that (which tinygrad can't check on device -- see test_rpn.py).
-  Returns (selected indices in selection order, -1 padded to n; count) like the hand kernel."""
+def nms_greedy_blocked(boxes:Tensor, scores:Tensor, thr:float, max_out:int, B:int=32) -> tuple[Tensor, Tensor]:
+  """Greedy NMS, exact for any input, without a device-side data-dependent loop: the visit order is cut into blocks of B.
+  A block's boxes are first checked against every kept box of the earlier (already final) blocks -- one masked row
+  reduction -- and then the recurrence inside the block needs at most B Jacobi sweeps over a B x B matrix. That is
+  O(n^2 + n B^2) work and n/B * (B + 1) kernels, instead of O(n^3) for plain Jacobi sweeps over the whole n x n
+  matrix (n sweeps are needed for exactness)."""
   n = boxes.shape[0]
   _, order = topk_desc(scores, n)
   order = order.cast(dtypes.int32)
-  S = suppress_matrix(boxes, thr)
-  Sp = S[order][:, order]                                     # Sp[a, b]: visit a suppressed by visit b
-  earlier = Tensor.ones(n, n, dtype=dtypes.bool).tril(-1)
-  Sp = (Sp & earlier).cast(dtypes.int32)
-  keep = Tensor.ones(n, dtype=dtypes.int32)
-  for _ in range(rounds): keep = ((Sp * keep.unsqueeze(0)).sum(1) == 0).cast(dtypes.int32).contiguous()
-  rank = keep.cumsum() - 1                                    # position in the output, for kept visits
+  Sp = suppress_matrix(boxes[order], thr).cast(dtypes.int32).contiguous()   # Sp[a, b]: visit a suppressed by visit b
+  keep_blocks: list[Tensor] = []
+  for b0 in range(0, n, B):
+    b1 = min(n, b0 + B)
+    if b0:
+      kept = Tensor.cat(*keep_blocks) if len(keep_blocks) > 1 else keep_blocks[0]
+      pre = ((Sp[b0:b1, :b0] * kept.unsqueeze(0)).sum(1) == 0).cast(dtypes.int32)
+    else:
+      pre = Tensor.ones(b1 - b0, dtype=dtypes.int32)
+    inner = (Sp[b0:b1, b0:b1] * Tensor.ones(b1 - b0, b1 - b0, dtype=dtypes.int32).tril(-1)).contiguous()
+    pre = pre.contiguous()
+    k = pre
+    for _ in range(b1 - b0): k = (pre * ((inner * k.unsqueeze(0)).sum(1) == 0).cast(dtypes.int32)).contiguous()
+    keep_blocks.append(k)
+  keep = Tensor.cat(*keep_blocks) if len(keep_blocks) > 1 else keep_blocks[0]
+  rank = keep.cumsum() - 1
   keep = keep * (rank < max_out).cast(dtypes.int32)
   slot = Tensor.arange(n, dtype=dtypes.int32).unsqueeze(1)
-  hit = (rank.unsqueeze(0) == slot) & (keep.unsqueeze(0) == 1)  # [slot, visit]
+  hit = (rank.unsqueeze(0) == slot) & (keep.unsqueeze(0) == 1)
   sel = (hit.cast(dtypes.int32) * (order + 1).unsqueeze(0)).sum(1) - 1
   return sel, keep.sum().reshape(1)

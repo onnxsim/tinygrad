@@ -85,8 +85,8 @@ Shapes are the real graph's (800x1088 input, FPN P2..P6, k = 1000); values synth
 | TopK n 106, k 100 | exact | 17 107 | 16 664 | 0.97x | 37 |
 | NMS pairwise SuppressByIOU, 1000 boxes (iou 0.7) | exact | 26 005 765 | 84 413 024 | 3.2x | 1 |
 | NMS pairwise SuppressByIOU, 300 boxes (iou 0.5) | exact | 2 448 821 | 6 759 624 | 2.8x | 1 |
-| NMS greedy, 96 boxes, 96 unrolled sweeps | exact | 109 302 | 32 704 413 | 299x | 137 |
-| NMS greedy at the real size (1000 boxes) | **xfail** | | | | |
+| NMS greedy, blocked, 1000 boxes (iou 0.7) | exact | 7 728 599 | 109 943 091 | 14x | 1168 |
+| NMS greedy, blocked, 300 boxes (iou 0.5) | exact | 216 107 | 9 775 829 | 45x | 390 |
 
 - Proposal decode: exact through `exact.py`'s QuantizeLinear-by-thresholds (tinygrad's float division is `x * (1/y)`,
   and its symbolic rewrites treat float algebra as real algebra, so `round(x / scale)` can't be written directly) and
@@ -104,9 +104,9 @@ Shapes are the real graph's (800x1088 input, FPN P2..P6, k = 1000); values synth
   counting sort): tinygrad has no stream compaction (data-dependent output size).
 - NMS: the pairwise test is the same fp32 ops in the same order as ORT's `SuppressByIOU` (tinygrad renders
   `a * (1/b)` as a true division, `FDIV`, on the C backends). Greedy selection is the lexicographically-first
-  maximal independent set -- inherently sequential. **Missing capability: a device-side data-dependent loop** (sweep
-  the keep mask until it stops changing, or the hand kernel's `break` on the first suppressing box). Without it the
-  exact form is rounds = n Jacobi sweeps, O(n^3), so the real-size case is `xfail(run=False)`.
+  maximal independent set -- inherently sequential, and tinygrad has no device-side data-dependent loop. The exact
+  form used here is blocked: in visit order, blocks of 32 boxes are checked against the earlier blocks' kept boxes in
+  one reduction, then at most 32 sweeps resolve the block itself -- O(n^2 + n * 32^2), exact for any input.
 - Not covered: `rpn_fused` itself (it composes these three kernels plus the level merge; checking it needs ORT
   captures of the real rest.onnx span, as onnx-simplifier's own CI notes).
 
@@ -166,6 +166,43 @@ this pass had no phone access.
 
 Not covered yet: Fast-BEV's `fbgather` (the tinygrad version crashed clang at the real 41 MB volume size -- needs a
 look), StreamPETR / Sparse4D attention kernels, the LLM decode loop (`llm_tinygrad/hvx`, qfloat like MCC).
+
+### Performance: before / after (tinygrad instructions / hand instructions, qemu)
+
+All still bit-exact. "Before" is the first passing version of each oracle.
+
+| family, case | before | after | what changed |
+|---|---:|---:|---|
+| RPN TopK, n 163 200 (P2) | 2265x | **42x** | index arange no longer padded (see below) + tournament of chunk sorts |
+| RPN TopK, n 2 550 | 509x | 7.0x | same |
+| MSDA BEVFormer TSA f32 / u8 | 236x / 252x | **1.7x / 1.2x** | tinygrad: one-hot gathers no longer split (`schedule/rangeify.py`) |
+| MSDA RT-DETR decoder f32 / u8 | 28x / 35x | **1.4x / 1.2x** | same |
+| MSDA BEVFormer SCA f32 / u8 | 6.8x / n.a. | 6.0x / 2.4x | same + one kernel per value map (the fused u8 kernel was 700 KB of C) |
+| RPN NMS greedy, real size (1000 / 663 / 300 boxes) | xfail | **14x / 15x / 45x** | blocked greedy form: exact for any input, no data-dependent loop needed |
+| RoiAlign uint8, 7x7 / 14x14 | 134-155x / 62-66x | **14-16x / 15-18x** | tinygrad DSP heuristic: HVX-width upcast of the channel axis (`codegen/opt/heuristic.py`) + weights/tap rows realized first |
+| RPN proposal decode, P2..P6 | 20-49x | **4.6-4.9x** | gather split fix + QuantizeLinear threshold count as an 8-step binary search |
+| RoiAlign fp32, NMS pairwise, FPN layout | 3-5x, 2-3x, 1.8-2x | unchanged | |
+
+tinygrad changes behind these (fork-wide, not special-cased in the tests):
+- **`split_reduceop` skips one-hot gathers** (`schedule/rangeify.py`): `sum(where(idx == arange, src, 0))` is folded by
+  codegen into a direct load of `src[idx]`, so there is nothing to parallelize -- but when the reduce is split first
+  (it is for any one-hot range >= 32768), the fold leaves one compare + guarded load per chunk: a 40 000-row gather
+  became 160 guarded loads per output plus a 160-way reduce. This one fix is most of MSDA's and proposal decode's gains.
+- **DSP heuristic: no masked-axis upcast when a contiguous HVX upcast is available, for reductions**
+  (`codegen/opt/heuristic.py`): the full upcast of small masked axes (up to 7x7) filled the upcast budget, so
+  RoiAlign's 256-channel axis stayed a scalar loop around 784 gathers. Limited to kernels with a reduce: for the
+  bitonic sort's elementwise split/cat stages the masked upcasts are better (dropping them doubled TopK).
+- Found, not fixed: **an arange that is later padded isn't folded** by symbolic and stays arange's O(n^2) reduce form
+  (99% of TopK n = 2 550 before). The TopK oracle now pads the key instead of the arange.
+
+What's left, per family:
+- TopK (42x at P2): tinygrad sorts every element; the hand kernel thresholds and compacts to ~1.5 k survivors first.
+  Stream compaction (a data-dependent output size) is the missing capability.
+- NMS greedy (14-45x): the O(n^2) pairwise matrix is computed in full; the hand kernel tests each candidate only
+  against the boxes kept so far and exits early (the data-dependent loop again).
+- RoiAlign u8 (~15x): the u8 x Q14 multiply-accumulate is 32-bit lane math; the hand kernel's `vzxt` + `vmpyacc`
+  (u16 x u16 -> u32 accumulate on the widened pair) has no tinygrad lowering yet.
+- MSDA SCA f32 (6x): the per-point attention-weight scaling is 192 tiny kernels; fusing it is next.
 
 ### tinygrad DSP backend fixes these tests needed (`tinygrad/runtime/ops_dsp.py`)
 

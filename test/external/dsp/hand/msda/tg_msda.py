@@ -84,4 +84,7 @@ def msda(s:MsdaShape, value:Tensor, vscale:Tensor|None, vzp:Tensor|None, loc:Ten
           term = tap_ok.unsqueeze(-1).where(val * ws[t].unsqueeze(-1), 0.0)
           # the hand kernel's acc starts at +0.0: 0 + (-0.0) is +0.0, and tinygrad would fold a literal `0.0 + term` away
           acc = (term == 0.0).where(0.0, term) if acc is None else acc + term
+    # one kernel per value map: with the one-hot gathers folded into direct loads, the whole NV x L x P x 4-tap chain fuses
+    # into one kernel, and at BEVFormer SCA's 6 maps x 8 points (u8) its 700 KB of C kept clang busy for minutes
+    if s.NV > 1: acc = acc.contiguous()
   return acc.reshape(Q, M * D)

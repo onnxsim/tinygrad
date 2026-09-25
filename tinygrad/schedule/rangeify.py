@@ -68,9 +68,18 @@ def fix_store_hazard(target:UOp, src:UOp):
     reaches_base[s] = s is base or any(reaches_base.get(c) for c in s.src)
     if reaches_base[s] and s.op in unsafe and not (s is target and s.op is Ops.SHRINK): return target.store(src.contiguous())
 
+def _onehot_gather(reduce:UOp, x:UOp) -> bool:
+  # sum(where(idx == arange, src, 0)): tensor indexing / gather. Codegen folds this reduce into a direct load of src[idx], so
+  # there is nothing left to parallelize -- but a split first cuts the one-hot range into chunks, and the fold then leaves one
+  # compare + conditional load per chunk (a 40000-row gather became 160 guarded loads per output plus a 160-way reduce)
+  while x.op in GroupOp.Movement: x = x.src[0]
+  return reduce.arg[0] is Ops.ADD and x.op is Ops.WHERE and x.src[2].op is Ops.CONST and x.src[2].arg == 0 and \
+    any(u.op in (Ops.CMPNE, Ops.CMPEQ) for u in x.src[0].toposort())
+
 def split_reduceop(reduce:UOp, x:UOp):
   if prod(reduce.shape) == 0: return None
   if not SPLIT_REDUCEOP or not all_int(x.shape) or (prod(x.shape)//prod(reduce.shape))<getenv("REDUCEOP_SPLIT_THRESHOLD", 32768): return None
+  if _onehot_gather(reduce, x): return None
   # if there are few globals, make some reduces into globals by splitting into two kernels
   # cap output buffer to 2**22: heuristic number of global outputs to achieve max occupancy with enough locals+upcasts for gemm
   #   ~2**10 should be enough if GROUP is used
