@@ -279,6 +279,35 @@ class TestDSPHmxI8(unittest.TestCase):
     self.assertEqual(kernel.count("__hmx_i8_addq("), 16)
     self.assertIn("((Lidx2))+4<8 ? (((Lidx2))==0 ? 1 : 2) : 0", kernel)
 
+  def rq_src(self, M, K, N, zy=131.0, lo=0.0, bias=True):
+    acc = Tensor.empty(M, K, dtype=dtypes.uint8).matmul(Tensor.empty(K, N, dtype=dtypes.int8), dtype=dtypes.int32)
+    if bias: acc = acc + Tensor.empty(N, dtype=dtypes.int32)
+    y = ((acc.cast(dtypes.float32) * Tensor.empty(N, dtype=dtypes.float32)).round() + zy).clip(lo, 255).cast(dtypes.uint8)
+    return dsp_source(y, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65)
+
+  def test_i8_requant_fused(self):
+    # ORT's QLinearConv output, clip(round((acc + b).float() * m) + zy, lo, 255).cast(uint8), on the HMX accumulator: every
+    # output row of 32 lanes is recognized (round()'s where/trunc expansion included) and the four rows of one accumulator
+    # load go through one HVX __hmx_rq4 -- nothing of tinygrad's lane-by-lane float epilogue is left
+    src = self.rq_src(64, 128, 96)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
+    self.assertEqual(kernel.count("__hmx_rq4("), 16)  # per output tile (64 rows) in the loop body
+    self.assertNotIn("__hmx_rq1(", kernel)
+    self.assertNotIn("__builtin_truncf", kernel)
+    self.assertIn(", 131, 0);", kernel)
+    # integer HVX only: V69 HVX has no IEEE fp32 (sf encodings compute qf32 on the phone)
+    self.assertNotIn("_sf_", src)
+
+  def test_i8_requant_relu_no_bias(self):
+    kernel = self.rq_src(64, 64, 64, zy=17.0, lo=17.0, bias=False).split("__attribute__((noinline)) void", 1)[1]
+    self.assertEqual(kernel.count("__hmx_rq4("), 16)
+    self.assertIn("(__hmx_i32x32)(0), ", kernel)
+    self.assertIn(", 17, 17);", kernel)
+
+  def test_i8_int32_out_has_no_requant(self):
+    src = self.src(64, 64, 128)
+    self.assertNotIn("__hmx_rq4(", src.split("__attribute__((noinline)) void", 1)[1])
+
   def test_i8_needs_signed_weights(self):
     # uint8 x uint8 has no HMX :cm form here: not the int8 TensorCore
     t = Tensor.empty(64, 64, dtype=dtypes.uint8).matmul(Tensor.empty(64, 64, dtype=dtypes.uint8), dtype=dtypes.int32)

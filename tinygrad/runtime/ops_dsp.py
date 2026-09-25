@@ -856,6 +856,81 @@ static inline void __hmx_i8_addq(int* acc, const unsigned char* P, int q) {
   a[2] += (__hmx_iv)__builtin_HEXAGON_V6_lo_128B(w1); a[3] += (__hmx_iv)__builtin_HEXAGON_V6_hi_128B(w1);
 }
 #endif
+/* ---- ORT-exact requantization of 32 int32 accumulators (QLinearConv / a QDQ Conv or MatMul after ORT's QDQ fusion):
+ *   y = clamp(rne(fp32(fp32(a + b) * m)) + zy, lo, 255)
+ * in integer HVX ops. V69 HVX has no IEEE fp32 (its sf encodings compute qf32 on the phone; hexagon-sim runs them as IEEE, so
+ * the simulator can't catch that), so ORT's two fp32 roundings are emulated exactly: fp32(acc) = |acc| rounded to 24
+ * significant bits (RNE), the 24 x 24-bit mantissa product with m's mantissa exact in two words, rounded to 24 bits (RNE),
+ * then to an integer (RNE) at the combined exponent, saturated. m > 0, normal ---- */
+typedef int __hmx_i32x32 __attribute__((ext_vector_type(32)));
+typedef float __hmx_f32x32 __attribute__((ext_vector_type(32)));
+#ifdef HMX_REF
+static inline unsigned char __hmx_rq1s(int a, int b, float m, int zy, int lo) {
+  volatile float f = (float)(a + b), v = f * m;
+  float l = (float)(lo - zy), h = (float)(255 - zy), c = v < l ? l : v > h ? h : v;
+  volatile float t = c + 12582912.0f;
+  return (unsigned char)((int)(t - 12582912.0f) + zy);
+}
+static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  for (int i = 0; i < 32; i++) d[i] = __hmx_rq1s(a[i], b[i], m[i], zy, lo);
+}
+static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3, __hmx_i32x32 a0,
+                             __hmx_i32x32 a1, __hmx_i32x32 a2, __hmx_i32x32 a3, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  __hmx_rq1(d0, a0, b, m, zy, lo); __hmx_rq1(d1, a1, b, m, zy, lo); __hmx_rq1(d2, a2, b, m, zy, lo); __hmx_rq1(d3, a3, b, m, zy, lo);
+}
+#else
+typedef unsigned int __hmx_u32x32 __attribute__((ext_vector_type(32)));
+static inline __hmx_u32x32 __hmx_bitlen(__hmx_u32x32 x) { return (__hmx_u32x32)32 - (__hmx_u32x32)__builtin_HEXAGON_V6_vcl0w_128B((__hmx_v)x); }
+static inline __hmx_u32x32 __hmx_rne_shr(__hmx_u32x32 q, __hmx_u32x32 sh) {  /* rne(q / 2^sh), sh in [0, 31] */
+  __hmx_u32x32 one = 1, r = q >> sh, rem = q & ((one << sh) - one), half = (one << sh) >> one;
+  __hmx_i32x32 up = (sh > 0) & ((rem > half) | ((rem == half) & ((r & one) == one)));
+  return r + ((__hmx_u32x32)up & one);
+}
+/* 32 int32 accumulators (+ bias) and m's fp32 bits -> 32 words y in [lo, 255] */
+static inline __hmx_v __hmx_rqw(__hmx_i32x32 acc, __hmx_u32x32 mbits, int zy, int lo) {
+  __hmx_u32x32 one = 1, z = 0;
+  __hmx_i32x32 neg = acc < 0;
+  __hmx_u32x32 u = (__hmx_u32x32)(neg ? -acc : acc), na = __hmx_bitlen(u), sa = na > 24 ? na - 24 : z;
+  __hmx_u32x32 ma = __hmx_rne_shr(u, sa), mm = (mbits & 0x7fffff) | 0x800000;           /* fp32(acc) = ma 2^sa, m = mm 2^em */
+  __hmx_i32x32 em = (__hmx_i32x32)((mbits >> 23) & 255) - 150;
+  __hmx_u32x32 al = ma & 0xfff, ah = ma >> 12, ml = mm & 0xfff, mh = mm >> 12;          /* ma * mm = hw 2^24 + lw, exact */
+  __hmx_u32x32 t1 = ah * ml + al * mh, lf = al * ml + ((t1 & 0xfff) << 12);
+  __hmx_u32x32 lw = lf & 0xffffff, hw = ah * mh + (t1 >> 12) + (lf >> 24);
+  __hmx_u32x32 n = hw > z ? __hmx_bitlen(hw) + 24 : __hmx_bitlen(lw), sp = n > 24 ? n - 24 : z;   /* product -> 24 bits */
+  __hmx_u32x32 q = (hw << (24 - sp)) | (lw >> sp), rem = lw & ((one << sp) - one), half = (one << sp) >> one;
+  __hmx_i32x32 up = (sp > z) & ((rem > half) | ((rem == half) & ((q & one) == one)));
+  __hmx_u32x32 pq = q + ((__hmx_u32x32)up & one);
+  __hmx_i32x32 e = (__hmx_i32x32)sa + em + (__hmx_i32x32)sp;                               /* value = pq 2^e */
+  __hmx_u32x32 left = (__hmx_u32x32)(e > 8 ? 9 : e), s = (__hmx_u32x32)(-e);
+  __hmx_u32x32 yl = pq == z ? z : e > 8 ? (__hmx_u32x32)256 : pq > ((__hmx_u32x32)256 >> left) ? (__hmx_u32x32)256 : pq << left;
+  __hmx_u32x32 yr = s >= 32 ? z : __hmx_rne_shr(pq, s & 31);
+  __hmx_i32x32 y = (__hmx_i32x32)(e >= 0 ? yl : yr);
+  y = neg ? -y : y;
+  y = y < lo - zy ? lo - zy : y > 255 - zy ? 255 - zy : y;
+  return (__hmx_v)(y + zy);
+}
+/* bytes 32j .. 32j+31 of v to d (32-byte aligned): rotated into place in d's 128-byte line, one byte-predicated store */
+static inline void __hmx_st32(unsigned char* d, __hmx_v v, int j) {
+  unsigned off = (unsigned)d & 127u;
+  v = __builtin_HEXAGON_V6_vror_128B(v, (int)((32u * (unsigned)j - off) & 127u));
+  __asm__ volatile("q0 = vsetq2(%2)\n q1 = vsetq(%3)\n q0 = and(q0, !q1)\n if (q0) vmem(%0+#0) = %1"
+                   :: "r"((unsigned)d & ~127u), "v"(v), "r"(off + 32u), "r"(off) : "q0", "q1", "memory");
+}
+static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  __hmx_v z = __builtin_HEXAGON_V6_vd0_128B(), y = __hmx_rqw(a + b, (__hmx_u32x32)m, zy, lo);
+  __hmx_st32(d, __builtin_HEXAGON_V6_vpackhub_sat_128B(z, __builtin_HEXAGON_V6_vpackwh_sat_128B(z, y)), 0);
+}
+/* four rows sharing bias and scale (the four rows of one 128-lane accumulator load): two word -> halfword packs, one
+ * halfword -> byte pack, the rows at bytes 0, 32, 64, 96 */
+static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
+    __hmx_i32x32 a0, __hmx_i32x32 a1, __hmx_i32x32 a2, __hmx_i32x32 a3, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  __hmx_u32x32 mb = (__hmx_u32x32)m;
+  __hmx_v y0 = __hmx_rqw(a0 + b, mb, zy, lo), y1 = __hmx_rqw(a1 + b, mb, zy, lo);
+  __hmx_v y2 = __hmx_rqw(a2 + b, mb, zy, lo), y3 = __hmx_rqw(a3 + b, mb, zy, lo);
+  __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
+  __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
+}
+#endif
 """.replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB)).replace("@AO@", str(_HMX_AO))
 
 def _hmx_lane(u:UOp):
@@ -1053,6 +1128,123 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
     after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, accs,
                                             "{{ const unsigned char* _P = __hmx_i8_store();" + "".join(body) + " }}"))
   return None
+
+def _hmx_cval(u:UOp):
+  # the value of a (casted) constant, else None
+  while u.op is Ops.CAST: u = u.src[0]
+  if u.op is not Ops.CONST: return None
+  try: return float(u.arg)
+  except (TypeError, ValueError): return None
+
+def _hmx_cadd(u:UOp):
+  # x + c (either order) -> (x, c), else None
+  if u.op is not Ops.ADD: return None
+  for x, c in (u.src, u.src[::-1]):
+    if (cv:=_hmx_cval(c)) is not None and _hmx_cval(x) is None: return x, cv
+  return None
+
+def _hmx_rne_of(r:UOp):
+  # tinygrad's round() (half to even) as it is linearized -> its operand v, else None:
+  #   WHERE((0 < v) != (trunc(h) == h), floor(v + 0.5), ceil(v - 0.5)), h = trunc(v) * 0.5
+  #   floor(z) = WHERE(z < trunc(z), trunc(z) - 1, trunc(z)), ceil(z) = WHERE(trunc(z) < z, trunc(z) + 1, trunc(z))
+  if r.op is not Ops.WHERE: return None
+  c, fl, ce = r.src
+  if c.op is not Ops.CMPNE or c.src[0].op is not Ops.CMPLT or _hmx_cval(c.src[0].src[0]) != 0.0: return None
+  v, e = c.src[0].src[1], c.src[1]
+  if e.op is not Ops.CMPEQ or e.src[0].op is not Ops.TRUNC or e.src[0].src[0] is not e.src[1]: return None
+  h = e.src[1]
+  if h.op is not Ops.MUL or not any(x.op is Ops.TRUNC and x.src[0] is v and _hmx_cval(y) == 0.5 for x, y in (h.src, h.src[::-1])): return None
+  def rounded(w:UOp, off:float, lt_first:bool, step:float) -> bool:
+    if w.op is not Ops.WHERE or w.src[1].op is not Ops.ADD or w.src[0].op is not Ops.CMPLT: return False
+    t = w.src[2]
+    if t.op is not Ops.TRUNC or _hmx_cadd(t.src[0]) != (v, off) or _hmx_cadd(w.src[1]) != (t, step): return False
+    return w.src[0].src == ((t.src[0], t) if lt_first else (t, t.src[0]))
+  return v if rounded(fl, 0.5, True, -1.0) and rounded(ce, -0.5, False, 1.0) else None
+
+def _hmx_rq_lane(x:UOp):
+  # one lane of a QDQ requantization, y = clip(round((float)(p [+ q]) * m) + zy, lo, 255).cast(uint8), as linearized:
+  #   WHERE(255 < X, 255, (uchar)X), X = MAX(round(v) [+ zy], lo), v = (float)(p [+ q]) * m (lanes of vector loads)
+  # -> ((p, lane), (q, lane) | None, (m, lane), zy, lo) or None
+  if x.op is not Ops.WHERE or x.dtype != dtypes.uchar or len(x.src) != 3: return None
+  c, hi, cx = x.src
+  if c.op is not Ops.CMPLT or _hmx_cval(c.src[0]) != 255.0 or _hmx_cval(hi) != 255.0: return None
+  X = c.src[1]
+  if cx.op is not Ops.CAST or cx.src[0] is not X or X.op is not Ops.MAX: return None
+  y, lo = next(((a, _hmx_cval(b)) for a, b in (X.src, X.src[::-1]) if _hmx_cval(b) is not None), (None, None))
+  if y is None: return None
+  y, zy = _hmx_cadd(y) or (y, 0.0)
+  v = _hmx_rne_of(y)
+  if v is None or v.op is not Ops.MUL: return None
+  for f, ml in (v.src, v.src[::-1]):
+    if f.op is Ops.CAST and f.dtype == dtypes.float and f.src[0].dtype == dtypes.int and (m := _hmx_lane(ml)) is not None: break
+  else: return None
+  a = f.src[0]
+  pq = [_hmx_lane(a)] if a.op is Ops.INDEX else [_hmx_lane(z) for z in a.src] if a.op is Ops.ADD else [None]
+  if any(t is None or t[0].op is not Ops.LOAD for t in pq + [m]) or m[0].dtype != dtypes.float: return None
+  if zy != int(zy) or lo != int(lo) or not 0 <= zy <= 255 or not -255 <= lo <= 255: return None
+  return pq[0], (pq[1] if len(pq) > 1 else None), m, int(zy), int(lo)
+
+def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
+  # uint8 row stores of 32 lanes that are each an ORT-exact requantization of the same lane of the same vector loads
+  # (accumulator, bias, per-column scale): the lanes go; the four rows of one 128-lane accumulator load (same bias, scale,
+  # zero point) become one HVX __hmx_rq4, any other row one __hmx_rq1
+  rows = []
+  for st in uops:
+    if st.op is not Ops.STORE or st.src[1].op is not Ops.STACK or st.src[1].dtype != dtypes.uchar or len(st.src[1].src) != 32: continue
+    ms = [_hmx_rq_lane(x) for x in st.src[1].src]
+    if any(m is None for m in ms) or len({(m[3], m[4]) for m in ms}) != 1: continue
+    cols = [tuple(m[i] for m in ms) for i in range(3)]
+    if cols[1][0] is None: cols[1] = None
+    picks = []
+    for c in cols:
+      if c is None: picks.append(None); continue
+      o, ld = c[0][1], c[0][0]
+      if len({t[0] for t in c}) != 1 or [t[1] for t in c] != list(range(o, o + 32)) or o % 32 or len(ld.shape) != 1 or ld.shape[0] % 32: break
+      picks.append((ld, o))
+    else: rows.append((st, picks, ms[0][3], ms[0][4]))
+  def pick(k:int, o:int, n:int) -> str:
+    return f"{{{k}}}" if n == 32 else f"__builtin_shufflevector({{{k}}}, {{{k}}}, {', '.join(str(o+i) for i in range(32))})"
+  groups: dict[tuple, dict[int, tuple]] = {}
+  for r in rows:
+    st, (a, b, m), zy, lo = r
+    if a[0].shape == (128,) and (b is None or b[1] == 0) and m[1] == 0:
+      groups.setdefault((a[0], b and b[0], m[0], zy, lo), {})[a[1] // 32] = r
+  done = set()
+  for (al, bl, ml, zy, lo), g in groups.items():
+    if sorted(g) != [0, 1, 2, 3]: continue
+    sts = [g[j][0] for j in range(4)]
+    loads = [al, ml] + ([bl] if bl is not None else [])
+    ptrs = tuple(x.src[0] for x in sts)
+    bias = pick(2, 0, bl.shape[0]) if bl is not None else "(__hmx_i32x32)(0)"
+    code = (f"__hmx_rq4({{3}}, {{4}}, {{5}}, {{6}}, {', '.join(pick(0, 32*j, 128) for j in range(4))}, {bias}, "
+            f"{pick(1, 0, ml.shape[0])}, {zy}, {lo});") if bl is not None else \
+           (f"__hmx_rq4({{2}}, {{3}}, {{4}}, {{5}}, {', '.join(pick(0, 32*j, 128) for j in range(4))}, {bias}, "
+            f"{pick(1, 0, ml.shape[0])}, {zy}, {lo});")
+    last = max(sts, key=lambda x: pos[x])
+    replace[last] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + ptrs, code)
+    drop.update(x for x in sts if x is not last)
+    done.update(sts)
+  for st, (a, b, m), zy, lo in rows:
+    if st in done: continue
+    loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
+    bias = pick(2, b[1], b[0].shape[0]) if b is not None else "(__hmx_i32x32)(0)"
+    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + (st.src[0],),
+                      f"__hmx_rq1({{{len(loads)}}}, {pick(0, a[1], a[0].shape[0])}, {bias}, {pick(1, m[1], m[0].shape[0])}, {zy}, {lo});")
+    done.add(st)
+  # the lanes' own uops, down to the loads, go when nothing else uses them
+  keep_loads = {x for u in replace.values() if u.op is Ops.CUSTOM for x in u.src}
+  dead, stack = set(), [x for st in done for x in st.src[1:]]
+  while stack:
+    u = stack.pop()
+    if u in dead or u in keep_loads or u.op in (Ops.CONST, Ops.PARAM, Ops.RANGE) or u not in pos: continue
+    dead.add(u); stack.extend(u.src)
+  live = {d for d in dead if any(v not in dead and v not in done for v in users.get(d, []))}
+  while live:
+    more = {x for d in live for x in d.src if x in dead} - live
+    dead -= live
+    live = more
+  drop |= dead
+  return len(done)
 
 def _hmx_bail(uops, why:int):
   if getenv("HMX_DEBUG"): print(f"hmx_acc rewrite skipped (check {why})")
@@ -1257,6 +1449,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     sm, sx = span_mac(tuple(so.src[0] for so in stores))
     after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
       "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
+  if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", 1):
+    nrq = _hmx_rq_rows(uops, users, drop, before, replace, pos)
+    if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}")
   if not replace: return _hmx_bail(uops, 9)
   if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
   out = []
@@ -1404,7 +1599,8 @@ class DSPRenderer(ClangRenderer):
     for u in uops:
       for s in u.src: self._users.setdefault(s, []).append(u)
     self._scopes = [i for i,u in enumerate(uops) if u.op in (Ops.RANGE, Ops.END, Ops.IF, Ops.ENDIF)]
-    return self.render_kernel(*self._render(uops), uops)
+    src = self.render_kernel(*self._render(uops), uops)
+    return src
 
   # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32
   # groups of 4)) in one instruction -- no warp/lane cooperation needed (tensor_cores' threads=1), unlike
