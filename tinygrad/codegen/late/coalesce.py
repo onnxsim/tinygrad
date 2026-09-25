@@ -33,10 +33,16 @@ def _drop_valid_stmts(valid:UOp, idx:UOp, height:int, width:int) -> list[UOp]:
       terms = list(X.split_uop(Ops.ADD))
       v = next((u for u in terms if u.op in GroupOp.Irreducible and u.op is not Ops.CONST), None)
       if v is not None and (rest:=[u for u in terms if u is not v]): subs.append({v: fake - UOp.usum(*rest)})
-      if any((testidx:=graph_rewrite(coord.substitute(sub), sym)).vmin >= b or testidx.vmax < 0
-             for sub in subs for coord,b in zip(idx.src, (width, height))):
+      if any(_out_of_bound(coord, sub, b) for sub in subs for coord,b in zip(idx.src, (width, height))):
         drop_stmt.append(stmt)
   return drop_stmt
+
+def _out_of_bound(coord:UOp, sub:dict[UOp, UOp], bound:int) -> bool:
+  # the "v -> fake - (X - v)" substitution can make the rewrite cyclic (KeyError in graph_rewrite, seen on a strided
+  # transposed conv's index); an unprovable probe just keeps the valid
+  try: testidx = graph_rewrite(coord.substitute(sub), sym)
+  except KeyError: return False
+  return testidx.vmin >= bound or testidx.vmax < 0
 
 def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
   idx = uop_given_valid(valid, start_idx)
