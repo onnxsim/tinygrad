@@ -184,7 +184,19 @@ class TestDSPHmx(unittest.TestCase):
     self.assertLess(kernel.index("for (int Lidx2"), kernel.index("for (int Lidx1"))
     self.assertIn("_a = __hmx_ca((Lidx1)*18+(Ridx0)); if ((Lidx2)==0)", kernel)
     self.assertIn("_b = __hmx_cb((Lidx2)%2*18+(Ridx0)); if ((Lidx1)==0 && (Lidx2)%2==0)", kernel)
-    self.assertEqual(kernel.count("__hmx_pack2x2("), 16)
+    # uniform row strides: one batched pack of the whole pair (16 row pairs of each tile), not 16 calls
+    self.assertEqual(kernel.count("__hmx_pack2x2_blk("), 1)
+    # B pairs stream from DDR: the next pair's 128-byte panel is L2-prefetched while this one packs
+    self.assertIn("(Lidx2)+2<8 ? ((Lidx2)==0 ? 1 : 2) : 0", kernel)
+
+  def test_output_pairing(self):
+    # adjacent N tiles n, n+1 (paired B) are computed together on even n: two spanning load pairs, both accumulators stored
+    # (n+1 at the second store slot), full 64-column output rows written from the pair; odd n does no work
+    kernel = self.src(128, 576, 384).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18), 18);", kernel)
+    self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18+18), 18);", kernel)  # tile n+1
+    self.assertIn("__hmx_store2()", kernel)
+    self.assertIn("__hmx_outp(", kernel)
 
   def test_large_vtcm_pool(self):
     # HMX_VTCM_KB > 256: A and B share one pool of loop-indexed slots, B after A's from a 32-slot boundary, K panels at a
@@ -237,6 +249,40 @@ class TestDSPHmx(unittest.TestCase):
 
   def test_float_matmul_is_not_hmx(self):
     self.assertNotIn("mxmem", self.src(64, 64, 64, dtypes.float32))
+
+class TestDSPHmxI8(unittest.TestCase):
+  # the V69 HMX int8 TensorCore (uint8 activations x int8 weights -> int32): ":cm" activation tiles (64 rows x 32 bytes), weight
+  # tiles 32 x 32 with four K rows per 32-bit column group, the exact int32 accumulator read back as four byte planes
+  def src(self, M, K, N):
+    t = Tensor.empty(M, K, dtype=dtypes.uint8).matmul(Tensor.empty(K, N, dtype=dtypes.int8), dtype=dtypes.int32)
+    return dsp_source(t, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65)
+
+  def test_i8_matmul_is_hmx_cm(self):
+    src = self.src(128, 256, 256)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
+    self.assertIn("activation.ub = mxmem(%0,%1):cm", src)
+    self.assertIn(":deep", src)
+    self.assertIn("#ifdef HMX_REF", src)
+    self.assertEqual(kernel.count("__hmx_i8_begin();"), 1)
+    self.assertNotIn("__WMMA_", kernel)
+    # A: packed once per M tile into loop-indexed VTCM slots
+    self.assertEqual(kernel.count("__hmx_i8_pack_a4("), 16)
+    self.assertIn("__hmx_ca((Lidx1)*8+(Ridx0))", kernel)
+
+  def test_i8_quad_b_deep_and_planes(self):
+    # four adjacent N tiles share each 128-byte weight row line: packed together on n%4==0, one :deep weight load pair per K
+    # block on even n drives both accumulators; n+1's byte planes go to spare A slots and are summed into its output on odd n
+    kernel = self.src(128, 256, 256).split("__attribute__((noinline)) void", 1)[1]
+    self.assertEqual(kernel.count("__hmx_i8_pack_b4x4("), 8)
+    self.assertIn("if ((Lidx2)%2==0) __hmx_i8_mac2(_a, __hmx_cb(((Lidx2)%4/2)*8+(Ridx0)));", kernel)
+    self.assertIn("__hmx_i8_store2((unsigned char*)__hmx_ca(16+4*(Lidx1)))", kernel)
+    self.assertEqual(kernel.count("__hmx_i8_addq("), 16)
+    self.assertIn("((Lidx2))+4<8 ? (((Lidx2))==0 ? 1 : 2) : 0", kernel)
+
+  def test_i8_needs_signed_weights(self):
+    # uint8 x uint8 has no HMX :cm form here: not the int8 TensorCore
+    t = Tensor.empty(64, 64, dtype=dtypes.uint8).matmul(Tensor.empty(64, 64, dtype=dtypes.uint8), dtype=dtypes.int32)
+    self.assertNotIn("__hmx_i8_", dsp_source(t, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65))
 
 if __name__ == '__main__':
   unittest.main()

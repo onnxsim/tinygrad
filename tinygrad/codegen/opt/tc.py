@@ -212,3 +212,13 @@ hexagon_hmx = [TensorCore(dims=(32,32,32), threads=1, elements_per_thread=(1024,
   opts=("u1","u0","u0","u0","u0","u0","u1","u1","u1","u1"),
   swizzle=(((), ('u0','r0','r1','r2','r3','r4','u6','u7','u8','u9'), ('u1','u2','u3','u4','u5')),
            ((), ('r0','u1','u2','u3','u4','u5','r1','r2','r3','r4'), ('u0','u6','u7','u8','u9'))))]
+
+# Hexagon HMX int8 ":cm" mode (V69): D (int32, 64 x 32) = C + A (u8, 64 x 32) . B (s8, 32 x 32), exact. One activation crouton
+# is 64 rows x 32 channels, one byte each (A(m, k) at byte 32*m + k: plain row-major), the weight block W(k, n) at byte
+# 128*(k/4) + 4*n + k%4 (index bits k4 k3 k2 n4..n0 k1 k0). C/D row-major (m, n). The exact int32 accumulator comes from four
+# non-saturating byte-plane stores (scripts/android/hmx_gemm/hmx_qconv.h in onnxsim). u0..u4 = n0..n4, u5..u10 = m0..m5.
+hexagon_hmx_i8 = [TensorCore(dims=(32,64,32), threads=1, elements_per_thread=(2048,1024,2048), dtype_in=dtypes.uint8,
+  dtype_out=dtypes.int32, dtype_in_b=dtypes.int8,
+  opts=("u0","u0","u0","u0","u0","u1","u1","u1","u1","u1","u1"),
+  swizzle=(((), ('r0','r1','r2','r3','r4','u5','u6','u7','u8','u9','u10'), ('u0','u1','u2','u3','u4')),
+           ((), ('r0','r1','u0','u1','u2','u3','u4','r2','r3','r4','u5'), ('u6','u7','u8','u9','u10'))))]
