@@ -767,6 +767,11 @@ static inline void __hmx_i8_pack_b4x4(signed char* d0, signed char* d1, signed c
   __hmx_i8_pack_b4(d0, r0, r1, r2, r3); __hmx_i8_pack_b4(d1, r0 + 32, r1 + 32, r2 + 32, r3 + 32);
   __hmx_i8_pack_b4(d2, r0 + 64, r1 + 64, r2 + 64, r3 + 64); __hmx_i8_pack_b4(d3, r0 + 96, r1 + 96, r2 + 96, r3 + 96);
 }
+static inline void __hmx_i8_pack_a4x4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3, const unsigned char* r0,
+                                      const unsigned char* r1, const unsigned char* r2, const unsigned char* r3) {
+  __hmx_i8_pack_a4(d0, r0, r1, r2, r3); __hmx_i8_pack_a4(d1, r0 + 32, r1 + 32, r2 + 32, r3 + 32);
+  __hmx_i8_pack_a4(d2, r0 + 64, r1 + 64, r2 + 64, r3 + 64); __hmx_i8_pack_a4(d3, r0 + 96, r1 + 96, r2 + 96, r3 + 96);
+}
 static int __hmx_i8acc2[2048], __hmx_i8out2[2048];
 static inline void __hmx_i8_mac2(const void* av, const void* bv) {
   const unsigned char* a = (const unsigned char*)av; const signed char* b = (const signed char*)bv;
@@ -828,6 +833,17 @@ static inline void __hmx_i8_pack_b4x4(signed char* d0, signed char* d1, signed c
   __hmx_vp y = __builtin_HEXAGON_V6_vshuffvdd_128B(*(const __hmx_v*)r3, *(const __hmx_v*)r2, -1);
   __hmx_vp lo = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(y), __builtin_HEXAGON_V6_lo_128B(x), -2);
   __hmx_vp hi = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_hi_128B(y), __builtin_HEXAGON_V6_hi_128B(x), -2);
+  *(__hmx_v*)d0 = __builtin_HEXAGON_V6_lo_128B(lo); *(__hmx_v*)d1 = __builtin_HEXAGON_V6_hi_128B(lo);
+  *(__hmx_v*)d2 = __builtin_HEXAGON_V6_lo_128B(hi); *(__hmx_v*)d3 = __builtin_HEXAGON_V6_hi_128B(hi);
+}
+/* four rows (128-byte aligned lines, e.g. 4 NHWC pixels of 128 channels) -> the 128-byte row group of each of four activation
+ * tiles (channel blocks 0..3): a 4x4 transpose of 32-byte blocks, two vshuff stages; each line is read once for four tiles */
+static inline void __hmx_i8_pack_a4x4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3, const unsigned char* r0,
+                                      const unsigned char* r1, const unsigned char* r2, const unsigned char* r3) {
+  __hmx_vp x = __builtin_HEXAGON_V6_vshuffvdd_128B(*(const __hmx_v*)r1, *(const __hmx_v*)r0, -32);
+  __hmx_vp y = __builtin_HEXAGON_V6_vshuffvdd_128B(*(const __hmx_v*)r3, *(const __hmx_v*)r2, -32);
+  __hmx_vp lo = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(y), __builtin_HEXAGON_V6_lo_128B(x), -64);
+  __hmx_vp hi = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_hi_128B(y), __builtin_HEXAGON_V6_hi_128B(x), -64);
   *(__hmx_v*)d0 = __builtin_HEXAGON_V6_lo_128B(lo); *(__hmx_v*)d1 = __builtin_HEXAGON_V6_hi_128B(lo);
   *(__hmx_v*)d2 = __builtin_HEXAGON_V6_lo_128B(hi); *(__hmx_v*)d3 = __builtin_HEXAGON_V6_hi_128B(hi);
 }
@@ -1167,11 +1183,21 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
     swap_out.append(sw)
     rank, na, nb, is_quad = plan(outer, inner)
     ti = int(inner.vmax) + 1
-    def slot(r, base):
+    def slot(r, base, j=0):
       deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
-      if deps == {inner}: return f"__hmx_ca({base}+({iname})*{kt}+({kr}))", f"({on})==0"
-      if deps == {outer}: return f"__hmx_ca({base}+({kr}))", f"({iname})==0"
-      return f"__hmx_ca({base}+({kr}))", f"({on})==0 && ({iname})==0"
+      oj = f"+{j}" if j else ""
+      if deps == {inner}: return f"__hmx_ca({base}+({iname})*{kt}+({kr}){oj})", f"({on})==0"
+      if deps == {outer}: return f"__hmx_ca({base}+({kr}){oj})", f"({iname})==0"
+      return f"__hmx_ca({base}+({kr}){oj})", f"({on})==0 && ({iname})==0"
+    # A rows reading the same 128-byte lines for K blocks 4j .. 4j+3: filled four slots at a time, each line loaded once
+    ki = f"{{{len(srcs)+no}}}"
+    qa = bool(getenv("HMX_I8_QUAD_A", 1)) and _hmx_quad_k_rows(ra, e.src[1], ranges)
+    def fill_a(a_):
+      if not qa: return f" if ({a_[1]}) {{{{{pa} }}}}"
+      d = [slot(ra, 0, j)[0] for j in range(4)]
+      pq4 = "".join(f" __hmx_i8_pack_a4x4((unsigned char*){d[0]}+{128*q}, (unsigned char*){d[1]}+{128*q}, (unsigned char*){d[2]}+{128*q}, "
+                    f"(unsigned char*){d[3]}+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
+      return f" if ({a_[1]} && ({ki})%4==0) {{{{{pq4} }}}}"
     if is_quad:
       # B: four adjacent N tiles share every 128-byte row line: packed together (one byte + one halfword interleave per four
       # rows) into pair slots [n | n+1] (2 KB), pair p of the quad at slot p*kt + k; even n runs one weight :deep load pair
@@ -1185,18 +1211,18 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
                    for g in range(8))
       pf = (f" if ({k0}) __hmx_prefetch_panel2((const __fp16*){ptr[64]}, (const __fp16*){ptr[65]}, {32*kt}, "
             f"{'(' + nm + ')+4<' + str(int(outer.vmax)+1) + ' ? ((' + nm + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
-      code = (f"{{{{ void* _a = {sa_[0]}; if ({sa_[1]}) {{{{{pa} }}}} if ({nm}%4==0 && ({iname})==0) {{{{{pf}{pq} }}}}"
+      code = (f"{{{{ void* _a = {sa_[0]};{fill_a(sa_)} if ({nm}%4==0 && ({iname})==0) {{{{{pf}{pq} }}}}"
               f" if ({nm}%2==0) __hmx_i8_mac2(_a, __hmx_ca({bb}+({nm}%4/2)*{kt}+({kr}))); }}}}")
       srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
       quad = (nm, f"(unsigned char*)__hmx_ca({na}+4*({iname}))")
     elif rank >= 1:
       a_ = slot(ra, 0) if rank in (3, 2) else None
       b_ = slot(rb, na) if rank in (3, 1) else None
-      ca = f"void* _a = {a_[0]}; if ({a_[1]}) {{{{{pa} }}}}" if a_ else f"void* _a = __hmx_i8sa();{pa}"
+      ca = f"void* _a = {a_[0]};{fill_a(a_)}" if a_ else f"void* _a = __hmx_i8sa();{pa}"
       cb = f" void* _b = {b_[0]}; if ({b_[1]}) {{{{{pb} }}}}" if b_ else f" void* _b = __hmx_i8sb();{pb}"
       code = "{{ " + ca + cb + " __hmx_i8_mac(_a, _b); }}"
       srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
-    if getenv("HMX_DEBUG"): print(f"i8 plan: rank {rank} (quad {is_quad}) A {na} B {nb} slots of {pool}, kt {kt}, swap {sw}")
+    if getenv("HMX_DEBUG"): print(f"i8 plan: rank {rank} (quad {is_quad}, quad A {qa}) A {na} B {nb} slots of {pool}, kt {kt}, swap {sw}")
   replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
   end_at = pos[eo] if eo is not None else max(pos[so] for so, _, _ in stores)
   body = []
@@ -1648,6 +1674,18 @@ def _hmx_quad_rows(rows, n:UOp, ranges:list[UOp]) -> bool:
     return _hmx_const_delta(g, ranges)
   stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, n: env[n] + 1}))
   return stride is not None and stride % 128 == 0 and nxt == 32
+
+def _hmx_quad_k_rows(rows, k:UOp, ranges:list[UOp]) -> bool:
+  # 32-byte row windows (their own loads) that move 32 bytes on per K block (loop k) and sit 128-byte aligned at k % 4 == 0: K
+  # blocks 4j .. 4j+3 read the same aligned 128-byte lines (NHWC activations with 128 | C, K = (.., C) with C innermost)
+  if (int(k.vmax) + 1) % 4 or any(b or v.max_numel() != 32 or len(v.src[0].src) < 2 for v, b in rows): return False
+  for v, _ in rows:
+    ix = v.src[0].src[1]
+    nxt = _hmx_const_delta(lambda env: None if (a:=_hmx_eval(ix, {**env, k: 4 * (env[k] // 4) + 1})) is None or
+                           (z:=_hmx_eval(ix, {**env, k: 4 * (env[k] // 4)})) is None else a - z, ranges)
+    al = _hmx_const_delta(lambda env: None if (a:=_hmx_eval(ix, {**env, k: 4 * (env[k] // 4)})) is None else a % 128, ranges)
+    if nxt != 32 or al != 0: return False
+  return True
 
 def _hmx_uniform_rows(rows, ranges:list[UOp]) -> bool:
   # the 32 rows of an operand sit at one constant stride from row 0 (so a helper can walk them from two pointers)

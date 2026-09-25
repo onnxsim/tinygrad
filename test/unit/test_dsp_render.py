@@ -329,6 +329,20 @@ class TestDSPHmxI8(unittest.TestCase):
     self.assertLess(kernel.index("__hmx_i8_begin();"), kernel.index("for (int Ridx"))  # before the outer (dy) loop
     self.assertRegex(kernel, r"__hmx_ca\(\d+\+\(Lidx\d\)\*18\+\(\(Ridx\d\)\*6\+Ridx\d\)\)")  # slot: tile * 18 + dy * 6 + k
 
+  def test_i8_conv3x3_quad_a_pack(self):
+    # NHWC activations with C = 128: K blocks 4j .. 4j+3 are the four channel blocks of the same 128-byte pixel lines, so the
+    # cached activation tiles are filled four at a time (each line loaded once, a 4x4 transpose of 32-byte blocks)
+    from tinygrad.helpers import Context
+    C, N, Wp, P = 128, 128, 18, 192
+    x, w = Tensor.empty(P + 2 * Wp + 2, C, dtype=dtypes.uint8), Tensor.empty(3, 3, C, N, dtype=dtypes.int8)
+    v = x.permute(1, 0)._pool((3,), 1, 1).permute(0, 2, 1)._pool((3,), 1, Wp).shrink(((0, C), (0, 3), (0, P), (0, 3))).permute(2, 3, 1, 0)
+    acc = (v.reshape(P, 1, 3, 3, C).cast(dtypes.int32) * w.permute(3, 0, 1, 2).reshape(1, N, 3, 3, C).cast(dtypes.int32)).sum((2, 3, 4))
+    with Context(TC_OPT=1): src = dsp_source(acc, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
+    self.assertEqual(kernel.count("__hmx_i8_pack_a4x4("), 16)
+    self.assertNotIn("__hmx_i8_pack_a4(", kernel)
+    self.assertRegex(kernel, r"%4==0\) \{ __hmx_i8_pack_a4x4")
+
   def test_i8_needs_signed_weights(self):
     # uint8 x uint8 has no HMX :cm form here: not the int8 TensorCore
     t = Tensor.empty(64, 64, dtype=dtypes.uint8).matmul(Tensor.empty(64, 64, dtype=dtypes.uint8), dtype=dtypes.int32)
