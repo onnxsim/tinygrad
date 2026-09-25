@@ -308,6 +308,23 @@ class TestDSPHmxI8(unittest.TestCase):
     src = self.src(64, 64, 128)
     self.assertNotIn("__hmx_rq4(", src.split("__attribute__((noinline)) void", 1)[1])
 
+  def test_i8_conv3x3_grid_two_reduce_loops(self):
+    # a 3x3 conv on the flat padded-image grid (row stride Wp): A(p, dy, dx, c) = x[p + dy*Wp + dx, c] as two dilated windows,
+    # so the pixel axis is one axis; tinygrad splits K into dy (3) and dx*C + c. The accumulator spans both reduce loops (begun
+    # before dy, stored after it) and cached tiles are keyed by the whole K index -- keyed by the inner loop alone, dy = 1, 2
+    # reused dy = 0's tiles
+    from tinygrad.helpers import Context
+    C, N, Wp, P = 64, 64, 18, 320
+    x, w = Tensor.empty(P + 2 * Wp + 2, C, dtype=dtypes.uint8), Tensor.empty(3, 3, C, N, dtype=dtypes.int8)
+    v = x.permute(1, 0)._pool((3,), 1, Wp).permute(0, 2, 1)._pool((3,), 1, 1).shrink(((0, C), (0, 3), (0, P), (0, 3))).permute(2, 1, 3, 0)
+    acc = (v.reshape(P, 1, 3, 3, C).cast(dtypes.int32) * w.permute(3, 0, 1, 2).reshape(1, N, 3, 3, C).cast(dtypes.int32)).sum((2, 3, 4))
+    with Context(TC_OPT=1): src = dsp_source(acc, tc.hexagon_hmx_i8 + tc.hexagon_hmx + tc.hexagon_v65)
+    kernel = src[src.index("__attribute__((noinline)) void"):]
+    self.assertIn("__hmx_i8_mac(", kernel)
+    self.assertEqual(kernel.count("__hmx_i8_begin();"), 1)
+    self.assertLess(kernel.index("__hmx_i8_begin();"), kernel.index("for (int Ridx"))  # before the outer (dy) loop
+    self.assertRegex(kernel, r"__hmx_c[ab]\(\(Lidx\d\)\*18\+\(\(Ridx\d\)\*6\+Ridx\d\)\)")  # slot: tile * 18 + dy * 6 + k
+
   def test_i8_needs_signed_weights(self):
     # uint8 x uint8 has no HMX :cm form here: not the int8 TensorCore
     t = Tensor.empty(64, 64, dtype=dtypes.uint8).matmul(Tensor.empty(64, 64, dtype=dtypes.uint8), dtype=dtypes.int32)

@@ -4,7 +4,7 @@ assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
-from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
+from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
 from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
@@ -1074,6 +1074,10 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
   ends = [e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE and e.src[1].arg[-1] == AxisType.REDUCE
           and pos[e.src[1]] < pos[w] < pos[e]]
   e = min(ends, key=lambda e: pos[e]-pos[e.src[1]]) if ends else None
+  # every reduce loop around the tile op (a 3x3 conv: the tap row dy outside the K blocks of dx*C + c): the accumulator is begun
+  # before the outermost and stored after it, and a cached tile's K slot is the index over all of them (outermost first)
+  eo = max(ends, key=lambda e: pos[e]-pos[e.src[1]]) if ends else None
+  reds = [x.src[1] for x in sorted(ends, key=lambda x: pos[x.src[1]])]
   # consumers: lane INDEX -> STACK (128) -> ADD(LOAD acc, STACK) -> STORE acc
   adds: list[UOp] = []
   for lane in users.get(w, []):
@@ -1100,7 +1104,7 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
     if getenv("HMX_DEBUG"): print("i8 live users of dropped uops:", bad[:6])
     return 29
   drop |= dead
-  before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_i8_begin();"))
+  before.setdefault(pos[eo.src[1]] if eo is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_i8_begin();"))
   ptr = [f"((const unsigned char*){{{vals.index(v)}}}+{b})" if b else f"((const unsigned char*){{{vals.index(v)}}})" for v, b in ra] + \
         [f"((const signed char*){{{vals.index(v)}}}+{b})" if b else f"((const signed char*){{{vals.index(v)}}})" for v, b in rb]
   pa = "".join(f" __hmx_i8_pack_a4((unsigned char*)_a+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
@@ -1116,8 +1120,13 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
     # read-only operand tiles stay in VTCM (the fp16 path's 2 KB slots; A from __hmx_ca, B from __hmx_cb): an operand indexed
     # by one output-tile loop is packed on the first iteration of the other, at slot (its tile index)*kt + k
     outer, inner = (loops[1], loops[0]) if loops[2] else (loops[0], loops[1])
-    kt = int(e.src[1].vmax) + 1
-    kr, on, iname = f"{{{len(srcs)}}}", f"{{{len(srcs)+1}}}", f"{{{len(srcs)+2}}}"
+    kt = prod(int(r.vmax) + 1 for r in reds)
+    no = len(reds) - 1  # outer reduce loops, as srcs before the inner one (outer, inner stay the last two srcs)
+    kr = f"{{{len(srcs)+no}}}"
+    for j in range(no - 1, -1, -1):
+      kr = f"({{{len(srcs)+j}}})*{prod(int(r.vmax) + 1 for r in reds[j+1:])}+" + kr
+    k0 = " && ".join(f"({{{len(srcs)+j}}})==0" for j in range(no + 1))  # the first K block of the whole reduction
+    on, iname = f"{{{len(srcs)+no+1}}}", f"{{{len(srcs)+no+2}}}"
     def slot(r, n, acc):
       deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
       if deps == {inner} and (int(inner.vmax) + 1) * kt <= n: return f"__hmx_{acc}(({iname})*{kt}+({kr}))", f"({on})==0"
@@ -1141,18 +1150,18 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
       dst = lambda t, g: f"(signed char*)__hmx_cb({t//2}*{kt}+({kr}))+{1024*(t%2)+128*g}"
       pq = "".join(f" __hmx_i8_pack_b4x4({dst(0,g)}, {dst(1,g)}, {dst(2,g)}, {dst(3,g)}, {ptr[64+4*g]}, {ptr[65+4*g]}, {ptr[66+4*g]}, {ptr[67+4*g]});"
                    for g in range(8))
-      pf = (f" if (({kr})==0) __hmx_prefetch_panel2((const __fp16*){ptr[64]}, (const __fp16*){ptr[65]}, {32*kt}, "
+      pf = (f" if ({k0}) __hmx_prefetch_panel2((const __fp16*){ptr[64]}, (const __fp16*){ptr[65]}, {32*kt}, "
             f"{'(' + nm + ')+4<' + str(int(nl.vmax)+1) + ' ? ((' + nm + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
       code = (f"{{{{ void* _a = {sa_[0]}; if ({sa_[1]}) {{{{{pa} }}}} if ({nm}%4==0 && ({iname})==0) {{{{{pf}{pq} }}}}"
               f" if ({nm}%2==0) __hmx_i8_mac2(_a, __hmx_cb(({nm}%4/2)*{kt}+({kr}))); }}}}")
-      srcs = srcs + (e.src[1], outer, inner)
+      srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
       quad = (nm, f"(unsigned char*)__hmx_ca({used_a}+4*({iname if nl is outer else '0'}))")
     elif sa_ and sb_:
       code = (f"{{{{ void* _a = {sa_[0]}; void* _b = {sb_[0]}; if ({sa_[1]}) {{{{{pa} }}}} if ({sb_[1]}) {{{{{pb} }}}}"
               " __hmx_i8_mac(_a, _b); }}")
-      srcs = srcs + (e.src[1], outer, inner)
+      srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
   replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
-  end_at = pos[e] if e is not None else max(pos[so] for so, _, _ in stores)
+  end_at = pos[eo] if eo is not None else max(pos[so] for so, _, _ in stores)
   body = []
   for k, (_, l0, n) in enumerate(stores):
     if l0 % 128 or n % 128: return 30
