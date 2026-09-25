@@ -874,9 +874,10 @@ static inline unsigned char __hmx_rq1s(int a, int b, float m, int zy, int lo) {
 static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
   for (int i = 0; i < 32; i++) d[i] = __hmx_rq1s(a[i], b[i], m[i], zy, lo);
 }
-static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3, __hmx_i32x32 a0,
-                             __hmx_i32x32 a1, __hmx_i32x32 a2, __hmx_i32x32 a3, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
-  __hmx_rq1(d0, a0, b, m, zy, lo); __hmx_rq1(d1, a1, b, m, zy, lo); __hmx_rq1(d2, a2, b, m, zy, lo); __hmx_rq1(d3, a3, b, m, zy, lo);
+static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3, const int* acc,
+                             __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
+  __hmx_rq1(d0, a[0], b, m, zy, lo); __hmx_rq1(d1, a[1], b, m, zy, lo); __hmx_rq1(d2, a[2], b, m, zy, lo); __hmx_rq1(d3, a[3], b, m, zy, lo);
 }
 #else
 typedef unsigned int __hmx_u32x32 __attribute__((ext_vector_type(32)));
@@ -886,8 +887,9 @@ static inline __hmx_u32x32 __hmx_rne_shr(__hmx_u32x32 q, __hmx_u32x32 sh) {  /* 
   __hmx_i32x32 up = (sh > 0) & ((rem > half) | ((rem == half) & ((r & one) == one)));
   return r + ((__hmx_u32x32)up & one);
 }
-/* 32 int32 accumulators (+ bias) and m's fp32 bits -> 32 words y in [lo, 255] */
-static inline __hmx_v __hmx_rqw(__hmx_i32x32 acc, __hmx_u32x32 mbits, int zy, int lo) {
+/* 32 int32 accumulators (+ bias) and m's fp32 bits -> 32 words y in [lo, 255]; out of line: only for rows with some
+ * |acc| > 2^24 */
+__attribute__((noinline)) static __hmx_v __hmx_rqw(__hmx_i32x32 acc, __hmx_u32x32 mbits, int zy, int lo) {
   __hmx_u32x32 one = 1, z = 0;
   __hmx_i32x32 neg = acc < 0;
   __hmx_u32x32 u = (__hmx_u32x32)(neg ? -acc : acc), na = __hmx_bitlen(u), sa = na > 24 ? na - 24 : z;
@@ -909,6 +911,33 @@ static inline __hmx_v __hmx_rqw(__hmx_i32x32 acc, __hmx_u32x32 mbits, int zy, in
   y = y < lo - zy ? lo - zy : y > 255 - zy ? 255 - zy : y;
   return (__hmx_v)(y + zy);
 }
+/* the same when every |acc| <= 2^24 (fp32(acc) exact, the common case), m as its mantissa mm (24 bits) and exponent em
+ * (m = mm 2^em): the 64-bit product in two multiplies, both roundings as (x + half - 1 + lsb) >> s */
+__attribute__((always_inline)) static inline __hmx_v __hmx_rqwf(__hmx_i32x32 acc, __hmx_u32x32 mm, __hmx_i32x32 em, int zy, int lo) {
+  __hmx_u32x32 one = 1, u = (__hmx_u32x32)__builtin_HEXAGON_V6_vabsw_128B((__hmx_v)acc);
+  __hmx_vp p = __builtin_HEXAGON_V6_vmpyowh_64_acc_128B(__builtin_HEXAGON_V6_vmpyewuh_64_128B((__hmx_v)u, (__hmx_v)mm), (__hmx_v)u, (__hmx_v)mm);
+  __hmx_u32x32 hw = (__hmx_u32x32)__builtin_HEXAGON_V6_hi_128B(p), lw = (__hmx_u32x32)__builtin_HEXAGON_V6_lo_128B(p);
+  __hmx_u32x32 n = hw != 0 ? __hmx_bitlen(hw) + 32 : __hmx_bitlen(lw);
+  __hmx_u32x32 sp = __builtin_elementwise_max(n, (__hmx_u32x32)24) - 24;                  /* product -> 24 bits: 0..24 */
+  __hmx_u32x32 q = ((hw << (31 - sp)) << one) | (lw >> sp), half = (one << sp) >> one;
+  __hmx_u32x32 c = ((lw & ((one << sp) - one)) + half - one + (q & one)) >> sp;
+  __hmx_u32x32 pq = q + (c & (__hmx_u32x32)(sp > 0));
+  __hmx_i32x32 e = em + (__hmx_i32x32)sp;                                                    /* |v| = pq 2^e */
+  __hmx_u32x32 s = (__hmx_u32x32)__builtin_elementwise_min(__builtin_elementwise_max(-e, (__hmx_i32x32)1), (__hmx_i32x32)31);
+  __hmx_u32x32 yr = (pq + ((one << s) >> one) - one + ((pq >> s) & one)) >> s;
+  __hmx_u32x32 t = (__hmx_u32x32)__builtin_elementwise_min(__builtin_elementwise_max(e, (__hmx_i32x32)0), (__hmx_i32x32)9);
+  __hmx_u32x32 yl = pq > ((__hmx_u32x32)511 >> t) ? (__hmx_u32x32)511 : pq << t;          /* e >= 0: saturates anyway */
+  __hmx_i32x32 y = (__hmx_i32x32)(e < 0 ? yr : yl);
+  y = acc < 0 ? -y : y;
+  y = __builtin_elementwise_min(__builtin_elementwise_max(y, (__hmx_i32x32)(lo - zy)), (__hmx_i32x32)(255 - zy));
+  return (__hmx_v)(y + zy);
+}
+/* nonzero when some lane of x has |x| > 2^24 (x = OR of a ^ (a >> 31) over the rows) */
+static inline int __hmx_any_big(__hmx_i32x32 x) {
+  __hmx_v v = __builtin_HEXAGON_V6_vand_128B((__hmx_v)x, __builtin_HEXAGON_V6_lvsplatw_128B((int)0xff000000));
+  for (int r = 64; r >= 4; r >>= 1) v = __builtin_HEXAGON_V6_vor_128B(v, __builtin_HEXAGON_V6_vror_128B(v, r));
+  return __builtin_HEXAGON_V6_extractw_128B(v, 0);
+}
 /* bytes 32j .. 32j+31 of v to d (32-byte aligned): rotated into place in d's 128-byte line, one byte-predicated store */
 static inline void __hmx_st32(unsigned char* d, __hmx_v v, int j) {
   unsigned off = (unsigned)d & 127u;
@@ -916,17 +945,28 @@ static inline void __hmx_st32(unsigned char* d, __hmx_v v, int j) {
   __asm__ volatile("q0 = vsetq2(%2)\n q1 = vsetq(%3)\n q0 = and(q0, !q1)\n if (q0) vmem(%0+#0) = %1"
                    :: "r"((unsigned)d & ~127u), "v"(v), "r"(off + 32u), "r"(off) : "q0", "q1", "memory");
 }
-static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
-  __hmx_v z = __builtin_HEXAGON_V6_vd0_128B(), y = __hmx_rqw(a + b, (__hmx_u32x32)m, zy, lo);
+__attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  __hmx_i32x32 x = a + b;
+  __hmx_v z = __builtin_HEXAGON_V6_vd0_128B();
+  __hmx_u32x32 mb = (__hmx_u32x32)m, mm = (mb & 0x7fffff) | 0x800000;
+  __hmx_i32x32 em = (__hmx_i32x32)((mb >> 23) & 255) - 150;
+  __hmx_v y = __hmx_any_big(x ^ (x >> 31)) ? __hmx_rqw(x, mb, zy, lo) : __hmx_rqwf(x, mm, em, zy, lo);
   __hmx_st32(d, __builtin_HEXAGON_V6_vpackhub_sat_128B(z, __builtin_HEXAGON_V6_vpackwh_sat_128B(z, y)), 0);
 }
-/* four rows sharing bias and scale (the four rows of one 128-lane accumulator load): two word -> halfword packs, one
+/* four rows sharing bias and scale (the four rows at acc, one 128-lane accumulator-array vector): two word -> halfword packs, one
  * halfword -> byte pack, the rows at bytes 0, 32, 64, 96 */
-static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
-    __hmx_i32x32 a0, __hmx_i32x32 a1, __hmx_i32x32 a2, __hmx_i32x32 a3, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
-  __hmx_u32x32 mb = (__hmx_u32x32)m;
-  __hmx_v y0 = __hmx_rqw(a0 + b, mb, zy, lo), y1 = __hmx_rqw(a1 + b, mb, zy, lo);
-  __hmx_v y2 = __hmx_rqw(a2 + b, mb, zy, lo), y3 = __hmx_rqw(a3 + b, mb, zy, lo);
+__attribute__((always_inline)) static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
+    const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  const __hmx_i32x32* a = (const __hmx_i32x32*)acc;  /* the four rows, loaded here: live across the whole epilogue they spill */
+  __hmx_u32x32 mb = (__hmx_u32x32)m, mm = (mb & 0x7fffff) | 0x800000;
+  __hmx_i32x32 em = (__hmx_i32x32)((mb >> 23) & 255) - 150;
+  __hmx_i32x32 x0 = a[0] + b, x1 = a[1] + b, x2 = a[2] + b, x3 = a[3] + b;
+  __hmx_v y0, y1, y2, y3;
+  if (__builtin_expect(__hmx_any_big((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))), 0)) {
+    y0 = __hmx_rqw(x0, mb, zy, lo), y1 = __hmx_rqw(x1, mb, zy, lo), y2 = __hmx_rqw(x2, mb, zy, lo), y3 = __hmx_rqw(x3, mb, zy, lo);
+  } else {
+    y0 = __hmx_rqwf(x0, mm, em, zy, lo), y1 = __hmx_rqwf(x1, mm, em, zy, lo), y2 = __hmx_rqwf(x2, mm, em, zy, lo), y3 = __hmx_rqwf(x3, mm, em, zy, lo);
+  }
   __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
   __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
 }
@@ -1213,13 +1253,12 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
   for (al, bl, ml, zy, lo), g in groups.items():
     if sorted(g) != [0, 1, 2, 3]: continue
     sts = [g[j][0] for j in range(4)]
-    loads = [al, ml] + ([bl] if bl is not None else [])
+    # the accumulator rows go in by address (al's pointer into the accumulator array), not as the loaded 128 lanes
+    loads = [al.src[0], ml] + ([bl] if bl is not None else [])
     ptrs = tuple(x.src[0] for x in sts)
     bias = pick(2, 0, bl.shape[0]) if bl is not None else "(__hmx_i32x32)(0)"
-    code = (f"__hmx_rq4({{3}}, {{4}}, {{5}}, {{6}}, {', '.join(pick(0, 32*j, 128) for j in range(4))}, {bias}, "
-            f"{pick(1, 0, ml.shape[0])}, {zy}, {lo});") if bl is not None else \
-           (f"__hmx_rq4({{2}}, {{3}}, {{4}}, {{5}}, {', '.join(pick(0, 32*j, 128) for j in range(4))}, {bias}, "
-            f"{pick(1, 0, ml.shape[0])}, {zy}, {lo});")
+    k = len(loads)
+    code = (f"__hmx_rq4({{{k}}}, {{{k+1}}}, {{{k+2}}}, {{{k+3}}}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo});")
     last = max(sts, key=lambda x: pos[x])
     replace[last] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + ptrs, code)
     drop.update(x for x in sts if x is not last)
