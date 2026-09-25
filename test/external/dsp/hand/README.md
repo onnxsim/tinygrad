@@ -102,6 +102,32 @@ Shapes are the real graph's (800x1088 input, FPN P2..P6, k = 1000); values synth
 - Not covered: `rpn_fused` itself (it composes these three kernels plus the level merge; checking it needs ORT
   captures of the real rest.onnx span, as onnx-simplifier's own CI notes).
 
+#### `roialign/` -- Mask R-CNN box/mask-head RoiAlign
+
+Hand kernels: `roialign_kernel.h` (fp32, channels-last, per-tap HVX FMA over channels) and `roialign_u8_kernel.h`
+(the shipped one: uint8 NHWC FPN map straight into the quantized head input, Q14 bilinear weights, exact int32
+accumulation, `vzxt` + `vmpyacc`). Real FPN level shapes P2..P5 (C = 256), 7x7 and 14x14, sampling ratio 2, 16
+synthetic RoIs per call (the real count is data-dependent). Hand vs ORT: fp32 within 1e-4, uint8 within 1 LSB of
+QuantizeLinear(ORT fp32). tinygrad vs hand: bit-exact in all 16 cases.
+
+| case | hand insns | tinygrad insns | ratio | kernels |
+|---|---:|---:|---:|---:|
+| fp32 P2 7x7 | 10 037 685 | 48 543 409 | 4.8x | 2 |
+| fp32 P2 14x14 | 50 305 393 | 168 890 354 | 3.4x | 2 |
+| fp32 P5 14x14 | 47 623 873 | 169 258 673 | 3.6x | 2 |
+| uint8 P2 7x7 | 274 055 | 42 382 946 | 155x | 2 |
+| uint8 P2 14x14 | 1 167 725 | 72 662 014 | 62x | 2 |
+| uint8 P5 14x14 | 1 107 999 | 69 962 926 | 63x | 2 |
+
+- The data-dependent gather (each tap reads the C channels of a pixel chosen by the RoI) is plain Tensor indexing by
+  a computed int tensor; tinygrad folds the one-hot form into a direct load, so the gather itself is not the gap.
+- `bin_h = roi_h / OH` divides by a constant, which tinygrad folds into `* (1/OH)` -- not IEEE division for OH = 7, 14.
+  The divisors come in as a two-element device buffer instead, so the division stays a division.
+- fp32 is within 5x; the uint8 kernel's gap (62-155x) is its per-tap `vzxt` + `vmpyacc` over 128 channels at once:
+  tinygrad's code for the u8 x Q14 multiply-accumulate is scalar-ish 32-bit lane math.
+- These compile tinygrad's kernels with `-ffp-contract=off` (conftest.py, qemu families only): with clang's default
+  contraction the fp32 4-tap sum becomes FMAs, and 5% of outputs differ from the hand kernel (and ORT) by an ulp.
+
 ### tinygrad DSP backend fixes these tests needed (`tinygrad/runtime/ops_dsp.py`)
 
 Found by the oracles, all in rendering; none touch the HMX paths.
@@ -128,4 +154,6 @@ Copied verbatim from onnx-simplifier `origin/master` at `6927c104`:
 | `rpn/pd_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/proposal_decode/pd_kernel.h` |
 | `rpn/topk_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/topk/topk_kernel.h` |
 | `rpn/nms_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/nms/nms_kernel.h` |
+| `roialign/roialign_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_kernel.h` |
+| `roialign/roialign_u8_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_u8_kernel.h` |
 
