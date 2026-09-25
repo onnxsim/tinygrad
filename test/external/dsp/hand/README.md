@@ -128,6 +128,37 @@ QuantizeLinear(ORT fp32). tinygrad vs hand: bit-exact in all 16 cases.
 - These compile tinygrad's kernels with `-ffp-contract=off` (conftest.py, qemu families only): with clang's default
   contraction the fp32 4-tap sum becomes FMAs, and 5% of outputs differ from the hand kernel (and ORT) by an ulp.
 
+#### `msda/` -- multi-scale deformable attention (RT-DETR decoder, BEVFormer TSA / SCA)
+
+Hand kernel: `msda_kernel.h`'s scalar body (built for v65; its HVX body is V68+ qf32, which neither qemu nor
+hexagon-sim reproduces). Cases are onnx-simplifier's `msda_ref.py synthetic` shapes with its edge cases (points off the
+map, on pixel centers/borders, a query no camera sees), float32 and uint8 value maps. tinygrad is bit-exact in all 6.
+
+| case | hand insns | tinygrad insns | ratio | kernels |
+|---|---:|---:|---:|---:|
+| RT-DETR decoder, 300 queries, 3 levels, f32 | 36 383 901 | 1 016 174 045 | 28x | 99 |
+| RT-DETR decoder, u8 | 52 349 853 | 1 845 601 460 | 35x | 99 |
+| BEVFormer TSA, 96 queries, 2 frames, f32 | 5 501 573 | 1 299 275 214 | 236x | 67 |
+| BEVFormer SCA, 6 cameras + visibility, f32 | 9 210 909 | 63 037 011 | 6.8x | 194 |
+
+The gap is structural: the exact contract fixes the accumulation order (every map, level, point, tap in turn), so the
+tinygrad version is one long add chain of gathered rows that it can't reduce in parallel. Exactness needed three
+float-order fixes in tinygrad itself (below: FLOAT_REASSOC, the right-operand parens, `-x` in parens).
+
+#### `layout/` -- FPN NCHW -> NHWC transpose (RoiAlign's input layout)
+
+`layout_kernels.h`: HVX 32x32-block register transpose (five `vshuff` rounds). tinygrad `x.T.contiguous()`, one
+kernel, bit-exact, **1.8-2.0x** the hand instructions on every level (P2: 16.1 M vs 29.0 M).
+
+#### `mcc/` -- MCC decoder HVX steps: **xfail**, tracked target
+
+LayerNorm / base-2 softmax / GELU in `mb_hvx.h` are V69 qfloat code: qemu can't decode it and hexagon-sim runs V69's
+`.sf` ops as IEEE, so neither gives the phone's rounding. Needs golden tiles captured on the phone (test_mcc.py says how);
+this pass had no phone access.
+
+Not covered yet: Fast-BEV's `fbgather` (the tinygrad version crashed clang at the real 41 MB volume size -- needs a
+look), StreamPETR / Sparse4D attention kernels, the LLM decode loop (`llm_tinygrad/hvx`, qfloat like MCC).
+
 ### tinygrad DSP backend fixes these tests needed (`tinygrad/runtime/ops_dsp.py`)
 
 Found by the oracles, all in rendering; none touch the HMX paths.
@@ -142,6 +173,14 @@ Found by the oracles, all in rendering; none touch the HMX paths.
    scalar float compares, ANDed with other bools, are stacked into a small char/int vector. On v65/v66 (MOCKDSP's
    target, no HVX float) each scalar float compare result now goes through an empty asm, so it stays a scalar
    predicate. Reproducer: `(u8x8){m[i] & (0.7f < a[i]*b[i]), ...}` with `-mhvx=v65`.
+5. **Float reassociation** (`uop/symbolic.py`, all backends): "move add/mul consts to end" ((x + c) + y -> (x + y) + c)
+   and two-stage constant folding ((x + c1) + c2 -> x + (c1 + c2)) are real-arithmetic rewrites that change a float
+   expression's rounding. New `FLOAT_REASSOC` context var (default 1 = unchanged); `FLOAT_REASSOC=0` skips them for
+   floats. The qemu families set it (conftest.py). MSDA's `r.x*W - 0.5 + off` was the case that found it.
+6. **Right-hand operand parens** (`renderer/cstyle.py`, all C backends): the ALU renderer dropped the parens of any
+   same-op operand, so a float `a + (b + c)` rendered as `a+b+c`, which C evaluates as `(a+b)+c`. Now only the left
+   operand's parens are dropped for floats.
+7. **`-x` rendered without parens** (`cstyle.py`): `a - -b` came out as `a--b`, a compile error. Now `(-x)`.
 4. **`-Wunused-variable` under `-Werror`**: `_splat_of_loaded_lane` re-reads a splatted lane as a scalar, which can
    leave the vector load it replaced declared but unused. The DSP compile now passes `-Wno-unused-variable`.
 
@@ -156,4 +195,6 @@ Copied verbatim from onnx-simplifier `origin/master` at `6927c104`:
 | `rpn/nms_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/nms/nms_kernel.h` |
 | `roialign/roialign_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_kernel.h` |
 | `roialign/roialign_u8_kernel.h` | `scripts/android/tinygrad_hexagon_bridge/roialign_fast/roialign_u8_kernel.h` |
+| `msda/msda_kernel.h`, `msda/msda_shape.h` | `scripts/android/msda_hvx/` |
+| `layout/layout_kernels.h` | `scripts/android/tinygrad_hexagon_bridge/fpn_channels_last/layout_kernels.h` |
 

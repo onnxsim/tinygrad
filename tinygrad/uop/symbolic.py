@@ -3,7 +3,11 @@ import math
 from collections import defaultdict
 from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu
 from tinygrad.dtype import PyConst, ConstType, dtypes, can_lossless_cast, Invalid, bitcast, truncate
-from tinygrad.helpers import partition, all_same, prod, flatten, unwrap, IMAGE, dedup
+from tinygrad.helpers import partition, all_same, prod, flatten, unwrap, IMAGE, dedup, ContextVar
+
+# FLOAT_REASSOC=0: don't apply the real-arithmetic rewrites that change a float expression's rounding (see "move add/mul consts")
+FLOAT_REASSOC = ContextVar("FLOAT_REASSOC", 1)
+def _reassoc(x) -> bool: return bool(FLOAT_REASSOC) or not dtypes.is_float(x.dtype)
 from tinygrad.uop.divandmod import div_and_mod_symbolic
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.weak import commit_weak
@@ -265,7 +269,7 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   #((UPat.var("x")+UPat.var("z")).maximum(UPat.var("y")+UPat.var("z")), lambda x,y,z: x.maximum(y) + z),
   # ** two stage ALU folding **
   *((UPat.var("x").alu(op, UPat.cvar("c1")).alu(op, UPat.cvar("c2")).named("f"),
-     lambda f,x,c1,c2: x.alu(f.op,c1.alu(f.op,c2))) for op in GroupOp.Associative),
+     lambda f,x,c1,c2: x.alu(f.op,c1.alu(f.op,c2)) if f.op not in (Ops.ADD, Ops.MUL) or _reassoc(x) else None) for op in GroupOp.Associative),
   # (x//c1)//c2 -> x//(c1*c2) for c2>0
   ((UPat.var("x") // UPat.cvar("c1")) // UPat.cvar("c2"), lambda x,c1,c2: x//(c1*c2) if c2.vmin>0 else None),
   # ** lt **
@@ -278,8 +282,10 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   ((UPat.var("x", dtype=dtypes.weakint)//UPat.cvar("d"))<UPat.cvar("c"),
    lambda x,d,c: (x<c.val*d.val) if d.val > 0 else (x>c.val*d.val) if d.val < 0 else None),
   # ** move add/mul consts to end (NOTE: this is still happening before constant folding) **
-  ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1 if y.op is not Ops.CONST else None),
-  ((UPat.var("x") * UPat.cvar("c1")) * UPat.var("y"), lambda x,c1,y: (x*y)*c1 if y.op is not Ops.CONST else None),
+  # on floats this reassociates -- (x + c) + y and (x + y) + c round differently -- so FLOAT_REASSOC=0 keeps float
+  # expressions in the order they were written (bit-exactness against ORT / hand-written kernels)
+  ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1 if y.op is not Ops.CONST and _reassoc(x) else None),
+  ((UPat.var("x") * UPat.cvar("c1")) * UPat.var("y"), lambda x,c1,y: (x*y)*c1 if y.op is not Ops.CONST and _reassoc(x) else None),
   # *** rules from symbolic ***
   # generic lt folding
   (UPat.var("x", dtypes.weakint)<UPat.cvar("c"), lambda x,c: lt_folding(x, c.val) if 0 < c.val else None),
