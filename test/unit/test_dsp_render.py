@@ -267,14 +267,15 @@ class TestDSPHmxI8(unittest.TestCase):
     self.assertNotIn("__WMMA_", kernel)
     # A: packed once per M tile into loop-indexed VTCM slots
     self.assertEqual(kernel.count("__hmx_i8_pack_a4("), 16)
-    self.assertIn("__hmx_ca((Lidx1)*8+(Ridx0))", kernel)
+    self.assertIn("__hmx_ca(0+(Lidx1)*8+(Ridx0))", kernel)
 
   def test_i8_quad_b_deep_and_planes(self):
     # four adjacent N tiles share each 128-byte weight row line: packed together on n%4==0, one :deep weight load pair per K
-    # block on even n drives both accumulators; n+1's byte planes go to spare A slots and are summed into its output on odd n
+    # block on even n drives both accumulators; n+1's byte planes go to spare slots and are summed into its output on odd n.
+    # One slot pool: A at 0 (2 M tiles x 8 K), the planes at 16 (4 per M tile), B's pair slots at 24
     kernel = self.src(128, 256, 256).split("__attribute__((noinline)) void", 1)[1]
     self.assertEqual(kernel.count("__hmx_i8_pack_b4x4("), 8)
-    self.assertIn("if ((Lidx2)%2==0) __hmx_i8_mac2(_a, __hmx_cb(((Lidx2)%4/2)*8+(Ridx0)));", kernel)
+    self.assertIn("if ((Lidx2)%2==0) __hmx_i8_mac2(_a, __hmx_ca(24+((Lidx2)%4/2)*8+(Ridx0)));", kernel)
     self.assertIn("__hmx_i8_store2((unsigned char*)__hmx_ca(16+4*(Lidx1)))", kernel)
     self.assertEqual(kernel.count("__hmx_i8_addq("), 16)
     self.assertIn("((Lidx2))+4<8 ? (((Lidx2))==0 ? 1 : 2) : 0", kernel)
@@ -288,25 +289,28 @@ class TestDSPHmxI8(unittest.TestCase):
   def test_i8_requant_fused(self):
     # ORT's QLinearConv output, clip(round((acc + b).float() * m) + zy, lo, 255).cast(uint8), on the HMX accumulator: every
     # output row of 32 lanes is recognized (round()'s where/trunc expansion included) and the four rows of one accumulator
-    # load go through one HVX __hmx_rq4 -- nothing of tinygrad's lane-by-lane float epilogue is left
+    # load go through one HVX __hmx_rq4f (fixed point; flagged lanes near a .5 redo their group exactly), the 16 groups of an
+    # output tile as one C loop with one flag check after it -- nothing of tinygrad's lane-by-lane float epilogue is left
     src = self.rq_src(64, 128, 96)
     kernel = src[src.index("__attribute__((noinline)) void"):]
-    self.assertEqual(kernel.count("__hmx_rq4("), 16)  # per output tile (64 rows) in the loop body
+    self.assertEqual(kernel.count("__hmx_rq4f("), 1)
+    self.assertIn("for (int _g = 0; _g < 16; _g++)", kernel)
+    self.assertIn("__hmx_rq4x(", kernel)
     self.assertNotIn("__hmx_rq1(", kernel)
     self.assertNotIn("__builtin_truncf", kernel)
-    self.assertIn(", 131, 0);", kernel)
+    self.assertIn(", 131, 0, &_rqg[_g]);", kernel)
     # integer HVX only: V69 HVX has no IEEE fp32 (sf encodings compute qf32 on the phone)
     self.assertNotIn("_sf_", src)
 
   def test_i8_requant_relu_no_bias(self):
     kernel = self.rq_src(64, 64, 64, zy=17.0, lo=17.0, bias=False).split("__attribute__((noinline)) void", 1)[1]
-    self.assertEqual(kernel.count("__hmx_rq4("), 16)
+    self.assertIn("for (int _g = 0; _g < 16; _g++)", kernel)
     self.assertIn("(__hmx_i32x32)(0), ", kernel)
-    self.assertIn(", 17, 17);", kernel)
+    self.assertIn(", 17, 17, &_rqg[_g]);", kernel)
 
   def test_i8_int32_out_has_no_requant(self):
     src = self.src(64, 64, 128)
-    self.assertNotIn("__hmx_rq4(", src.split("__attribute__((noinline)) void", 1)[1])
+    self.assertNotIn("__hmx_rq4f(", src.split("__attribute__((noinline)) void", 1)[1])
 
   def test_i8_conv3x3_grid_two_reduce_loops(self):
     # a 3x3 conv on the flat padded-image grid (row stride Wp): A(p, dy, dx, c) = x[p + dy*Wp + dx, c] as two dilated windows,
@@ -323,7 +327,7 @@ class TestDSPHmxI8(unittest.TestCase):
     self.assertIn("__hmx_i8_mac(", kernel)
     self.assertEqual(kernel.count("__hmx_i8_begin();"), 1)
     self.assertLess(kernel.index("__hmx_i8_begin();"), kernel.index("for (int Ridx"))  # before the outer (dy) loop
-    self.assertRegex(kernel, r"__hmx_c[ab]\(\(Lidx\d\)\*18\+\(\(Ridx\d\)\*6\+Ridx\d\)\)")  # slot: tile * 18 + dy * 6 + k
+    self.assertRegex(kernel, r"__hmx_ca\(\d+\+\(Lidx\d\)\*18\+\(\(Ridx\d\)\*6\+Ridx\d\)\)")  # slot: tile * 18 + dy * 6 + k
 
   def test_i8_needs_signed_weights(self):
     # uint8 x uint8 has no HMX :cm form here: not the int8 TensorCore

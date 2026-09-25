@@ -542,9 +542,9 @@ static inline __fp16* __hmx_sa(void) { return __hmx_ra[__hmx_t]; }
 static inline __fp16* __hmx_sb(void) { return __hmx_rb[__hmx_t]; }
 #define __HMX_CA @CA@
 #define __HMX_CB @CB@
-static __fp16 __hmx_rca[__HMX_CA][1024] __attribute__((aligned(128))), __hmx_rcb[__HMX_CB][1024] __attribute__((aligned(128)));
+static __fp16 __hmx_rca[__HMX_CA + __HMX_CB][1024] __attribute__((aligned(128)));  /* one pool, B after A (as in VTCM) */
 static inline __fp16* __hmx_ca(int i) { return __hmx_rca[i]; }
-static inline __fp16* __hmx_cb(int i) { return __hmx_rcb[i]; }
+static inline __fp16* __hmx_cb(int i) { return __hmx_rca[__HMX_CA + i]; }
 static inline void __hmx_begin(void) { for (int i = 0; i < 1024; i++) __hmx_racc[i] = 0.0; }
 static inline void __hmx_mac(__fp16* a, __fp16* b) {
   const unsigned short *A = (const unsigned short*)a, *B = (const unsigned short*)b;
@@ -879,6 +879,10 @@ static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char
   const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
   __hmx_rq1(d0, a[0], b, m, zy, lo); __hmx_rq1(d1, a[1], b, m, zy, lo); __hmx_rq1(d2, a[2], b, m, zy, lo); __hmx_rq1(d3, a[3], b, m, zy, lo);
 }
+typedef unsigned int __hmx_u32x32 __attribute__((ext_vector_type(32)));
+#define __hmx_rq4f(d0, d1, d2, d3, acc, b, m, zy, lo, fl) __hmx_rq4(d0, d1, d2, d3, acc, b, m, zy, lo)
+#define __hmx_rq4x(d0, d1, d2, d3, acc, b, m, zy, lo) do {} while (0)
+static inline int __hmx_rq_any(__hmx_u32x32 fl) { (void)fl; return 0; }
 #else
 typedef unsigned int __hmx_u32x32 __attribute__((ext_vector_type(32)));
 static inline __hmx_u32x32 __hmx_bitlen(__hmx_u32x32 x) { return (__hmx_u32x32)32 - (__hmx_u32x32)__builtin_HEXAGON_V6_vcl0w_128B((__hmx_v)x); }
@@ -911,30 +915,31 @@ __attribute__((noinline)) static __hmx_v __hmx_rqw(__hmx_i32x32 acc, __hmx_u32x3
   y = y < lo - zy ? lo - zy : y > 255 - zy ? 255 - zy : y;
   return (__hmx_v)(y + zy);
 }
-/* the same when every |acc| <= 2^24 (fp32(acc) exact, the common case), m as its mantissa mm (24 bits) and exponent em
- * (m = mm 2^em): the 64-bit product in two multiplies, both roundings as (x + half - 1 + lsb) >> s */
-__attribute__((always_inline)) static inline __hmx_v __hmx_rqwf(__hmx_i32x32 acc, __hmx_u32x32 mm, __hmx_i32x32 em, int zy, int lo) {
+/* the common case, |acc| <= 2^24 (fp32(acc) exact), as fixed point: r = floor(|acc| 2^L * mm7 / 2^32) = floor(|v| 2^F) with
+ * |acc| 2^L normalized below 2^31 and mm7 = m's 24-bit mantissa << 7, F = L + emf (emf = -em - 25); y = round half up of
+ * r / 2^F. It differs from ORT only where |v| is within truncation (a unit of r) or ORT's double rounding (|v| 2^-24 <= 2^-16)
+ * of a .5: those lanes set *flag and the caller redoes the rows with __hmx_rqw */
+__attribute__((always_inline)) static inline __hmx_v __hmx_rqwf(__hmx_i32x32 acc, __hmx_u32x32 mm7, __hmx_i32x32 emf, int zy, int lo,
+                                                                 __hmx_u32x32* flag) {
   __hmx_u32x32 one = 1, u = (__hmx_u32x32)__builtin_HEXAGON_V6_vabsw_128B((__hmx_v)acc);
-  __hmx_vp p = __builtin_HEXAGON_V6_vmpyowh_64_acc_128B(__builtin_HEXAGON_V6_vmpyewuh_64_128B((__hmx_v)u, (__hmx_v)mm), (__hmx_v)u, (__hmx_v)mm);
-  __hmx_u32x32 hw = (__hmx_u32x32)__builtin_HEXAGON_V6_hi_128B(p), lw = (__hmx_u32x32)__builtin_HEXAGON_V6_lo_128B(p);
-  __hmx_u32x32 n = hw != 0 ? __hmx_bitlen(hw) + 32 : __hmx_bitlen(lw);
-  __hmx_u32x32 sp = __builtin_elementwise_max(n, (__hmx_u32x32)24) - 24;                  /* product -> 24 bits: 0..24 */
-  __hmx_u32x32 q = ((hw << (31 - sp)) << one) | (lw >> sp), half = (one << sp) >> one;
-  __hmx_u32x32 c = ((lw & ((one << sp) - one)) + half - one + (q & one)) >> sp;
-  __hmx_u32x32 pq = q + (c & (__hmx_u32x32)(sp > 0));
-  __hmx_i32x32 e = em + (__hmx_i32x32)sp;                                                    /* |v| = pq 2^e */
-  __hmx_u32x32 s = (__hmx_u32x32)__builtin_elementwise_min(__builtin_elementwise_max(-e, (__hmx_i32x32)1), (__hmx_i32x32)31);
-  __hmx_u32x32 yr = (pq + ((one << s) >> one) - one + ((pq >> s) & one)) >> s;
-  __hmx_u32x32 t = (__hmx_u32x32)__builtin_elementwise_min(__builtin_elementwise_max(e, (__hmx_i32x32)0), (__hmx_i32x32)9);
-  __hmx_u32x32 yl = pq > ((__hmx_u32x32)511 >> t) ? (__hmx_u32x32)511 : pq << t;          /* e >= 0: saturates anyway */
-  __hmx_i32x32 y = (__hmx_i32x32)(e < 0 ? yr : yl);
-  y = acc < 0 ? -y : y;
-  y = __builtin_elementwise_min(__builtin_elementwise_max(y, (__hmx_i32x32)(lo - zy)), (__hmx_i32x32)(255 - zy));
-  return (__hmx_v)(y + zy);
+  __hmx_u32x32 L = __builtin_elementwise_min((__hmx_u32x32)__builtin_HEXAGON_V6_vcl0w_128B((__hmx_v)u) - one, (__hmx_u32x32)30);
+  __hmx_u32x32 a = u << L;
+  __hmx_vp p = __builtin_HEXAGON_V6_vmpyowh_64_acc_128B(__builtin_HEXAGON_V6_vmpyewuh_64_128B((__hmx_v)a, (__hmx_v)mm7), (__hmx_v)a, (__hmx_v)mm7);
+  __hmx_u32x32 r = (__hmx_u32x32)__builtin_HEXAGON_V6_hi_128B(p);
+  __hmx_i32x32 F = (__hmx_i32x32)L + emf;
+  __hmx_u32x32 Fc = (__hmx_u32x32)__builtin_elementwise_min(__builtin_elementwise_max(F, (__hmx_i32x32)1), (__hmx_i32x32)31);
+  __hmx_u32x32 half = one << (Fc - one), y = (r + half) >> Fc;
+  __hmx_u32x32 d = (__hmx_u32x32)__builtin_HEXAGON_V6_vabsw_128B((__hmx_v)((__hmx_i32x32)(r & ((one << Fc) - one)) - (__hmx_i32x32)half));
+  __hmx_u32x32 win = (one << (__hmx_u32x32)__builtin_elementwise_max(F - 16, (__hmx_i32x32)0)) + 3;
+  *flag |= (__hmx_u32x32)(d <= win) & (__hmx_u32x32)(F > 0);
+  y = F <= 0 ? (__hmx_u32x32)256 : y;
+  __hmx_i32x32 ys = acc < 0 ? -(__hmx_i32x32)y : (__hmx_i32x32)y;
+  ys = __builtin_elementwise_min(__builtin_elementwise_max(ys, (__hmx_i32x32)(lo - zy)), (__hmx_i32x32)(255 - zy));
+  return (__hmx_v)(ys + zy);
 }
-/* nonzero when some lane of x has |x| > 2^24 (x = OR of a ^ (a >> 31) over the rows) */
-static inline int __hmx_any_big(__hmx_i32x32 x) {
-  __hmx_v v = __builtin_HEXAGON_V6_vand_128B((__hmx_v)x, __builtin_HEXAGON_V6_lvsplatw_128B((int)0xff000000));
+/* nonzero when some lane of x has |x| > 2^24 (x = OR of a ^ (a >> 31) over the rows) or a flag set (flags: 0 or -1) */
+static inline int __hmx_any_big(__hmx_i32x32 x, __hmx_u32x32 flags) {
+  __hmx_v v = __builtin_HEXAGON_V6_vor_128B(__builtin_HEXAGON_V6_vand_128B((__hmx_v)x, __builtin_HEXAGON_V6_lvsplatw_128B((int)0xff000000)), (__hmx_v)flags);
   for (int r = 64; r >= 4; r >>= 1) v = __builtin_HEXAGON_V6_vor_128B(v, __builtin_HEXAGON_V6_vror_128B(v, r));
   return __builtin_HEXAGON_V6_extractw_128B(v, 0);
 }
@@ -948,27 +953,41 @@ static inline void __hmx_st32(unsigned char* d, __hmx_v v, int j) {
 __attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __hmx_i32x32 a, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
   __hmx_i32x32 x = a + b;
   __hmx_v z = __builtin_HEXAGON_V6_vd0_128B();
-  __hmx_u32x32 mb = (__hmx_u32x32)m, mm = (mb & 0x7fffff) | 0x800000;
-  __hmx_i32x32 em = (__hmx_i32x32)((mb >> 23) & 255) - 150;
-  __hmx_v y = __hmx_any_big(x ^ (x >> 31)) ? __hmx_rqw(x, mb, zy, lo) : __hmx_rqwf(x, mm, em, zy, lo);
+  __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7, fl = 0;
+  __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
+  __hmx_v y = __hmx_rqwf(x, mm7, emf, zy, lo, &fl);
+  if (__builtin_expect(__hmx_any_big(x ^ (x >> 31), fl), 0)) y = __hmx_rqw(x, mb, zy, lo);
   __hmx_st32(d, __builtin_HEXAGON_V6_vpackhub_sat_128B(z, __builtin_HEXAGON_V6_vpackwh_sat_128B(z, y)), 0);
 }
-/* four rows sharing bias and scale (the four rows at acc, one 128-lane accumulator-array vector): two word -> halfword packs, one
- * halfword -> byte pack, the rows at bytes 0, 32, 64, 96 */
-__attribute__((always_inline)) static inline void __hmx_rq4(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
-    const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
-  const __hmx_i32x32* a = (const __hmx_i32x32*)acc;  /* the four rows, loaded here: live across the whole epilogue they spill */
-  __hmx_u32x32 mb = (__hmx_u32x32)m, mm = (mb & 0x7fffff) | 0x800000;
-  __hmx_i32x32 em = (__hmx_i32x32)((mb >> 23) & 255) - 150;
+/* four rows sharing bias and scale (the four rows at acc, one 128-lane accumulator-array vector): the fixed-point fast path,
+ * flags (window lanes, |acc| > 2^24) ORed into *fl -- checked once per output tile (__hmx_rq_any: moving a vector to a scalar
+ * stalls ~250 cycles, per group it cost 3x the whole requantization) -- then two word -> halfword packs, one halfword -> byte
+ * pack, the rows at bytes 0, 32, 64, 96 */
+__attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
+    const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo, __hmx_u32x32* fl) {
+  const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
+  __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7;
+  __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
   __hmx_i32x32 x0 = a[0] + b, x1 = a[1] + b, x2 = a[2] + b, x3 = a[3] + b;
-  __hmx_v y0, y1, y2, y3;
-  if (__builtin_expect(__hmx_any_big((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))), 0)) {
-    y0 = __hmx_rqw(x0, mb, zy, lo), y1 = __hmx_rqw(x1, mb, zy, lo), y2 = __hmx_rqw(x2, mb, zy, lo), y3 = __hmx_rqw(x3, mb, zy, lo);
-  } else {
-    y0 = __hmx_rqwf(x0, mm, em, zy, lo), y1 = __hmx_rqwf(x1, mm, em, zy, lo), y2 = __hmx_rqwf(x2, mm, em, zy, lo), y3 = __hmx_rqwf(x3, mm, em, zy, lo);
-  }
+  __hmx_v y0 = __hmx_rqwf(x0, mm7, emf, zy, lo, fl), y1 = __hmx_rqwf(x1, mm7, emf, zy, lo, fl);
+  __hmx_v y2 = __hmx_rqwf(x2, mm7, emf, zy, lo, fl), y3 = __hmx_rqwf(x3, mm7, emf, zy, lo, fl);
+  *fl |= (__hmx_u32x32)(((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))) & (int)0xff000000);
   __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
   __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
+}
+/* the same four rows through the exact emulation (a tile whose fast path flagged something) */
+__attribute__((noinline)) static void __hmx_rq4x(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
+    const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo) {
+  const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
+  __hmx_u32x32 mb = (__hmx_u32x32)m;
+  __hmx_v y0 = __hmx_rqw(a[0] + b, mb, zy, lo), y1 = __hmx_rqw(a[1] + b, mb, zy, lo), y2 = __hmx_rqw(a[2] + b, mb, zy, lo), y3 = __hmx_rqw(a[3] + b, mb, zy, lo);
+  __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
+  __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
+}
+static inline int __hmx_rq_any(__hmx_u32x32 fl) {
+  __hmx_v v = (__hmx_v)fl;
+  for (int r = 64; r >= 4; r >>= 1) v = __builtin_HEXAGON_V6_vor_128B(v, __builtin_HEXAGON_V6_vror_128B(v, r));
+  return __builtin_HEXAGON_V6_extractw_128B(v, 0);
 }
 #endif
 """.replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB)).replace("@AO@", str(_HMX_AO))
@@ -1064,7 +1083,7 @@ def _hmx_rows_i8(stack:UOp, n:int, lane_of):
     rows.append((lj[0][0], b))
   return rows
 
-def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
+def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_out:list):
   # int8 :cm tile op with the accumulator kept in HMX: per K block pack A (64 rows x 32 B) and B (32 rows x 32 B -> W layout)
   # into VTCM stages and issue one :cm load pair; after the reduce loop four byte-plane stores give the exact int32 tile,
   # which is added into tinygrad's accumulator array (whose per-K-block += of the WMMA lanes is dropped)
@@ -1117,9 +1136,9 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
   written = {_hmx_param(u.src[0]) for u in uops if u.op is Ops.STORE}
   ro = [all(_hmx_param(v.src[0]) not in written for v, _ in r) for r in (ra, rb)]
   if loops is not None and e is not None and all(ro) and getenv("HMX_I8_CACHE", 1):
-    # read-only operand tiles stay in VTCM (the fp16 path's 2 KB slots; A from __hmx_ca, B from __hmx_cb): an operand indexed
-    # by one output-tile loop is packed on the first iteration of the other, at slot (its tile index)*kt + k
-    outer, inner = (loops[1], loops[0]) if loops[2] else (loops[0], loops[1])
+    # read-only operand tiles stay in VTCM, in one pool of 2 KB slots (__hmx_ca: A first, then the quad path's spare byte-plane
+    # slots, then B): an operand indexed by one output-tile loop is packed on the first iteration of the other, at slot (its
+    # tile index)*kt + k. The loop order is chosen for what fits: both orders are planned when they can be interchanged
     kt = prod(int(r.vmax) + 1 for r in reds)
     no = len(reds) - 1  # outer reduce loops, as srcs before the inner one (outer, inner stay the last two srcs)
     kr = f"{{{len(srcs)+no}}}"
@@ -1127,39 +1146,57 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace):
       kr = f"({{{len(srcs)+j}}})*{prod(int(r.vmax) + 1 for r in reds[j+1:])}+" + kr
     k0 = " && ".join(f"({{{len(srcs)+j}}})==0" for j in range(no + 1))  # the first K block of the whole reduction
     on, iname = f"{{{len(srcs)+no+1}}}", f"{{{len(srcs)+no+2}}}"
-    def slot(r, n, acc):
+    pool = _HMX_CA + _HMX_CB
+    def plan(outer, inner):
+      # -> (rank, need_a, need_b, quad): rank 4 quad, 3 both cached, 2 A only, 1 B only, 0 none
+      ti = int(inner.vmax) + 1
+      def need(r):
+        deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
+        return ti * kt if deps == {inner} else kt if deps in ({outer}, set()) else None
+      na, nb = need(ra), need(rb)
+      bdeps = {l for l in (outer, inner) if _hmx_uses(rb[0][0].src[0], l)}
+      if (na is not None and bdeps == {outer} and int(outer.vmax + 1) % 4 == 0 and na + 4 * ti + 2 * kt <= pool and
+          _hmx_quad_rows(rb, outer, ranges) and getenv("HMX_I8_QUAD", 1)): return (4, na, 2 * kt, True)
+      if na is not None and nb is not None and na + nb <= pool: return (3, na, nb, False)
+      if na is not None and na <= pool: return (2, na, 0, False)
+      if nb is not None and nb <= pool: return (1, 0, nb, False)
+      return (0, 0, 0, False)
+    orders = [(loops[0], loops[1], False)] + ([(loops[1], loops[0], True)] if loops[3] else [])
+    # best rank; ties keep the default (the longer loop outermost)
+    outer, inner, sw = max(orders, key=lambda o: (plan(o[0], o[1])[0], o[2] == loops[2]))
+    swap_out.append(sw)
+    rank, na, nb, is_quad = plan(outer, inner)
+    ti = int(inner.vmax) + 1
+    def slot(r, base):
       deps = {l for l in (outer, inner) if _hmx_uses(r[0][0].src[0], l)}
-      if deps == {inner} and (int(inner.vmax) + 1) * kt <= n: return f"__hmx_{acc}(({iname})*{kt}+({kr}))", f"({on})==0"
-      if deps == {outer} and kt <= n: return f"__hmx_{acc}({kr})", f"({iname})==0"
-      if not deps and kt <= n: return f"__hmx_{acc}({kr})", f"({on})==0 && ({iname})==0"
-      return None
-    sa_, sb_ = slot(ra, _HMX_CA, "ca"), slot(rb, _HMX_CB, "cb")
-    bdeps = {l for l in (outer, inner) if _hmx_uses(rb[0][0].src[0], l)}
-    nl = next(iter(bdeps)) if len(bdeps) == 1 else None
-    nname = on if nl is outer else iname
-    ti, to = int(inner.vmax) + 1, int(outer.vmax) + 1
-    used_a = (ti if {l for l in (outer, inner) if _hmx_uses(ra[0][0].src[0], l)} == {inner} else 1) * kt
-    p1n = ti if nl is outer else 1
-    if (nl is outer and sa_ and 2 * kt <= _HMX_CB and int(nl.vmax + 1) % 4 == 0 and used_a + 4 * p1n <= _HMX_CA and
-        _hmx_quad_rows(rb, nl, ranges) and getenv("HMX_I8_QUAD", 1)):
+      if deps == {inner}: return f"__hmx_ca({base}+({iname})*{kt}+({kr}))", f"({on})==0"
+      if deps == {outer}: return f"__hmx_ca({base}+({kr}))", f"({iname})==0"
+      return f"__hmx_ca({base}+({kr}))", f"({on})==0 && ({iname})==0"
+    if is_quad:
       # B: four adjacent N tiles share every 128-byte row line: packed together (one byte + one halfword interleave per four
       # rows) into pair slots [n | n+1] (2 KB), pair p of the quad at slot p*kt + k; even n runs one weight :deep load pair
-      # per K block for tiles n and n+1 and stores both accumulators (n+1's byte planes in 8 KB of spare A slots, per inner
+      # per K block for tiles n and n+1 and stores both accumulators (n+1's byte planes in 8 KB of spare slots, per inner
       # tile), odd n only adds those planes
-      nm = f"({nname})"
-      dst = lambda t, g: f"(signed char*)__hmx_cb({t//2}*{kt}+({kr}))+{1024*(t%2)+128*g}"
+      sa_ = slot(ra, 0)
+      bb = na + 4 * ti
+      nm = f"({on})"
+      dst = lambda t, g: f"(signed char*)__hmx_ca({bb}+{t//2}*{kt}+({kr}))+{1024*(t%2)+128*g}"
       pq = "".join(f" __hmx_i8_pack_b4x4({dst(0,g)}, {dst(1,g)}, {dst(2,g)}, {dst(3,g)}, {ptr[64+4*g]}, {ptr[65+4*g]}, {ptr[66+4*g]}, {ptr[67+4*g]});"
                    for g in range(8))
       pf = (f" if ({k0}) __hmx_prefetch_panel2((const __fp16*){ptr[64]}, (const __fp16*){ptr[65]}, {32*kt}, "
-            f"{'(' + nm + ')+4<' + str(int(nl.vmax)+1) + ' ? ((' + nm + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
+            f"{'(' + nm + ')+4<' + str(int(outer.vmax)+1) + ' ? ((' + nm + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
       code = (f"{{{{ void* _a = {sa_[0]}; if ({sa_[1]}) {{{{{pa} }}}} if ({nm}%4==0 && ({iname})==0) {{{{{pf}{pq} }}}}"
-              f" if ({nm}%2==0) __hmx_i8_mac2(_a, __hmx_cb(({nm}%4/2)*{kt}+({kr}))); }}}}")
+              f" if ({nm}%2==0) __hmx_i8_mac2(_a, __hmx_ca({bb}+({nm}%4/2)*{kt}+({kr}))); }}}}")
       srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
-      quad = (nm, f"(unsigned char*)__hmx_ca({used_a}+4*({iname if nl is outer else '0'}))")
-    elif sa_ and sb_:
-      code = (f"{{{{ void* _a = {sa_[0]}; void* _b = {sb_[0]}; if ({sa_[1]}) {{{{{pa} }}}} if ({sb_[1]}) {{{{{pb} }}}}"
-              " __hmx_i8_mac(_a, _b); }}")
+      quad = (nm, f"(unsigned char*)__hmx_ca({na}+4*({iname}))")
+    elif rank >= 1:
+      a_ = slot(ra, 0) if rank in (3, 2) else None
+      b_ = slot(rb, na) if rank in (3, 1) else None
+      ca = f"void* _a = {a_[0]}; if ({a_[1]}) {{{{{pa} }}}}" if a_ else f"void* _a = __hmx_i8sa();{pa}"
+      cb = f" void* _b = {b_[0]}; if ({b_[1]}) {{{{{pb} }}}}" if b_ else f" void* _b = __hmx_i8sb();{pb}"
+      code = "{{ " + ca + cb + " __hmx_i8_mac(_a, _b); }}"
       srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
+    if getenv("HMX_DEBUG"): print(f"i8 plan: rank {rank} (quad {is_quad}) A {na} B {nb} slots of {pool}, kt {kt}, swap {sw}")
   replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
   end_at = pos[eo] if eo is not None else max(pos[so] for so, _, _ in stores)
   body = []
@@ -1259,6 +1296,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
     if a[0].shape == (128,) and (b is None or b[1] == 0) and m[1] == 0:
       groups.setdefault((a[0], b and b[0], m[0], zy, lo), {})[a[1] // 32] = r
   done = set()
+  quads = []
   for (al, bl, ml, zy, lo), g in groups.items():
     if sorted(g) != [0, 1, 2, 3]: continue
     sts = [g[j][0] for j in range(4)]
@@ -1267,11 +1305,63 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
     ptrs = tuple(x.src[0] for x in sts)
     bias = pick(2, 0, bl.shape[0]) if bl is not None else "(__hmx_i32x32)(0)"
     k = len(loads)
-    code = (f"__hmx_rq4({{{k}}}, {{{k+1}}}, {{{k+2}}}, {{{k+3}}}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo});")
-    last = max(sts, key=lambda x: pos[x])
-    replace[last] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + ptrs, code)
-    drop.update(x for x in sts if x is not last)
+    args = f"{{{k}}}, {{{k+1}}}, {{{k+2}}}, {{{k+3}}}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo}"
+    quads.append((max(sts, key=lambda x: pos[x]), tuple(loads) + ptrs, args))
+    drop.update(sts)
     done.update(sts)
+  # fast path per group, flags ORed per run of groups between two uses of the same accumulator row (an output tile); one check
+  # after the run redoes all of it exactly when anything flagged
+  quads.sort(key=lambda q: pos[q[0]])
+  runs: list[list] = []
+  for q in quads:
+    if not runs or any(q[1][0] is r[1][0] for r in runs[-1]): runs.append([q])
+    else: runs[-1].append(q)
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  def delta(p0:UOp, p1:UOp):
+    # element offset of pointer p1 from p0 (same buffer), constant over the loops, else None
+    if p0.op not in (Ops.INDEX, Ops.SHRINK) or p1.op is not p0.op or p0.src[0] is not p1.src[0]: return None
+    def f(env):
+      a, b = _hmx_eval(p1.src[1], env), _hmx_eval(p0.src[1], env)
+      return None if a is None or b is None else a - b
+    return _hmx_const_delta(f, ranges)
+  for run in runs:
+    # a regular run -- every group's pointers at one constant offset per group from the first's -- becomes one C loop: 16
+    # unrolled copies of the requantization are ~25 KB of code per output tile and ran at half the speed of the loop
+    # in accumulator-row order (the store order has group 0 last)
+    offs = [delta(run[0][1][0], q[1][0]) for q in run]
+    if None not in offs: run = [q for _, q in sorted(zip(offs, run), key=lambda t: t[0])]
+    g0 = run[0][1]
+    steps = None
+    if len(run) > 1 and all(len(q[1]) == len(g0) and all(a is b for a, b in zip(q[1][1:len(g0)-4], g0[1:len(g0)-4])) for q in run):
+      pidx = [0] + list(range(len(g0) - 4, len(g0)))  # the accumulator pointer and the four row pointers
+      d1 = [delta(g0[i], run[1][1][i]) for i in pidx]
+      if None not in d1 and len(set(d1[1:])) == 1 and \
+         all(delta(g0[i], q[1][i]) == n * d for n, q in enumerate(run) for i, d in zip(pidx, d1)): steps = (d1[0], d1[1])
+    if steps is not None:
+      st_last, srcs, args = max((q[0] for q in run), key=lambda x: pos[x]), g0, run[0][2]
+      da, dd = steps
+      ga = re.sub(r"\{(\d+)\}", lambda mt: f"({{{mt.group(1)}}}+_g*{dd})" if int(mt.group(1)) >= len(g0) - 4 else mt.group(0), args)
+      ga = ga.replace("(const int*){0}", f"(const int*)({{0}}+_g*{da})")
+      code = (f"__hmx_u32x32 _rqf = (__hmx_u32x32)(0), _rqg[{len(run)}]; for (int _g = 0; _g < {len(run)}; _g++) {{{{ _rqg[_g] = "
+              f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}} if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
+              f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});")
+      replace[st_last] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
+      drop.discard(st_last)
+      continue
+    # per group its own flags (_rqg[n]) and the run's OR (_rqf): the rare flagged run then redoes only its flagged groups
+    for n, (st, srcs, args) in enumerate(run):
+      code = (f"__hmx_u32x32 _rqf = (__hmx_u32x32)(0), _rqg[{len(run)}]; " if n == 0 else "") + \
+             f"_rqg[{n}] = (__hmx_u32x32)(0); __hmx_rq4f({args}, &_rqg[{n}]); _rqf |= _rqg[{n}];"
+      if n == len(run) - 1:
+        base, allsrc, redo = 0, (), []
+        for j, (_, s2, a2) in enumerate(run):
+          a2 = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base}}}", a2)
+          redo.append(f"if (__hmx_rq_any(_rqg[{j}])) __hmx_rq4x({a2});"); allsrc += s2; base += len(s2)
+        code = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base - len(srcs)}}}", code)
+        code += " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
+        srcs = allsrc
+      replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
+      drop.discard(st)
   for st, (a, b, m), zy, lo in rows:
     if st in done: continue
     loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
@@ -1313,9 +1403,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
   before: dict[int, list[UOp]] = {}
   after: dict[int, list[UOp]] = {}
   replace: dict[UOp, UOp] = {}
+  swap_out: list[bool] = []  # the int8 path's loop-order choice (planned for what fits in the VTCM tile pool)
   for w in uops:
     if w.op is Ops.WMMA and w.arg[0] == (32, 64, 32) and w.arg[1] == dtypes.uint8 and getenv("HMX_I8", 1):
-      r = _hmx_i8_rewrite(w, uops, pos, users, drop, before, after, replace)
+      r = _hmx_i8_rewrite(w, uops, pos, users, drop, before, after, replace, swap_out)
       if r is not None: return _hmx_bail(uops, r)
       continue
     if w.op is not Ops.WMMA or w.arg[1] != dtypes.half: continue
@@ -1508,7 +1599,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if u in replace: out.append(replace[u])
     elif u not in drop: out.append(u)
     out += after.get(i, [])
-  if loops is not None and loops[2]: out = _hmx_interchange(out, loops[0], loops[1])
+  if loops is not None and (swap_out[0] if swap_out else loops[2]): out = _hmx_interchange(out, loops[0], loops[1])
   return out, True
 
 _HMX_EVAL = {Ops.ADD: lambda a,b: a+b, Ops.SUB: lambda a,b: a-b, Ops.MUL: lambda a,b: a*b, Ops.SHL: lambda a,b: a<<b,
@@ -1584,8 +1675,8 @@ def _hmx_uses(x:UOp, r:UOp) -> bool:
   return x is r or any(r in u.src for u in x.toposort(lambda u: u.op is not Ops.RANGE))
 
 def _hmx_tile_loops(uops:list[UOp], at:int):
-  # the two innermost output-tile loops open at uops[at] -> (o, i, swap): swap = the one with more iterations should be
-  # outermost and they can be interchanged (nothing between the loop heads depends on i, nothing between their ENDs)
+  # the two innermost output-tile loops open at uops[at] -> (o, i, swap, legal): legal = they can be interchanged (nothing
+  # between the loop heads depends on i, nothing between their ENDs), swap = legal and the one with more iterations is inner
   pos = {u:k for k,u in enumerate(uops)}
   end_of = {e.src[1]: e for e in uops if e.op is Ops.END and len(e.src) > 1 and e.src[1].op is Ops.RANGE}
   open_: list[UOp] = []
@@ -1597,8 +1688,8 @@ def _hmx_tile_loops(uops:list[UOp], at:int):
   o, i = loops[-2], loops[-1]
   mid = uops[pos[o]+1:pos[i]]
   between_ends = [u for u in uops[pos[end_of[i]]+1:pos[end_of[o]]] if u.op not in (Ops.GROUP, Ops.NOOP)]
-  swap = bool(getenv("HMX_INTERCHANGE", 1)) and o.vmax < i.vmax and not between_ends and not any(_hmx_uses(x, i) for x in mid)
-  return o, i, swap
+  legal = bool(getenv("HMX_INTERCHANGE", 1)) and not between_ends and not any(_hmx_uses(x, i) for x in mid)
+  return o, i, legal and o.vmax < i.vmax, legal
 
 def _hmx_interchange(uops:list[UOp], o:UOp, i:UOp) -> list[UOp]:
   pos = {u:k for k,u in enumerate(uops)}
