@@ -5,6 +5,7 @@ when installed). Covers the ops that only exist inside the hand runner: the stem
 import os, pathlib, sys, tempfile, unittest
 import numpy as np
 from test.external.dsp.hand import hexsim
+from test.external.dsp.test_qdq_onnx_dsp import ort_compare
 
 HMX = hexsim.HERE / "hmx"
 os.environ.setdefault("QDQ_HMX", "1")
@@ -47,15 +48,11 @@ class TestHandHmxRunner(unittest.TestCase):
       dsp_graph.emit(work / "g", calls, bufs, xt.uop.buffer, res[0].uop.buffer)
       tg, tg_cyc = dsp_graph.run_sim(work / "g", x.tobytes(), ref.nbytes)
       tg = np.frombuffer(tg, np.uint8)
-      try:
-        import onnxruntime as ort
-        o = ort.InferenceSession(str(work / "m.onnx"), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
-        self.assertEqual(int((o.ravel() != ref.ravel()).sum()), 0, "ORT's semantics (qdq_emulate) disagree with onnxruntime")
-      except ImportError: pass
+      ort_note = ort_compare(work / "m.onnx", x, ref)
     self.assertEqual(int((hand != ref.ravel()).sum()), 0, "the hand runner disagrees with ORT's semantics")
     self.assertEqual(int((tg != hand).sum()), 0, "tinygrad disagrees with the hand runner")
     print(f"\ntiny QDQ ResNet (stem 7x7 s2, MaxPool, 3x3 s1/s2, 1x1 s2, 2 Adds): hand runner {hand_cyc} pcycles, "
-          f"tinygrad {tg_cyc} ({tg_cyc / hand_cyc:.2f}x)")
+          f"tinygrad {tg_cyc} ({tg_cyc / hand_cyc:.2f}x); {ort_note}")
 
 if __name__ == "__main__":
   unittest.main()
