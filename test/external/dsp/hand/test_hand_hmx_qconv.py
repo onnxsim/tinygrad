@@ -28,8 +28,10 @@ def tinygrad_layer(c):
   return ((acc.cast(dtypes.float32) * Tensor(c["m"])).round() + float(c["zy"])).clip(c["lo"], 255).cast(dtypes.uint8)
 
 @unittest.skipUnless(hexsim.tools() is not None and hexsim.mockdsp_ok(), "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang")
-@unittest.skip("the simulator child dies when this runs under pytest; see ORACLE_QUARANTINE.md")
 class TestHandHmxQconv1x1(unittest.TestCase):
+  # Not quarantined: passes bit-exact in ~280 s (verified 2026-09-26 with and without gdb, both
+  # pythons). It was switched off with the 3x3 family on a fault they do not share. See
+  # ORACLE_QUARANTINE.md for what the 3x3 abort actually is.
   def _run(self, M, K, N, zx, zy, relu, seed=0):
     c = case(M, K, N, zx, zy, relu, seed)
     with tempfile.TemporaryDirectory() as d:
