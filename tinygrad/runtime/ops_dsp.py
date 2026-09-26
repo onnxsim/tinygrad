@@ -1789,11 +1789,13 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
   if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", 1):
     nrq = 0 if getenv("HMX_RQ_PROBE") else _hmx_rq_rows(uops, users, drop, before, replace, pos)
-    # HMX_RQ_PROBE keeps the :cm tile path and only stops the requantize rows from being emitted, so
-    # the time is "this graph without the requantization" rather than "this graph without HMX". It
-    # exists because HMX_RQ=0 is not that measurement: dropping the epilogue makes the accumulator
-    # unreachable from the store, the whole rewrite bails, and the kernel falls back to a scalar one
-    # (24x slower on a ResNet-18). The output is wrong on purpose.
+    # HMX_RQ_PROBE keeps the :cm tile path and only stops the requantize rows from being emitted.
+    # **It does not measure the requantization, and do not read a number off it.** Measured on the
+    # phone it came out *slower* than the baseline (22,508 us against 22,208), which is impossible if
+    # it were isolating the epilogue: dropping rows reshapes the surrounding codegen - the addq folding
+    # and the store chain - and that costs more than the requant saves. Under hexagon-sim it does not
+    # finish at all within 40 minutes. To price the requant properly, keep the epilogue and replace
+    # only its body; that is not written.
     if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}{' (skipped, HMX_RQ_PROBE)' if getenv('HMX_RQ_PROBE') else ''}")
   if not replace: return _hmx_bail(uops, 9)
   if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
