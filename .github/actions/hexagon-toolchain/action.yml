@@ -51,6 +51,11 @@ runs:
         set -euo pipefail
         TOOLS=$(dirname "$(dirname "$(find ~/hexagon-toolchain -path '*/bin/hexagon-sim' | head -1)")")
         test -n "$TOOLS" || { echo "::error::hexagon-sim not found under ~/hexagon-toolchain"; exit 1; }
+        # HEXAGON_TOOLS is what test/external/dsp/hand/harness.py reads (headers + libgcc.a);
+        # HEXAGON_TOOLCHAIN is what tinygrad's DSPCompiler._find_libgcc reads. Both point at the same
+        # Tools/ dir, so set both: with only one of them set, whichever side reads the other variable finds
+        # no toolchain and its -nostdlib build fails to link soft-float routines (__hexagon_divsf3).
         echo "HEXAGON_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+        echo "HEXAGON_TOOLCHAIN=$TOOLS" >> "$GITHUB_ENV"
         echo "$TOOLS/bin" >> "$GITHUB_PATH"
         ls "$TOOLS/bin" | grep -E '^hexagon-(clang|sim)$'

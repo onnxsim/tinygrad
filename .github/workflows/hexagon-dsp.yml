@@ -93,14 +93,14 @@ jobs:
             -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null -
           python -m pip install numpy pytest onnx onnxruntime
       - uses: ./.github/actions/hexagon-toolchain
-      # HEXAGON_CLANG pins clang-19 rather than leaving it to clang()'s search order: the oracle tests'
-      # exactness contracts are bit-level, and the qfloat lowering is checked against what clang-19 emits
-      # (clang 18 would take the __hexagon_divsf3 call path instead, which needs the toolchain's libgcc.a).
-      # The harness links that archive when the toolchain is present, so both work, but the expected
-      # generated source is clang-19's.
       - name: Run the DSP oracle tests
         shell: bash  # -o pipefail: the default `bash -e` would let tee swallow pytest's exit code
         env:
+          # CC is what tinygrad's DSPCompiler invokes; HEXAGON_CLANG is what the hand-kernel harness
+          # invokes. Both have to be pinned: the runner's default `clang` is 18, whose Hexagon float
+          # division is a call to __hexagon_divsf3 rather than clang-19's inlined Newton-Raphson
+          # sequence, and the qfloat tests check the generated source, which is clang-19's output.
+          CC: clang-19
           HEXAGON_CLANG: clang-19
         run: python -m pytest -v -rs --durations=0 test/external/dsp/ | tee pytest.log
 
@@ -124,6 +124,7 @@ jobs:
       - name: Run the oracle tests with the toolchain required
         shell: bash
         env:
+          CC: clang-19
           HEXAGON_CLANG: clang-19
         run: |
           python -m pytest -v -rs --durations=0 test/external/dsp/hand test/external/dsp/test_qdq_onnx_dsp.py | tee pytest.log
