@@ -36,12 +36,16 @@ on:
       - "test/external/dsp/**"
       - "test/unit/test_dsp_render.py"
       - ".github/workflows/hexagon-dsp.yml"
+      - ".github/actions/hexagon-toolchain/**"
+      - ".github/actions/llvm-hexagon/**"
   pull_request:
     paths:
       - "tinygrad/**"
       - "test/external/dsp/**"
       - "test/unit/test_dsp_render.py"
       - ".github/workflows/hexagon-dsp.yml"
+      - ".github/actions/hexagon-toolchain/**"
+      - ".github/actions/llvm-hexagon/**"
   workflow_dispatch:
 
 permissions:
