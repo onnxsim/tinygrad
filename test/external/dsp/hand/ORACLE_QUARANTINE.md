@@ -55,12 +55,12 @@ Changing the cases to 32x32 does make them much cheaper standalone (12.7 s again
 3. Then lift the quarantine on the 3x3 and whole-graph tests and keep the 1x1 ones running -
    **those already pass**, bit-exact, in 295 s, and the quarantine on them is wrong.
 
-## The 1x1 family behaves the same way
+## The 1x1 family: not affected
 
-`TestHandHmxQconv1x1` was quarantined on the assumption that it shared the 3x3 family's fault. An
-earlier note in this file claimed it passed; **that was wrong** - it only passed in a tree where
-`_sim` had been instrumented to use `Popen` instead of `subprocess.run`. On a clean checkout it
-aborts exactly like the 3x3 family, in the same place.
+`TestHandHmxQconv1x1::test_qconv1x1` **passes**, bit-exact, in ~280 s. Verified 2026-09-26 on a
+clean checkout at this commit, three ways: system python, the venv python, and under gdb. It was
+switched off with the 3x3 family on a fault they do not share, and it has been switched back on.
 
-So all five quarantined files share one fault, and it is the pytest interaction, not a kernel
-problem. The 1x1 quarantine is correct as it stands.
+Two notes in this file's history claimed otherwise - first that it aborted, then that it passed
+- before the answer was checked properly on a clean tree with nothing else running. The earlier
+aborts came from running several suites concurrently. Only the 3x3 family is quarantined.
