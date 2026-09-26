@@ -744,6 +744,7 @@ static inline void __hmx_i8_begin(void) { for (int i = 0; i < 2048; i++) __hmx_i
 static inline void __hmx_i8_pack_a4(unsigned char* d, const unsigned char* r0, const unsigned char* r1, const unsigned char* r2, const unsigned char* r3) {
   for (int j = 0; j < 32; j++) { d[j] = r0[j]; d[32 + j] = r1[j]; d[64 + j] = r2[j]; d[96 + j] = r3[j]; }
 }
+static inline void __hmx_i8_copy_a(unsigned char* d, const unsigned char* src) { for (int i = 0; i < 2048; i++) d[i] = src[i]; }
 static inline void __hmx_i8_pack_b4(signed char* d, const signed char* r0, const signed char* r1, const signed char* r2, const signed char* r3) {
   for (int n = 0; n < 32; n++) { d[4 * n] = r0[n]; d[4 * n + 1] = r1[n]; d[4 * n + 2] = r2[n]; d[4 * n + 3] = r3[n]; }
 }
@@ -818,6 +819,12 @@ static inline void __hmx_i8_pack_b4(signed char* d, const signed char* r0, const
   __hmx_vp x = __builtin_HEXAGON_V6_vshuffvdd_128B(__hmx_row32(r1), __hmx_row32(r0), -1);
   __hmx_vp y = __builtin_HEXAGON_V6_vshuffvdd_128B(__hmx_row32(r3), __hmx_row32(r2), -1);
   *(__hmx_v*)d = __builtin_HEXAGON_V6_lo_128B(__builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(y), __builtin_HEXAGON_V6_lo_128B(x), -2));
+}
+/* 64 activation rows that are one contiguous 2 KB (rows at a 32-byte stride: a 32-channel-block layout) -> the tile: 16
+ * unaligned 128-byte loads, 16 aligned stores */
+typedef int __hmx_i8vu __attribute__((vector_size(128), aligned(1)));
+static inline void __hmx_i8_copy_a(unsigned char* d, const unsigned char* src) {
+  for (int q = 0; q < 16; q++) ((__hmx_v*)d)[q] = (__hmx_v)((const __hmx_i8vu*)src)[q];
 }
 static inline void __hmx_i8_mac(const void* a, const void* b) {
   __asm__ volatile("{ activation.ub = mxmem(%0,%1):cm\n weight.b = mxmem(%2,%3) }" :: "r"(a), "r"(0x7ff), "r"(b), "r"(0x3ff) : "memory");
@@ -1161,6 +1168,8 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
   ptr = [f"((const unsigned char*){{{vals.index(v)}}}+{b})" if b else f"((const unsigned char*){{{vals.index(v)}}})" for v, b in ra] + \
         [f"((const signed char*){{{vals.index(v)}}}+{b})" if b else f"((const signed char*){{{vals.index(v)}}})" for v, b in rb]
   pa = "".join(f" __hmx_i8_pack_a4((unsigned char*)_a+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
+  # the 64 rows contiguous (row r at row 0 + 32 r bytes): one 2 KB copy instead of 64 row gathers
+  if getenv("HMX_I8_CONTIG_A", 1) and _hmx_contig_rows(ra, [u for u in uops if u.op is Ops.RANGE]): pa = f" __hmx_i8_copy_a((unsigned char*)_a, {ptr[0]});"
   pb = "".join(f" __hmx_i8_pack_b4((signed char*)_b+{128*q}, {ptr[64+4*q]}, {ptr[65+4*q]}, {ptr[66+4*q]}, {ptr[67+4*q]});" for q in range(8))
   srcs = tuple(v.src[0] for v in vals)
   code = "{{ void* _a = __hmx_i8sa(); void* _b = __hmx_i8sb();" + pa + pb + " __hmx_i8_mac(_a, _b); }}"
@@ -1318,20 +1327,28 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
   # uint8 row stores of 32 lanes that are each an ORT-exact requantization of the same lane of the same vector loads
   # (accumulator, bias, per-column scale): the lanes go; the four rows of one 128-lane accumulator load (same bias, scale,
   # zero point) become one HVX __hmx_rq4, any other row one __hmx_rq1
+  # a row: (store, j) = lanes 32j .. 32j+31 of a uint8 store of 32k lanes (k rows of 32 contiguous bytes: a 32-channel-block
+  # output layout stores 4 pixels at once), at the store's address + 32j
   rows = []
   for st in uops:
-    if st.op is not Ops.STORE or st.src[1].op is not Ops.STACK or st.src[1].dtype != dtypes.uchar or len(st.src[1].src) != 32: continue
-    ms = [_hmx_rq_lane(x) for x in st.src[1].src]
-    if any(m is None for m in ms) or len({(m[3], m[4]) for m in ms}) != 1: continue
-    cols = [tuple(m[i] for m in ms) for i in range(3)]
-    if cols[1][0] is None: cols[1] = None
-    picks = []
-    for c in cols:
-      if c is None: picks.append(None); continue
-      o, ld = c[0][1], c[0][0]
-      if len({t[0] for t in c}) != 1 or [t[1] for t in c] != list(range(o, o + 32)) or o % 32 or len(ld.shape) != 1 or ld.shape[0] % 32: break
-      picks.append((ld, o))
-    else: rows.append((st, picks, ms[0][3], ms[0][4]))
+    if st.op is not Ops.STORE or st.src[1].op is not Ops.STACK or st.src[1].dtype != dtypes.uchar or len(st.src[1].src) % 32: continue
+    srows = []
+    for j in range(len(st.src[1].src) // 32):
+      ms = [_hmx_rq_lane(x) for x in st.src[1].src[32 * j:32 * j + 32]]
+      if any(m is None for m in ms) or len({(m[3], m[4]) for m in ms}) != 1: break
+      cols = [tuple(m[i] for m in ms) for i in range(3)]
+      if cols[1][0] is None: cols[1] = None
+      picks = []
+      for c in cols:
+        if c is None: picks.append(None); continue
+        o, ld = c[0][1], c[0][0]
+        if len({t[0] for t in c}) != 1 or [t[1] for t in c] != list(range(o, o + 32)) or o % 32 or len(ld.shape) != 1 or ld.shape[0] % 32: break
+        picks.append((ld, o))
+      else:
+        srows.append(((st, j), picks, ms[0][3], ms[0][4])); continue
+      break
+    if len(srows) == len(st.src[1].src) // 32: rows += srows  # all of the store's rows, or none of it
+  rp = lambda k, j: f"({{{k}}}+{32 * j})" if j else f"{{{k}}}"  # row j's pointer from its store's (placeholder k)
   def pick(k:int, o:int, n:int) -> str:
     return f"{{{k}}}" if n == 32 else f"__builtin_shufflevector({{{k}}}, {{{k}}}, {', '.join(str(o+i) for i in range(32))})"
   groups: dict[tuple, dict[int, tuple]] = {}
@@ -1339,20 +1356,21 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
     st, (a, b, m), zy, lo = r
     if a[0].shape == (128,) and (b is None or b[1] == 0) and m[1] == 0:
       groups.setdefault((a[0], b and b[0], m[0], zy, lo), {})[a[1] // 32] = r
-  done = set()
+  done_rows: set = set()
   quads = []
   for (al, bl, ml, zy, lo), g in groups.items():
     if sorted(g) != [0, 1, 2, 3]: continue
-    sts = [g[j][0] for j in range(4)]
+    rws = [g[j][0] for j in range(4)]
+    sts = [r[0] for r in rws]
     # the accumulator rows go in by address (al's pointer into the accumulator array), not as the loaded 128 lanes
     loads = [al.src[0], ml] + ([bl] if bl is not None else [])
     ptrs = tuple(x.src[0] for x in sts)
     bias = pick(2, 0, bl.shape[0]) if bl is not None else "(__hmx_i32x32)(0)"
     k = len(loads)
-    args = f"{{{k}}}, {{{k+1}}}, {{{k+2}}}, {{{k+3}}}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo}"
+    args = f"{rp(k, rws[0][1])}, {rp(k+1, rws[1][1])}, {rp(k+2, rws[2][1])}, {rp(k+3, rws[3][1])}, (const int*){{0}}, {bias}, {pick(1, 0, ml.shape[0])}, {zy}, {lo}"
     quads.append((max(sts, key=lambda x: pos[x]), tuple(loads) + ptrs, args))
     drop.update(sts)
-    done.update(sts)
+    done_rows.update(rws)
   # fast path per group, flags ORed per run of groups between two uses of the same accumulator row (an output tile); one check
   # after the run redoes all of it exactly when anything flagged
   quads.sort(key=lambda q: pos[q[0]])
@@ -1406,13 +1424,28 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
         srcs = allsrc
       replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st)
-  for st, (a, b, m), zy, lo in rows:
-    if st in done: continue
-    loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
-    bias = pick(2, b[1], b[0].shape[0]) if b is not None else "(__hmx_i32x32)(0)"
-    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(loads) + (st.src[0],),
-                      f"__hmx_rq1({{{len(loads)}}}, {pick(0, a[1], a[0].shape[0])}, {bias}, {pick(1, m[1], m[0].shape[0])}, {zy}, {lo});")
-    done.add(st)
+  # rows no group took: one __hmx_rq1 each, one CUSTOM per store (a store none of whose rows is grouped)
+  grouped = {r[0] for r in done_rows}
+  singles: dict = {}
+  for (st, j), abm, zy, lo in rows:
+    if st not in grouped: singles.setdefault(st, []).append((j, abm, zy, lo))
+  for st, rs in singles.items():
+    srcs, code = [], []
+    for j, (a, b, m), zy, lo in rs:
+      loads = [a[0], m[0]] + ([b[0]] if b is not None else [])
+      k0 = len(srcs)
+      srcs += loads
+      bias = pick(k0 + 2, b[1], b[0].shape[0]) if b is not None else "(__hmx_i32x32)(0)"
+      code.append(f"__hmx_rq1(PTR, {pick(k0, a[1], a[0].shape[0])}, {bias}, {pick(k0 + 1, m[1], m[0].shape[0])}, {zy}, {lo});".replace(
+        "PTR", rp(len(srcs), j) if False else f"@P{j}@"))
+    kp = len(srcs)
+    srcs.append(st.src[0])
+    code_s = " ".join(code)
+    for j, *_ in rs: code_s = code_s.replace(f"@P{j}@", rp(kp, j))
+    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(srcs), code_s)
+  # a store half grouped (its other rows single) isn't expected: leave it, and its lanes, to the plain rendering
+  done = {st for st in grouped if all(((st, j) in done_rows) for j in range(len(st.src[1].src) // 32))} | set(singles)
+  for st in grouped - done: drop.discard(st)
   # the lanes' own uops, down to the loads, go when nothing else uses them
   keep_loads = {x for u in replace.values() if u.op is Ops.CUSTOM for x in u.src}
   dead, stack = set(), [x for st in done for x in st.src[1:]]
@@ -1814,6 +1847,19 @@ def _hmx_quad_rows(rows, n:UOp, ranges:list[UOp]) -> bool:
     return _hmx_const_delta(g, ranges)
   stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, n: env[n] + 1}))
   return stride is not None and stride % 128 == 0 and nxt == 32
+
+def _hmx_contig_rows(rows, ranges:list[UOp]) -> bool:
+  # the operand's rows at a 32-byte stride from row 0, for any loop values: one contiguous 2 KB tile
+  def addr(v, b):
+    ix = v.src[0].src[1] if len(v.src) >= 1 and v.src[0].op in (Ops.INDEX, Ops.SHRINK) and len(v.src[0].src) >= 2 else None
+    return (lambda env: None if ix is None or (a:=_hmx_eval(ix, env)) is None else a + b), (v.src[0].src[0] if ix is not None else None)
+  a0, base0 = addr(*rows[0])
+  if base0 is None: return False
+  for r, (v, b) in enumerate(rows[1:], start=1):
+    ar, base = addr(v, b)
+    if base is not base0 or _hmx_const_delta(lambda env: None if (x:=ar(env)) is None or (y:=a0(env)) is None else x - y, ranges) != 32 * r:
+      return False
+  return True
 
 def _hmx_quad_k_rows(rows, k:UOp, ranges:list[UOp]) -> bool:
   # 32-byte row windows (their own loads) that move 32 bytes on per K block (loop k) and sit 128-byte aligned at k % 4 == 0: K

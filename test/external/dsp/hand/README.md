@@ -26,6 +26,7 @@ Run: `HMX=1 DEV=DSP MOCKDSP=1 TC=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLS=... py
 | family | hand kernel | tinygrad | hexagon-sim (hand / tinygrad pcycles) |
 |---|---|---|---|
 | `gemm` | fp16 GEMM, DDR-fed, weights prepacked on the host (`hmx_gemm.h`) | HMX fp16 TensorCore, accumulator kept in HMX | 128x576x256: 35032 / 39149; 64^3: 2715 / 3976 |
+| `runner` | the whole QDQ graph runner (`runner/`: stem, 3x3 s1/s2, 1x1 s2, QLinearAdd, MaxPool, padding, VTCM plan; `qdq_graph.py` builds its program) | `OnnxRunner`'s QDQ lowering (`nn/onnx_qdq.py`) as one program (`runtime/support/dsp_graph.py`) | tiny QDQ ResNet 32x32: 404874 / 470902 |
 | `qconv` | 1x1 QDQ conv, `QC_EXACT` (`hmx_qconv.h`) | int8 `:cm` TensorCore + fused exact requant | 256x128x128: 24710 / 64842; 128x256x64 relu: 25358 / 21345 |
 | `qconv` | 3x3 QDQ conv s1/s2, `QC_EXACT` (`hmx_qconv3.h`: shifted copies / phase split, `:single` windows, stitch) | grid-form conv (`TC_OPT=1`) + fused exact requant | 16x16x64->64 s1: 21088 / 87147; 16x16x128->128 s2 relu: 28388 / 114694 |
 
