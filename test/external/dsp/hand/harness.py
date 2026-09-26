@@ -47,6 +47,23 @@ def hexagon_include() -> pathlib.Path|None:
   if root and (p := pathlib.Path(root) / "target" / "hexagon" / "include").is_dir(): return p
   return None
 
+@functools.cache
+def libgcc() -> pathlib.Path|None:
+  """The toolchain's soft-float archive, for a -nostdlib -ffreestanding build. A Hexagon float division
+  (`float / float`, and transitively anything sigmoid/softmax-shaped) is not always a native instruction
+  sequence: clang >= 19 inlines a Newton-Raphson sequence, clang 15/17/18 emit a call to
+  `__hexagon_divsf3` instead, which then fails to link. The toolchain ships the routine in libgcc.a (a plain
+  static archive, so only referenced symbols are pulled in and this is free for every kernel that does not
+  need it). Same list, and the same caveat, as tinygrad's runtime/ops_dsp.py _find_libgcc: some SDK
+  snapshots ship no v65 archive, and the Hexagon scalar ISA these target has been stable v65-v81, so the
+  lowest available version is used."""
+  root = os.environ.get("HEXAGON_TOOLS") or os.environ.get("HEXAGON_TOOLCHAIN")
+  if not root: return None
+  libdir = pathlib.Path(root) / "target" / "hexagon" / "lib"
+  for arch in ["v65", "v66", "v67", "v68", "v69", "v71", "v73", "v75", "v77", "v79", "v81"]:
+    if (p := libdir / arch / "libgcc.a").exists(): return p
+  return None
+
 def missing(intrinsics:bool=False) -> str|None:
   """Why this machine can't run the oracles (a skip reason), or None."""
   if int(os.environ.get("HVX_ARCH", "v65").lstrip("v")) >= 68:
@@ -63,7 +80,7 @@ def build_hand(driver:pathlib.Path, out:pathlib.Path, cpu:str="v73", hvx:bool=Tr
          "-O2", "-ffp-contract=off", "-static", "-nostdlib", "-ffreestanding", "-fuse-ld=lld", "-Wno-unused-function",
          f"-I{HERE}", f"-I{driver.parent}", *[f"-I{i}" for i in includes], *flags]
   if hexagon_include() is not None: cmd += ["-isystem", hexagon_include()]
-  res = _run([*cmd, "-o", out, driver])
+  res = _run([*cmd, *(["-x", "none", libgcc()] if libgcc() is not None else []), "-o", out, driver])
   assert res.returncode == 0, f"hand build of {driver.name} failed:\n{res.stdout}{res.stderr}"
   return out
 
