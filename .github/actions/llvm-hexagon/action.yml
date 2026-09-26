@@ -47,12 +47,17 @@ runs:
         for v in 19 18 17 20; do
           sudo apt-get install -y --no-install-recommends "clang-$v" || echo "clang-$v unavailable, skipping"
         done
-        # The apt.llvm.org packages install into /usr/lib/llvm-N/bin and put only versioned symlinks
-        # in /usr/bin. That is enough for the probe below, but the oracle harnesses resolve their
-        # compiler with shutil.which(CC) and would not find it, so every HMX test would skip itself
-        # with "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang" while the toolchain is present.
+        # The apt.llvm.org packages install into /usr/lib/llvm-N/bin and put only some versioned
+        # symlinks in /usr/bin. That is enough for the probe below, but the oracle harnesses resolve
+        # their compiler with shutil.which(CC) and would not find it, so every HMX test would skip
+        # itself with "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang" while the toolchain is
+        # present. (CC is set to an absolute path further down too; this is belt and braces.)
+        #
+        # `if`, not `[ -d ] &&`: under `set -e` a false test as the last statement of a loop body is a
+        # non-zero exit status and kills the step, even though the whole point is that some LLVM
+        # series are not installed.
         for v in 20 19 18 17 16 15; do
-          [ -d "/usr/lib/llvm-$v/bin" ] && echo "/usr/lib/llvm-$v/bin" >> "$GITHUB_PATH"
+          if [ -d "/usr/lib/llvm-$v/bin" ]; then echo "/usr/lib/llvm-$v/bin" >> "$GITHUB_PATH"; fi
         done
 
     - name: Select a clang that can target hexagonv65
