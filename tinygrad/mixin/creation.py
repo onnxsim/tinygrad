@@ -31,12 +31,14 @@ class CreationMixin(DTypeMixin, MovementMixin):
     print(t.shape)
     ```
     """
-    from tinygrad.uop.ops import UOp, to_max_shape
+    from tinygrad.uop.ops import UOp, Ops, ParamArg, to_max_shape
     from tinygrad.device import canonicalize_device
     dt = to_dtype(dtype) if dtype is not None else dtypes.default_float
+    if dt in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {dt}")
     new_shape = argfix(*shape)
     max_shape = to_max_shape(new_shape)
-    u = UOp.new_buffer(canonicalize_device(device), prod(max_shape), dt).reshape(max_shape).shrink_to(new_shape)
+    u = UOp(Ops.ALLOC, arg=ParamArg(next(UOp.unique_num), dt, prod(max_shape), device=canonicalize_device(device), bind_on_realize=True))
+    u = u.reshape(max_shape).shrink_to(new_shape)
     return cls._wrap_uop(u)
 
   def empty_like(self, dtype: DTypeLike|None=None, device: str|tuple[str, ...]|None=None) -> Self:
@@ -78,10 +80,9 @@ class CreationMixin(DTypeMixin, MovementMixin):
     from tinygrad.uop.ops import UOp
     new_shape = argfix(shape)
     dt = to_dtype(dtype) if dtype is not None else fill_value.dtype if isinstance(fill_value, UOp) else dtypes.from_py(fill_value)
-    val = cls.const(fill_value, dt)
-    val = val.reshape((1,)*len(new_shape)).expand(new_shape)
+    val = cls.const(fill_value, dt).expand(new_shape)
     if not buffer: return val
-    ret = val.empty_like(dt if dtype is not None else None, device)
+    ret = val.empty_like(None if dt in dtypes.weaks else dt, device)
     return cls._wrap_uop(ret._uop.after(ret._uop.store(val._uop)))
 
   def full_like(self, fill_value:ConstType, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None, buffer=True) -> Self:

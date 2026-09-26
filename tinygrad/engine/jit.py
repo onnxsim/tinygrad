@@ -2,12 +2,12 @@ from typing import TypeVar, Generic, Callable, Any, overload
 import functools
 from tinygrad.tensor import Tensor, all_tensors
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ, disable_gc
-from tinygrad.device import Buffer, Compiled, Device, MultiBuffer, DepsTracker
+from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType
-from tinygrad.uop.ops import UOp, PatternMatcher, Variable, sym_infer, Ops, buffers, rewrite_group, graph_rewrite
+from tinygrad.uop.ops import UOp, PatternMatcher, Variable, sym_infer, Ops, rewrite_group, graph_rewrite
 from tinygrad.renderer import Estimates
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear, graph_cache, estimate_uop, get_runtime
-from tinygrad.engine.realize import unwrap_multi, resolve_params, get_call_arg_uops, get_call_outs_ins
+from tinygrad.engine.realize import unwrap_multi, resolve_params, get_call_arg_uops, get_call_written_bufs
 from tinygrad.schedule.memory import memory_plan_rewrite, _collect_bufs
 from tinygrad.nn.state import get_parameters
 from tinygrad.uop.movement import mop_cleanup
@@ -59,7 +59,8 @@ def graph_split_rewrite(linear:UOp, max_batch_size:int=0) -> UOp:
   return linear.replace(src=tuple(new_src))
 
 def _copy_input(u:UOp) -> UOp:
-  run_linear(UOp(Ops.LINEAR, src=(u.copy_to_device(u.device).call(new:=UOp.new_buffer(u.device, u.max_numel(), u.dtype), u),)))
+  if u.on_disk(): raise JitError("cannot make an independent copy of a written DISK input")
+  run_linear(UOp(Ops.LINEAR, src=((new:=UOp.new_buffer(u.device, u.max_numel(), u.dtype)).store_call(u),)))
   return new
 
 @rewrite_group(lambda linear,held_bufs,input_uops,ret=(): f"JIT {pluralize('call', len(linear.src))}")
@@ -67,9 +68,9 @@ def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp]) -> UOp:
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View captured linear")
 
   # parametrize input buffers: map each input buffer UOp to a PARAM with the correct slot index
-  linear = linear.substitute({u: UOp.param(i, u.dtype, u.shape, u.device) for i,u in enumerate(input_uops)}, walk=True)
+  linear = linear.substitute({u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}, walk=True)
   linear = memory_plan_rewrite(linear, held_bufs)
-  linear = compile_linear(linear, beam=getenv("JITBEAM", BEAM.value))
+  linear = compile_linear(linear, beam=getenv("JITBEAM", BEAM.value), input_uops=input_uops, cache=False)
   if JIT < 2: linear = graph_split_rewrite(linear, max_batch_size=JIT_BATCH_SIZE.value)
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View graphed linear")
   return linear
@@ -95,8 +96,8 @@ class GraphRunner:
     for call in self.linear.src:
       replace = [(p, b.arg.slot) for p, b in enumerate(get_call_arg_uops(call)) if b.op is Ops.PARAM]
       for dev_idx, (bufs, device_vars) in enumerate(unwrap_multi(call, resolve_params(call, input_uops))):
-        self.calls.append((dev_idx, call.src[0], [b.ensure_allocated() for b in bufs], device_vars))
-        self.runtimes.append(get_runtime(bufs[0].device, call.src[0]) if call.src[0].op is Ops.PROGRAM else None)
+        self.calls.append((dev_idx, call.body, [b.ensure_allocated() for b in bufs], device_vars))
+        self.runtimes.append(get_runtime(bufs[0].device, call.body) if call.body.op is Ops.PROGRAM else None)
         self.uop_replace.append(replace)
 
     self.var_vals_replace:dict[int, list[tuple[int, int]]] = {}
@@ -106,24 +107,20 @@ class GraphRunner:
     def is_sym_dim(dim) -> bool: return not all(isinstance(d, (int, float)) for d in dim)
 
     crs = [(j, self.calls[j][1].arg, self.calls[j][3]) for j in range(len(self.calls)) if self.calls[j][1].op is Ops.PROGRAM]
-    self.vars = sorted({v.expr for _,p,dv in crs for v in p.vars if v.expr not in dv | p.runtimevars})
-    self.symbolic_dims = dedup(tuple(d) for _,p,_ in crs for d in (p.local_size, p.global_size) if d and is_sym_dim(d))
+    self.vars = sorted({v.expr for _,p,dv in crs for v in p.vars if v.expr not in dv})
+    self.symbolic_dims = dedup(tuple(d) for _,p,_ in crs for d in (p.local_size, p.global_size) if is_sym_dim(d))
 
-    def find_symbolic_dim(dim): return self.symbolic_dims.index(tuple(dim)) if dim is not None and tuple(dim) in self.symbolic_dims else None
+    def find_symbolic_dim(dim:tuple[int,int,int]): return self.symbolic_dims.index(tuple(dim)) if tuple(dim) in self.symbolic_dims else None
 
     for j,p,dv in crs:
-      if (replace:=[(i, self.vars.index(v.expr)) for i, v in enumerate(p.vars) if v.expr not in dv | p.runtimevars]):
+      if (replace:=[(i, self.vars.index(v.expr)) for i, v in enumerate(p.vars) if v.expr not in dv]):
         self.var_vals_replace[j] = replace
       global_dim_idx, local_dim_idx = find_symbolic_dim(p.global_size), find_symbolic_dim(p.local_size)
       if global_dim_idx is not None or local_dim_idx is not None:
         self.launch_dims_replace[j] = (global_dim_idx, local_dim_idx)
-        assert p.local_size is not None
         self.launch_dims_base[j] = (tuple(p.global_size), tuple(p.local_size))
 
     estimates = sum((estimate_uop(call) for call in self.linear.src), Estimates())
-
-    # used in MultiGraphRunner
-    self.deps = DepsTracker()
 
     self.device, self.estimates = self.calls[0][2][0].device.split(":")[0], estimates.simplify()
 
@@ -139,9 +136,6 @@ class GraphRunner:
     for j, (gl, lc) in self.launch_dims_replace.items():
       yield j, (dims[gl] if gl is not None else self.launch_dims_base[j][0]), (dims[lc] if lc is not None else self.launch_dims_base[j][1])
 
-  def _access_resources(self, bufs:list[Buffer], write:list[int], new_dependency:Any):
-    return self.deps.access_resources(bufs, write, new_dependency)
-
   @staticmethod
   def _all_devs(batch_devs:list[Compiled], new_call:UOp) -> list[Compiled]:
     return dedup(batch_devs + [Device[x] for b in get_call_arg_uops(new_call)
@@ -149,14 +143,7 @@ class GraphRunner:
 
   @staticmethod
   def supports_uop(batch_devs:list[Compiled], new_call:UOp) -> bool:
-    return new_call.src[0].op is Ops.PROGRAM and len(GraphRunner._all_devs(batch_devs, new_call)) == 1
-
-# a marker for your graph supporting multiple devices of the same type
-class MultiGraphRunner(GraphRunner):
-  @staticmethod
-  def supports_uop(batch_devs:list[Compiled], new_call:UOp) -> bool:
-    # Devices must be the same type
-    return new_call.src[0].op in (Ops.PROGRAM, Ops.COPY) and len(dedup([type(d) for d in GraphRunner._all_devs(batch_devs, new_call)])) == 1
+    return new_call.op is Ops.CALL and new_call.body.op is Ops.PROGRAM and len(GraphRunner._all_devs(batch_devs, new_call)) == 1
 
 ReturnType = TypeVar('ReturnType')
 @dataclass
@@ -167,19 +154,13 @@ class CapturedJit(Generic[ReturnType]):
   expected_input_info: list[tuple[UOp, tuple[Variable, ...], DType, str]]  # (view, variables, dtype, device) per input
 
   @functools.cached_property
-  def linear(self) -> UOp: return link_linear(self._linear)
+  def linear(self) -> UOp: return link_linear(self._linear, allow_cache=False) # do not cache jit
 
   def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info)
 
   @functools.cached_property
   def _written_uops(self) -> set[UOp]:
-    out: set[UOp] = set()
-    for call in self.linear.toposort():
-      if call.op is not Ops.CALL: continue
-      arg_uops = get_call_arg_uops(call)
-      outs, ins = get_call_outs_ins(call)
-      out |= {b for k in set(outs) - set(ins) if (b:=u if (cv:=(u:=arg_uops[k]).contiguous_view()) is None else cv[0]).op is Ops.BUFFER}
-    return out
+    return {b for call in self.linear.toposort() if call.op is Ops.CALL for b in get_call_written_bufs(call)}
 
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
     concrete = tuple(_copy_input(u) if u in self._written_uops else u for u in input_uops)
@@ -190,11 +171,11 @@ class CapturedJit(Generic[ReturnType]):
   def free_intermediates(self):
     # drop graph runners
     for call in self.linear.src:
-      if call.src[0].op is Ops.CUSTOM_FUNCTION and call.src[0].arg == "graph": graph_cache.pop(call.src[0], None)
+      if call.op is Ops.CALL and call.body.op is Ops.CUSTOM_FUNCTION and call.body.arg == "graph": graph_cache.pop(call.body, None)
     for u in self._written_uops:
-      if (buf:=buffers.get(u)) is None: continue
+      if u.op is not Ops.BUFFER or (buf:=u.arg.buffer) is None: continue
       for b in (buf.bufs if isinstance(buf, MultiBuffer) else (buf,)):
-        if b.is_initialized(): b.deallocate()
+        if b.is_allocated(): b.deallocate()
         if (base:=b._base) is not None and base.allocated_views == 0 and base.is_allocated(): base.deallocate()
 
 def _prepare_jit_inputs(args, kwargs):
@@ -271,8 +252,11 @@ class _TinyJit(Generic[ReturnType]):
         run_linear(onetime_linear, var_vals)
         del onetime_linear
 
-      # hold all buffers reachable from live Tensors (e.g. lazy .grad created during capture), the memory planner can't suballocate those
-      held_bufs = set(buffers) | {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if u.op is Ops.BUFFER}
+      # hold all buffers with real storage reachable from live Tensors (e.g. lazy .grad created during capture) and all buffers with
+      # allocated storage in the captured linear (e.g. constants baked in by copies): the memory planner can't suballocate those
+      def _buf_or_none(u:UOp) -> Buffer|MultiBuffer|None: return u.arg.buffer if u.op is Ops.BUFFER else None
+      held_bufs = {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if _buf_or_none(u) is not None}
+      held_bufs |= {u for u in big_linear.toposort() if (b:=_buf_or_none(u)) is not None and b.is_allocated()}
       linear = jit_lower(big_linear, held_bufs, input_buf_uops)
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec

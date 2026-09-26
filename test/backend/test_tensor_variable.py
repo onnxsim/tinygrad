@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from tinygrad import Device, Tensor, Variable, TinyJit, dtypes
-from tinygrad.helpers import CHECK_OOB
+from tinygrad.helpers import CHECK_OOB, Context
 
 class TestTensorVariable(unittest.TestCase):
   def test_add_tvar(self):
@@ -35,7 +35,14 @@ class TestTensorVariable(unittest.TestCase):
     vv = Variable("a", 1, 10).bind(2)
     self.assertEqual(Tensor(vv).dtype, dtypes.weakint)
     self.assertEqual((Tensor(vv) + Tensor([1], dtype=dtypes.int8)).dtype, dtypes.int8)  # takes the concrete side, no widening
-    self.assertEqual(Tensor(vv).item(), 2)                                              # a read commits at default_int
+    self.assertEqual(Tensor(vv).item(), 2)                                              # a read commits by bounds, like a kernel
+
+  def test_weak_read_widens_by_bounds(self):
+    self.assertEqual(Tensor(2**40).item(), 2**40)
+    self.assertEqual(Tensor(Variable("b", 0, 2**40).bind(2**35+3)).item(), 2**35+3)
+
+  def test_long_variable_emulated_raises(self):
+    with Context(EMULATED_DTYPES="long"), self.assertRaises(RuntimeError): Tensor(Variable("c", 0, 2**40).bind(2**35+3)).item()
 
   def test_variable_tensor_dtype_arg(self):
     vv = Variable("a", 1, 10).bind(2)
@@ -50,11 +57,27 @@ class TestTensorVariable(unittest.TestCase):
     # bound variables in an expression are fine
     self.assertEqual(Tensor(Variable("u", 1, 10).bind(2) + 1).item(), 3)
 
+  def test_negative_variable_on_device(self): self.assertEqual(Tensor(Variable("n", -10, 10).bind(-3)).clone().item(), -3)
+
   def test_shrink_beyond_buffer_variable(self):
     # TODO: shrink by a variable whose vmax exceeds the dim should fail at build, today only CHECK_OOB=1 rejects it
     t = Tensor.ones(3).contiguous()[:Variable("a", 1, 10).bind(5)]
     if CHECK_OOB: self.assertRaises(RuntimeError, t.sum().item)
     else: t.sum().item()  # silent OOB: reads 2 elements past the buffer, result depends on the allocator
+
+  def test_symbolic_contiguous_flip(self):
+    a = Tensor([1, 2, 3, 4], dtype=dtypes.int32).realize()
+    for n in (1, 2, 4):
+      with self.subTest(n=n):
+        v = Variable("stage_v", 1, 4).bind(n)
+        self.assertEqual(a[:v].flip(0).contiguous().sum().item(), n*(n+1)//2)
+
+  def test_symbolic_contiguous_flip_2d(self):
+    a = Tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=dtypes.int32).realize()
+    for n in (1, 2, 4):
+      with self.subTest(n=n):
+        v = Variable("stage_v", 1, 4).bind(n)
+        self.assertEqual(a[:, :v].flip(1).contiguous().sum().item(), n*(n+5))
 
   def test_symbolic_shape_mul_variable_tensor(self):
     # NOTE: the buffer dim must cover the variable's vmax
@@ -157,7 +180,7 @@ class TestTensorVariable(unittest.TestCase):
     # TODO: Tensor creation from unbound variable should assert
     # with self.assertRaises(AssertionError): t = Tensor.empty(3, v)
     vb = v.bind(3)
-    t = Tensor.empty(3, vb)
+    t = Tensor.empty(3, vb).realize()
     assert t.uop.base.buffer.size == 30
     assert t.uop.shape == (3, vb)
 

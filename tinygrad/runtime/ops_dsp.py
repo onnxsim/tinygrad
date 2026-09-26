@@ -1,7 +1,7 @@
 from __future__ import annotations
 import ctypes, os, mmap, math, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
 assert sys.platform != 'win32'
-from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
+from tinygrad.device import BufferStorage, MMIOInterface, BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod

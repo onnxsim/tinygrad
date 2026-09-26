@@ -7,7 +7,7 @@ from tinygrad.uop.ops import graph_rewrite, sint, AxisType, BottomUpGate, rewrit
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.helpers import prod, getenv, dedup, all_int, DEBUG, SPLIT_REDUCEOP, DEBUG_RANGEIFY, VIZ, MAX_KERNEL_BUFFERS, SPEC
-from tinygrad.helpers import PCONTIG, FLOAT16, OPENPILOT_HACKS, argsort, partition, get_single_element
+from tinygrad.helpers import FLOAT16, OPENPILOT_HACKS, argsort, partition, get_single_element
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.codegen.opt import Opt
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, apply_movement_op
@@ -135,7 +135,7 @@ def expand_bitcast(bc:UOp) -> UOp|None:
 
 earliest_rewrites = mop_cleanup+PatternMatcher([
   # resolve FUNCTION calls (inline the body)
-  (UPat(Ops.FUNCTION, name="c"), resolve_function),
+  (UPat(Ops.STAGE, name="c"), resolve_function),
 
   # resolve TUPLE+GETTUPLE
   (UPat(Ops.GETTUPLE, src=(UPat(Ops.TUPLE, name="t"),), name="g"), lambda g,t: t.src[g.arg]),
@@ -262,7 +262,7 @@ def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
   accessed_buffers = dedup(accessed_buffers)
 
   # if this is generated from multiple buffers, don't remove this buffer
-  if len(accessed_buffers) > 3 and not (PCONTIG > 2): return None
+  if len(accessed_buffers) > 3: return None
 
   # if any reduces access a buffer, don't remove this buffer
   buffer_in_reduce = False
@@ -273,22 +273,7 @@ def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
   UOp.sink(*[x.src[0] for x in reduces]).toposort(gate=buf_gate)
   del buf_gate
   if buffer_in_reduce:
-    if PCONTIG > 2:
-      out_in_ratio = (prod(buf.shape)+1) / (sum([x.numel() for x in accessed_buffers])+1)
-      if out_in_ratio < 10: return None
-      # here we have to check the indexes, we might do a partial contig here
-      local_indexes = [x for x in indexes if x.src[0].op is Ops.STAGE and x.src[0].arg.addrspace == AddrSpace.LOCAL]
-      exclude_ranges = UOp.group(*[UOp.group(*x.src[1:]) for x in local_indexes]).ranges
-      subs = [(k,v) for k,v in zip(buf.src[1:], idx.src[1:]) if k.op is not Ops.CONST]
-      # if it's bufferized or a reduce, it's pcontig
-      is_pcontig, is_subs = partition(subs, lambda x: x[0] in exclude_ranges or any([r.arg[-1] == AxisType.REDUCE for r in x[1].ranges]))
-      if not len(is_subs):
-        return None
-      if len(is_pcontig):
-        ret = src.substitute(dict(is_subs), extra_pm=pm_gate_substitute)
-        return ret.bufferize(*[x[0] for x in is_pcontig], arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*[x[1] for x in is_pcontig])
-    else:
-      return None
+    return None
 
   # if it makes it here, the bufferize is removed
   # this is the ranges replaced
@@ -355,6 +340,12 @@ def no_indexing_calls(u:UOp):
       # everything else we pass through
       new_srcs.append(x)
   return u.replace(src=tuple(new_srcs))
+
+# the kernel graph is what gets executed: no shape views left in it, the storage of a value is just the storage
+pm_no_views = PatternMatcher([
+  (UPat((Ops.RESHAPE, Ops.SHRINK), name="v",
+        src=(UPat((Ops.AFTER, Ops.PARAM, Ops.UNSHARD, Ops.MSTACK, Ops.BUFFER, Ops.ALLOC)),), allow_any_len=True), lambda v: v.src[0]),
+])
 
 pm_no_indexing_calls = PatternMatcher([
   (UPat(Ops.CALL, name="u"), no_indexing_calls),
@@ -615,6 +606,7 @@ def get_kernel_graph(sink:UOp) -> UOp:
   tsink = graph_rewrite(tsink, pm_add_buffers+pm_add_param_range_tags, ctx=itertools.count(paramarg_start), bottom_up=True, name="stage to store")
   tsink = graph_rewrite(tsink, split_kernels, bottom_up=True, name="split kernels")
   tsink = graph_rewrite(tsink, pm_no_indexing_calls, name="remove indexing from call args")
+  tsink = graph_rewrite(tsink, pm_no_views, name="remove views from the kernel graph")
 
   if VIZ: graph_rewrite(tsink, PatternMatcher([]), name="View Kernel Graph")
   if SPEC:

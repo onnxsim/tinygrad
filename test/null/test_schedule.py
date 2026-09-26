@@ -6,7 +6,7 @@ from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo, AxisType
 from tinygrad.helpers import GlobalCounters, Context
 from tinygrad.engine.realize import run_linear, compile_linear
 from tinygrad.codegen import to_program, full_rewrite_to_sink
-from test.helpers import check_schedule, assert_kernel_count, KernelCountException
+from test.helpers import check_schedule, assert_kernel_count, KernelCountException, jit_cache_count
 
 def _realize_weights(m):
   for p in nn.state.get_parameters(m): p.realize()
@@ -15,6 +15,10 @@ class TestBufferUOp(unittest.TestCase):
   # BUFFER has a ShapeTracker of shape=(n,) and stride=(1,)
   def test_buffer_has_buffer(self):
     buf = Tensor.empty(10)
+    self.assertIs(buf.uop.op, Ops.ALLOC)
+    self.assertTrue(buf.uop.arg.bind_on_realize)
+    self.assertIsNone(buf.uop.arg.buffer)
+    buf.realize()
     self.assertIsNotNone(buf.uop.buffer)
     self.assertEqual(buf.uop.shape, (10,))
     # the device Buffer remains unallocated until it's we run the schedule
@@ -26,10 +30,18 @@ class TestBufferUOp(unittest.TestCase):
     self.assertTrue(buf.uop.buffer.is_allocated())
 
   def test_buffer_has_unique_buffer(self):
-    buf = Tensor.empty(10)
+    buf = Tensor.empty(10).realize()
     buf1 = buf.uop.buffer
     buf2 = buf.uop.buffer
     self.assertIs(buf1, buf2)
+
+  def test_empty_aliases_bind_together(self):
+    a, other = Tensor.empty(6), Tensor.empty(6)
+    b = a.reshape(2, 3)
+    self.assertIsNot(a.uop, other.uop)
+    b.realize()
+    self.assertIs(a.uop.buffer, b.uop.buffer)
+    self.assertIs(other.uop.op, Ops.ALLOC)
 
   # we also allow VIEW(BUFFER) to access the underlying device Buffer, as long as it's contiguous
   def test_buffer_view_allowed(self):
@@ -48,7 +60,7 @@ class TestBufferUOp(unittest.TestCase):
     # accessing realized will return None
     self.assertIsNone(a.uop.realized)
     # accessing Buffer will assert
-    with self.assertRaisesRegex(AssertionError, "must be BUFFER"):
+    with self.assertRaisesRegex(AssertionError, "must be a realized BUFFER"):
       a.uop.buffer # there is no BUFFER on an unrealized ADD
     # Buffer only exists once we realize it
     a.realize()
@@ -582,8 +594,8 @@ class TestSchedule(unittest.TestCase):
     p = P[0]
     p = p.pad(((1, 0), ))
     p = p.repeat([2])
-    # TODO: this should be 3 if fix store hazard worked correctly
-    check_schedule(p, 4)
+    # assign on a pending contiguous overwrites the whole value, no store hazard
+    check_schedule(p, 3)
 
   def test_conv2d(self, allowed=4, dtype=dtypes.float):
     self.enterContext(Context(DEFAULT_FLOAT=dtype))
@@ -597,6 +609,7 @@ class TestSchedule(unittest.TestCase):
   def test_conv2d_half(self): self.test_conv2d(4, dtype=dtypes.half)
 
   def test_schedule_mem_used_with_inputs(self):
+    Tensor.ones(256).contiguous().realize() # hcq2 caches the linked schedule with its buffers
     gc.collect()
     base = GlobalCounters.mem_used
     x = Tensor.ones(256).contiguous().realize()
@@ -610,7 +623,7 @@ class TestSchedule(unittest.TestCase):
         x, y, z = Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float')
         a = (x @ y).relu()
         linear = compile_linear(((a @ z).relu() + a).schedule_linear())
-        return len([call for call in linear.src if call.src[0].op is Ops.PROGRAM])
+        return jit_cache_count(linear)
 
       with Context(IMAGE=1):
         got = cnt()
@@ -626,7 +639,7 @@ class TestSchedule(unittest.TestCase):
         b16, c16 = Tensor.empty((512, 16), dtype='float'), Tensor.empty((16,), dtype='float')
         b32, c32 = Tensor.empty((512, 32), dtype='float'), Tensor.empty((32,), dtype='float')
         linear = compile_linear(Tensor.schedule_linear((rb @ b16 + c16).relu(), (rb @ b32 + c32).relu()))
-        return len([call for call in linear.src if call.src[0].op is Ops.PROGRAM])
+        return jit_cache_count(linear)
 
       with Context(IMAGE=1):
         got = cnt()
@@ -1685,6 +1698,7 @@ class TestSchedule(unittest.TestCase):
     check_schedule(out, 2)
 
   def test_schedule_mem_used(self):
+    Tensor.ones(256).contiguous().realize() # hcq2 caches the linked schedule with its buffers
     gc.collect()
     base = GlobalCounters.mem_used
     Tensor.ones(256).contiguous().realize()

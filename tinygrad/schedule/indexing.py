@@ -5,7 +5,7 @@ from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, graph_rewrite, sint, AxisType, rewrite_group, broadcast_axes
 from tinygrad.uop.ops import gate_kernel_sink
 from tinygrad.uop.symbolic import symbolic, pm_simplify_valid, pm_drop_and_clauses
-from tinygrad.helpers import argsort, all_same, cpu_profile, PCONTIG, colored, Context, SPEC
+from tinygrad.helpers import argsort, all_same, cpu_profile, colored, Context, SPEC
 
 @dataclass
 class IndexingContext:
@@ -21,9 +21,9 @@ class IndexingContext:
     return UOp.range(s, next(self.range_idx), axistype) if resolve(s!=1) else UOp.const(0)
 
 
-ALWAYS_CONTIGUOUS: set[Ops] = {Ops.CONTIGUOUS, Ops.AFTER, Ops.BUFFER,
+ALWAYS_CONTIGUOUS: set[Ops] = {Ops.AFTER, Ops.BUFFER, Ops.ALLOC,
                       Ops.CONST, Ops.MSELECT, Ops.MSTACK, Ops.PARAM,
-                      Ops.LOAD, Ops.CALL, Ops.FUNCTION}
+                      Ops.LOAD, Ops.CALL}
 
 def realize(ctx:IndexingContext, tr:UOp) -> None: ctx.realize_map[tr] = None
 
@@ -46,17 +46,16 @@ pm_generate_realize_map = PatternMatcher([
   # realize the inputs of custom kernel calls
   (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.PROGRAM)),), name="c", allow_any_len=True), realize_custom_kernel_srcs),
   # always realize
-  (UPat({Ops.CONTIGUOUS, Ops.STORE}, name="tr"), realize),
+  (UPat(Ops.STORE, name="tr"), realize),
   # realize srcs of these
   (UPat((Ops.MSELECT, Ops.MSTACK), name="rb"), realize_srcs),
-  # sometimes we need to realize the src of STORE if there's a self-access
+  # sometimes we need to realize the src of STORE if there's a self-access, or if it's a cross device store
   (UPat(Ops.STORE, src=(UPat.var("dest"), UPat.var("src"))), realize_store_after_src),
 ])
 
 @dataclass(frozen=True)
 class BufferizeOpts:
-  # on AddrSpace.LOCAL, device is the id
-  device: str|tuple[str, ...]|int|None
+  device: str|tuple[str, ...]|None
   addrspace: AddrSpace = AddrSpace.GLOBAL
   removable: bool = True
 
@@ -67,7 +66,7 @@ def broadcast_rngs(x:UOp, src:UOp, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
 
 # TODO: srcs contain (real data srcs, something else, ranges) and the boundary is confusing. see range_start
 def data_srcs(op:Ops, src:tuple[UOp, ...]) -> tuple[UOp, ...]:
-  if op in {Ops.PARAM, Ops.BUFFER, Ops.RANGE, Ops.SPECIAL}: return ()
+  if op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.RANGE, Ops.SPECIAL}: return ()
   # the store of a bound Variable only carries the input value, it has no data srcs
   if op is Ops.STORE and src[0].is_variable: return ()
   if op in GroupOp.Movement|{Ops.INDEX, Ops.STAGE, Ops.REDUCE, Ops.AFTER, Ops.END}: return src[:1]
@@ -80,7 +79,7 @@ def create_bufferize_and_index_srcs(ctx:IndexingContext, x:UOp) -> list[UOp]:
   for i, s in enumerate(x.src):
     new_src = s
     src_rngs = broadcast_rngs(x, s, ctx.range_map[x][0]) if x in ctx.range_map else ()
-    if s.op in {Ops.PARAM, Ops.BUFFER, Ops.MSTACK, Ops.MSELECT, Ops.AFTER}:
+    if s.op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.MSTACK, Ops.MSELECT, Ops.AFTER}:
       if x in ctx.range_map and i < data_src_count: new_src = new_src.index(*src_rngs)
     elif s in ctx.realize_map:
       realized_ranges = ctx.realize_map[s]
@@ -204,7 +203,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
   ending_ranges: dict[UOp, list[UOp]] = {}
   for x in reversed(tsink_toposort):
     # no ranges on kernels, they are internal
-    if x.op in {Ops.CALL, Ops.FUNCTION, Ops.LINEAR}: continue
+    if x.op in {Ops.CALL, Ops.LINEAR}: continue
 
     # AFTER doesn't have range
     if x.op is Ops.AFTER: continue
@@ -248,13 +247,12 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
         local_rngs, valids = zip(*[(r.get_idx(), r.get_valid()) for r in valid_rngs])
         rngs_valids.append((local_rngs, valids))
 
-      # TODO: in RANGEIFY > 1 all_all_same isn't required
       all_all_same = all(all_same(local_rngs) for local_rngs,_ in rngs_valids)
       _out_rngs = []
       _realize_axis = []
       for i,(local_rngs,valids) in enumerate(rngs_valids):
         # we compare the ranges without their valids
-        if all_all_same or (PCONTIG and all_same(local_rngs)):
+        if all_all_same:
           # the new valid is the OR of all the children valids
           minimum_valid = UOp.const(False).usum(valids)
           _out_rngs.append(graph_rewrite(local_rngs[0].valid(minimum_valid), symbolic, name="minimum_valid"))
@@ -268,15 +266,11 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
 
     # if this element is a reduce and there's ended ranges, we might have to end some other ranges
     if len(ending_ranges[x]) and x.op in GroupOp.Elementwise.union({Ops.REDUCE}):
-      _realize_axis = rctx.realize_map.get(x) or []
-      for i,r in enumerate(out_rngs):
-        if i in _realize_axis: continue
-        if not (PCONTIG > 1) or any(any(rr.arg > e.arg for e in ending_ranges[x]) for rr in r.ranges):
-          _realize_axis.append(i)
+      _realize_axis = list(range(len(out_rngs)))
       ending_ranges[x] = []
       if len(_realize_axis):
         rctx.realize_map[x] = _realize_axis
-        out_rngs = tuple([(rctx.new_range(x.shape[i]) if i in _realize_axis else r) for i,r in enumerate(out_rngs)])
+        out_rngs = tuple(rctx.new_range(x.shape[i]) for i in range(len(out_rngs)))
     ending_ranges[x] += broadcast_ending_ranges
 
     # TODO: some ops don't have shape, enable this after the `.st` property is removed

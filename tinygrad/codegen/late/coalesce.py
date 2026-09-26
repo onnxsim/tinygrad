@@ -1,7 +1,8 @@
 import itertools, functools
 from collections import defaultdict
+from dataclasses import replace
 from tinygrad.dtype import dtypes, AddrSpace, Invalid, DType
-from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp, shape_to_shape_arg, graph_rewrite
+from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp, graph_rewrite
 from tinygrad.uop.symbolic import uop_given_valid, parse_valid, invalid_gate, sym
 from tinygrad.helpers import getenv, IMAGE, OSX, ceildiv, is_image_shape
 from tinygrad.renderer import Renderer
@@ -91,32 +92,37 @@ def transform_to_image(ctx, buf:UOp, x:UOp) -> UOp|None:
   if len(cands) == 0: return None
   # and tiebreak with indexing complexity (ie. number of nodes)
   h, w, cidx = cands[0] if len(cands) == 1 else min(cands, key=lambda cand: len(cand[2].index(1).simplify().backward_slice))
-  buf = buf.replace(src=(shape_to_shape_arg((h, w, 4)),))
+  # the image dims are stored in the param's arg, the size stays the flat buffer len
+  buf = buf.replace(arg=replace(buf.arg, image=(h, w)))
   shapes[buf.arg.slot] = (h, w)
   if valid.op is not Ops.CONST or valid.val is not True:
     return buf.index(cidx.src[1].valid(valid), cidx.src[0].valid(valid))
   else:
     return buf.index(cidx.src[1], cidx.src[0])
 
+def store_image(x:UOp, d:UOp) -> UOp:
+  # image load/store is always float, a half image converts on store
+  def as_float(s:UOp):
+    return s.src[0] if x.src[0].dtype is dtypes.half and s.op is Ops.CAST and s.src[0].dtype is dtypes.float else s.cast(dtypes.float)
+  return x.store(UOp.stack(*[as_float(s) for s in d.src]) if d.op is Ops.STACK else as_float(d))
+
 pm_simplify_add_image = PatternMatcher([
   (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))), transform_to_image),
-  # image load/store is always float
-  (UPat(Ops.INDEX, dtype=dtypes.float, name="x").load(dtype=dtypes.half), lambda x: x.load().cast(dtypes.half)),
-  (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), lambda x,d: x.store(d.cast(dtypes.float))),
-  (UPat.var("x", dtype=dtypes.float).cast(dtypes.half).cast(dtypes.float), lambda x: x),
+  (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), store_image),
 ])
 
 def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   if getenv("DMC"): return sink
 
   # collect
-  memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp], dict[int, list[UOp]]] = defaultdict(dict)
+  memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp, object], dict[int, list[UOp]]] = defaultdict(dict)
   for u in sink.toposort():
     # TODO: this should handle images too, it's just memory coalescing
     if u.op in {Ops.LOAD, Ops.STORE}:
       assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
+      if buf.buf_uop.op is Ops.PARAM and buf.buf_uop.arg.volatile: continue # volatile accesses never merge
       # register arrays are only coalesced on the DSP, where an upcast accumulator (e.g. a vrmpy WMMA's 32 int32 lanes) is one
       # HVX register: without this every reduce iteration round-trips it through 32 scalar loads/stores
       if buf.addrspace == AddrSpace.REG and not (ctx is not None and ctx.target.device == "DSP"): continue
@@ -127,7 +133,8 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       elif idx.op is Ops.CONST and idx.val is Invalid: root_src, arg = "INVALID", 0
       elif idx.op is Ops.CONST: root_src, arg = "CONST", idx.val
       else: root_src, arg = idx, 0
-      memory[(u.op, buf, root_src, valid)].setdefault(arg, []).append(u)
+      # loads/stores only coalesce with others carrying the same arg (e.g. the nontemporal flag)
+      memory[(u.op, buf, root_src, valid, u.arg)].setdefault(arg, []).append(u)
 
   # on the DSP, don't merge loads wider than the widest contiguous store group: a wider load that consumers only use in
   # narrower slices has to be split back out of the HVX register, which LLVM does through a stack round trip
@@ -140,7 +147,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
 
   # build replacements
   replacements = {}
-  for (op,buf,base,valid),offsets in memory.items():
+  for (op,buf,base,valid,ld_arg),offsets in memory.items():
     # allowed lengths (copied in)
     lengths = []
     must_divide = True
@@ -150,8 +157,6 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       # alignment, so a group must start at a multiple of its length
       must_divide = buf.addrspace == AddrSpace.REG
     elif buf.dtype not in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and not is_image_shape(buf._shape):
-      pass
-    elif buf.addrspace == AddrSpace.REG:
       pass
     elif is_image_shape(buf._shape):
       lengths = [4]
@@ -177,7 +182,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
           store = idx.store(UOp.stack(*datas) if len(datas) > 1 else datas[0])
           for i,g in enumerate(grp): replacements[offsets[g][0]] = store
         else:
-          ld = idx.load()
+          ld = idx.load(arg=ld_arg)
           for i,g in enumerate(grp):
             for oo in offsets[g]:
               replacements[oo] = ld.index(i) if len(grp) > 1 else ld

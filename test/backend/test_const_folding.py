@@ -34,7 +34,7 @@ class TestMovedConstFolding(unittest.TestCase):
 
   def test_copy_padded_const(self):
     schedule = Tensor.ones(4, buffer=False).pad(((1, 1),)).to("CPU:1").schedule_linear()
-    assert not any(si.src[0].op is Ops.COPY for si in schedule.src), "const copy should be folded"
+    assert not any(si.src[0].op is Ops.STORE for si in schedule.src), "const copy should be folded"
     np.testing.assert_equal(Tensor.ones(4, buffer=False).pad(((1, 1),)).to("CPU:1").numpy(), [0, 1, 1, 1, 1, 0])
 
   def test_cast_padded(self):
@@ -84,10 +84,10 @@ class TestReduceOpsConstFolding(unittest.TestCase):
       np.testing.assert_equal(reduceop((Tensor.randn(shape:=(0, 1))+1).realize()).numpy(), reduceop(np.empty(shape)))
 
   def test_zero_size_realize_folded(self):
-    # non contiguous folded output doesn't realize
+    # folded output doesn't realize on its own
     _check_ast_count(0, Tensor.empty(1, 0).sum())
-    # contiguous folded const can still schedule
-    a = Tensor.empty(1, 0).sum().contiguous()
+    # explicit storage of the folded const still schedules, and the value is usable
+    a = Tensor.empty(1, 0).sum().clone()
     _check_ast_count(2, a+2)
     self.assertIs(a.uop.base.op, Ops.BUFFER)
     np.testing.assert_equal((Tensor.empty(1, 0).sum().contiguous()+2).numpy(), 2)

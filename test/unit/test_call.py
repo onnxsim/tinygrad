@@ -1,8 +1,11 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, function
+from tinygrad import Tensor, function, Device
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, Ops
+from tinygrad.uop.ops import UOp, Ops, KernelInfo
+from tinygrad.tensor import transform_to_call
+
+def sched_key(t:Tensor): return transform_to_call(UOp.sink(t.uop))[0].src[0].key
 
 class TestCall(unittest.TestCase):
   def test_call_plus(self):
@@ -51,6 +54,11 @@ class TestCall(unittest.TestCase):
 
     np.testing.assert_allclose(a.grad.numpy(), gt_a_grad, rtol=1e-5)
     np.testing.assert_allclose(b.grad.numpy(), gt_b_grad, rtol=1e-5)
+
+  def test_call_scalar_param_shape_mismatch(self):
+    scalar_fxn = UOp.param(0, dtypes.float, ()) * 2
+    with self.assertRaisesRegex(TypeError, "shape mismatch: expected scalar"):
+      Tensor.call(Tensor.ones(2), fxn=scalar_fxn).realize()
 
   def test_call_gemm(self):
     M, K, N = 4, 8, 4
@@ -136,6 +144,33 @@ class TestCallShape(unittest.TestCase):
     self.assertEqual(shape[0], sz.bind(5))
 
 class TestCallSchedule(unittest.TestCase):
+  def test_precompile_slice_assign(self):
+    @function(precompile=True)
+    def f(x:Tensor) -> Tensor: return x * 2 + 1
+    a = Tensor.arange(8).float().realize()
+    cache = Tensor.zeros(16)
+    # the output must land at the slice offset, not at the start of the base buffer
+    cache[4:12].assign(f(a)).realize()
+    np.testing.assert_equal(cache.numpy(), np.concatenate([np.zeros(4), np.arange(8)*2+1, np.zeros(4)]).astype(np.float32))
+
+  def test_precompile_slice_assign_2d(self):
+    @function(precompile=True)
+    def f(x:Tensor) -> Tensor: return x + 1
+    a = Tensor.arange(8).reshape(2, 4).float().realize()
+    big = Tensor.zeros(4, 8)
+    big[1:3, 2:6].assign(f(a)).realize()
+    ref = np.zeros((4, 8), dtype=np.float32)
+    ref[1:3, 2:6] = np.arange(8).reshape(2, 4) + 1
+    np.testing.assert_equal(big.numpy(), ref)
+
+  def test_precompile_full_buffer_assign(self):
+    @function(precompile=True)
+    def f(x:Tensor) -> Tensor: return x * 2 + 1
+    a = Tensor.arange(8).float().realize()
+    cache = Tensor.zeros(8).realize()
+    cache.assign(f(a)).realize()
+    np.testing.assert_equal(cache.numpy(), np.arange(8)*2+1)
+
   def test_reshape_precompile(self):
     a = Tensor.empty(4, 8).realize()
     a = a.reshape(4,4,2).assign(Tensor.empty(4,4,2)).reshape(8,4)
@@ -160,6 +195,38 @@ class TestCallSchedule(unittest.TestCase):
     @function(precompile=True)
     def s(x): return x*2
     s(s(a).contiguous()).realize()
+
+  def test_contiguous_call_output_realizes_aliases(self):
+    def increment(x:UOp):
+      i = UOp.range(x.shape[0], 0)
+      return x[i].store(x[i].load() + 1).end(i).sink(arg=KernelInfo(name="increment"))
+
+    for precompile in (False, True):
+      for reshape in (False, True):
+        with self.subTest(precompile=precompile, reshape=reshape):
+          @function(precompile=precompile)
+          def f(x:Tensor): return x.custom_kernel(fxn=increment)[0]
+          state = Tensor([1., 2.]).realize()
+          a = f(state)
+          alias = a.reshape(1, 2)
+          b = (alias if reshape else a).contiguous().realize()
+          self.assertEqual(b.flatten().tolist(), [2., 3.])
+          a.realize(alias)
+          self.assertEqual(state.tolist(), [2., 3.])
+          self.assertIs(a.uop.buffer, b.uop.buffer)
+          self.assertIs(alias.uop.buffer, b.uop.buffer)
+          b.assign([9., 10.]).realize()
+          self.assertEqual(a.tolist(), [9., 10.])
+          self.assertEqual(alias.tolist(), [[9., 10.]])
+
+  def test_assign_call_output_to_input(self):
+    for precompile in (False, True):
+      with self.subTest(precompile=precompile):
+        @function(precompile=precompile)
+        def f(x:Tensor): return x.flip(0).contiguous()
+        a = Tensor.arange(1024).clone().realize()
+        a.assign(f(a)).realize()
+        self.assertEqual(a.tolist(), list(reversed(range(1024))))
 
   def test_call_double_gemm(self):
     a = Tensor.randn(4, 8)
@@ -218,9 +285,7 @@ class TestCallSchedule(unittest.TestCase):
     a = Tensor.ones(3)
     x = f(a, UOp.variable("scale_a", 1, 100).bind(2))
     y = f(a, UOp.variable("scale_b", 1, 100).bind(3))
-    fx = next(u for u in x.uop.toposort() if u.op is Ops.FUNCTION)
-    fy = next(u for u in y.uop.toposort() if u.op is Ops.FUNCTION)
-    self.assertEqual(fx.src[0].key, fy.src[0].key)
+    self.assertEqual(sched_key(x), sched_key(y))
     np.testing.assert_equal(x.numpy(), [2, 2, 2])
     np.testing.assert_equal(y.numpy(), [3, 3, 3])
 
@@ -240,17 +305,48 @@ class TestCallSchedule(unittest.TestCase):
     np.testing.assert_equal(cache.numpy()[8:], np.zeros(8))
 
   def test_precompile_schedule_cache_hit(self):
-    """two instances of the same @function should produce identical function body keys (schedule cache hit)"""
+    """two instances of the same @function should produce identical scheduled function keys without aliasing their outputs"""
     @function(precompile=True)
     def f(x:Tensor) -> Tensor: return x + Tensor.full(x.shape, -1.0)
     a = Tensor.empty(4, 8)
     b = Tensor.empty(4, 8)
     r0, r1 = f(a), f(b)
-    # find the FUNCTION nodes
-    c0 = next(u for u in r0.uop.toposort() if u.op is Ops.FUNCTION)
-    c1 = next(u for u in r1.uop.toposort() if u.op is Ops.FUNCTION)
-    # the function bodies (src[0]) should have identical keys
-    self.assertEqual(c0.src[0].key, c1.src[0].key)
+    c0 = next(u for u in r0.uop.toposort() if u.op is Ops.CALL and u.arg.precompile)
+    c1 = next(u for u in r1.uop.toposort() if u.op is Ops.CALL and u.arg.precompile)
+    self.assertTrue(c0.has_unbound_outputs)
+    self.assertTrue(c1.has_unbound_outputs)
+    # output identities stay unique per call; they canonicalize only when combined into a scheduling scope
+    self.assertIsNot(c0.src[-1], c1.src[-1])
+    self.assertEqual(sched_key(r0), sched_key(r1))
+
+  def test_precompile_nested(self):
+    for precompile in (False, True):
+      for devices in (None, ("CPU:0", "CPU:1")):
+        with self.subTest(precompile=precompile, devices=devices):
+          @function(precompile=True, precompile_backward=True)
+          def inner(x:Tensor): return x * 2, x + 3
+          @function(precompile=precompile, precompile_backward=True)
+          def outer(x:Tensor):
+            a, b = inner(x)
+            return a + b
+          x = Tensor([1., 2., 3., 4.]).realize()
+          if devices is not None: x = x.shard(devices, axis=0).realize()
+          out = outer(x)
+          for call in (u for u in out.uop.toposort() if u.op is Ops.CALL):
+            self.assertFalse(any(b.op is Ops.BUFFER for b in call.body.toposort()))
+          self.assertEqual(sched_key(out), sched_key(outer(x)))
+          out.sum().backward()
+          np.testing.assert_equal(out.numpy(), [6., 9., 12., 15.])
+          np.testing.assert_equal(x.grad.numpy(), [3., 3., 3., 3.])
+
+  def test_precompile_consumes_call_output(self):
+    """a precompiled function consuming the output of a non-precompiled function"""
+    @function
+    def inner(x:Tensor) -> Tensor: return x * 2
+    @function(precompile=True)
+    def outer(x:Tensor) -> Tensor: return x + 1
+    x = Tensor.arange(8).float().contiguous().realize()
+    np.testing.assert_equal(outer(inner(x)).numpy(), np.arange(8, dtype=np.float32) * 2 + 1)
 
   def test_precompile_symbolic_2d(self):
     """precompile with symbolic shapes in 2D (tests debuf reshape with symbolic PARAM)"""
@@ -270,6 +366,69 @@ class TestCallSchedule(unittest.TestCase):
     a = Tensor.arange(8).reshape(4, 2).float().clone().shard(devs, axis=0)
     out = f(a) + 2
     np.testing.assert_allclose(out.numpy(), np.arange(8, dtype=np.float32).reshape(4, 2) + 3)
+
+class TestArgOrder(unittest.TestCase):
+  """outputs can appear anywhere in a call's srcs (output_pos): slots are src positions, nothing reorders"""
+  def _dev(self, x): return x.device if isinstance(x.device, str) else (x.device or (Device.DEFAULT,))[0]
+  def make_intersperse_call(self, x, precompile=False):
+    # the output is at position 0, the input (param slot 1) at position 1 in the call's args
+    val = UOp.param(1, x.dtype, x.shape, self._dev(x)).reshape(x.shape) * 2
+    return UOp.call_with_outputs((val,), x.uop, name='t', output_pos=(0,), precompile=precompile)
+
+  def test_intersperse_returned(self):
+    x = Tensor.arange(3, dtype=dtypes.int).realize()
+    outs = self.make_intersperse_call(x)
+    out = Tensor(outs[0], device=x.device) + 1
+    np.testing.assert_equal(out.numpy(), [1, 3, 5])
+
+  def test_outputs_arbitrary_order(self):
+    x = Tensor([1.0, 2.0, 3.0])
+    y = Tensor([4.0, 5.0, 6.0])
+    x.requires_grad = True
+    y.requires_grad = True
+    x, y = x.realize(), y.realize()
+    dev = self._dev(x)
+    # args (out0, in0, out1, in1): outputs at positions 0 and 2, input params slotted at their final positions 1 and 3
+    p1, p3 = UOp.param(1, x.dtype, x.shape, dev), UOp.param(3, y.dtype, y.shape, dev)
+    outs = UOp.call_with_outputs((p1.reshape(x.shape) * 2, p3.reshape(y.shape) + p1.reshape(y.shape)), x.uop, y.uop,
+                                 output_pos=(0, 2))
+    np.testing.assert_equal(Tensor(outs[0]).numpy(), [2, 4, 6])
+    np.testing.assert_equal(Tensor(outs[1]).numpy(), [5, 7, 9])
+    # the auto gradient path (no grad_fxn) resolves outputs and gradients positionally at any position
+    (Tensor(outs[0]).sum() + Tensor(outs[1]).sum()).backward()
+    np.testing.assert_equal(x.grad.numpy(), [3, 3, 3])
+    np.testing.assert_equal(y.grad.numpy(), [1, 1, 1])
+
+  def test_output_pos_symbolic_shape(self):
+    # symbolic output shapes resolve against the final arg slots, not the input order (PARAM(2) in the shape, output at 0)
+    x = Tensor.empty(8).realize()
+    sz = UOp.variable('sz', 1, 8)
+    dev = self._dev(x)
+    p1, p2 = UOp.param(1, x.dtype, x.shape, dev), sz.param_like(2)
+    value = p1.reshape(x.shape).shrink_to((p2,))
+    bound = sz.bind(5)
+    outs = UOp.call_with_outputs((value,), x.uop, bound, output_pos=(0,))
+    # the minted output's shape substituted PARAM(2) with the bind arg from position 2 in the arg list
+    shp = outs[0].shape[0]
+    self.assertIsInstance(shp, UOp)
+    self.assertNotEqual(shp.op, Ops.PARAM)
+    self.assertEqual(shp, bound)
+
+  def test_output_pos_must_be_ascending(self):
+    x = Tensor.arange(3, dtype=dtypes.int).realize()
+    p1 = UOp.param(1, x.dtype, x.shape, self._dev(x))
+    with self.assertRaises(AssertionError):
+      UOp.call_with_outputs((p1.reshape(x.shape) * 2, p1.reshape(x.shape) + 1), x.uop, output_pos=(1, 0))
+
+  def test_intersperse_returned_gradient(self):
+    x = Tensor([1.0, 2.0, 3.0]).realize()
+    x.requires_grad = True
+    p1 = UOp.param(1, dtypes.float, x.shape, self._dev(x))
+    val = p1.reshape(x.shape) * p1.reshape(x.shape)
+    outs = UOp.call_with_outputs((val,), x.uop, name='t', output_pos=(0,))
+    y = Tensor(outs[0], device=x.device)
+    y.sum().backward()
+    np.testing.assert_equal(x.grad.numpy(), [2, 4, 6])
 
 class TestCallMultiSharded(unittest.TestCase):
   # TODO: multi-output + sharded needs per-device CALL execution, which requires reworking how MULTI propagates through TUPLE bodies

@@ -15,6 +15,16 @@ class TestFunction(unittest.TestCase):
     b = Tensor([4,5,6])
     np.testing.assert_equal(f(a,b).numpy(), [5,7,9])
 
+  def test_two_return(self, precompile=False):
+    @function(precompile=precompile)
+    def f(a:Tensor, b:Tensor) -> tuple[Tensor, Tensor]:
+      return (a+b, (a+b)*2)
+    a = Tensor([1,2,3])
+    b = Tensor([4,5,6])
+    c = f(a,b)
+    np.testing.assert_equal((c[0]+c[1]).numpy(), [5*3,7*3,9*3])
+  def test_two_return_precompiled(self): self.test_two_return(True)
+
   def test_simple_same(self):
     @function
     def f(a:Tensor, b:Tensor) -> Tensor: return a+b
@@ -174,13 +184,13 @@ class TestFunction(unittest.TestCase):
   def test_name(self):
     @function
     def f(a:Tensor) -> Tensor: return a + 1
-    assert f(Tensor([1])).uop.src[0].arg.name.endswith("f")
+    assert f(Tensor([1])).uop.src[1].arg.name.endswith("f")
 
   def test_method_name(self):
     class Foo:
       @function
       def __call__(self, x:Tensor) -> Tensor: return x + 1
-    assert Foo()(Tensor([1])).uop.src[0].arg.name.endswith("Foo.__call__")
+    assert Foo()(Tensor([1])).uop.src[1].arg.name.endswith("Foo.__call__")
 
   def test_callable_instance(self):
     class Foo:
@@ -189,7 +199,7 @@ class TestFunction(unittest.TestCase):
     foo = Foo()
     f = function(foo, allow_implicit=True)
     np.testing.assert_equal(f(Tensor([1,2,3])).numpy(), [11,22,33])
-    assert f(Tensor([1,2,3])).uop.src[0].arg.name.endswith("Foo")
+    assert f(Tensor([1,2,3])).uop.src[1].arg.name.endswith("Foo")
 
   def test_iadd(self):
     @function
@@ -425,6 +435,15 @@ class TestFunctionTuple(unittest.TestCase):
     np.testing.assert_allclose(x.grad.numpy(), [1., 1., 1.])
     np.testing.assert_allclose(y.grad.numpy(), [1., 1., 1.])
 
+  def test_grad_fxn_more_outputs_than_inputs(self):
+    def grad_fxn(grad:UOp, call:UOp): return (grad,)
+
+    x = Tensor([2.]).contiguous()
+    @function(grad_fxn=grad_fxn)
+    def f(x:Tensor): return (x+1, x+2)
+    _, y = f(x)
+    self.assertEqual(y.sum().gradient(x)[0].item(), 1.0)
+
   def test_grad_unused_tuple_output_recursive(self):
     # only one output is used
     @function(precompile=True, precompile_backward=True)
@@ -516,9 +535,10 @@ class TestFunctionTuple(unittest.TestCase):
     Tensor.realize(a)
     c = f(a)
 
-    if count_kernels(c) != 1: raise KernelCountException(1, count_kernels(c))
-
+    # Build gradients before scheduling replaces the forward graph with its output buffers.
     c.sum().backward()
+    if (cnt := count_kernels(c)) != 1: raise KernelCountException(1, cnt)
+
     Tensor.realize(a.grad)
     np.testing.assert_allclose(a.grad.numpy(), [2., 2., 2., 2.])
 
@@ -542,20 +562,35 @@ class TestFunctionTuple(unittest.TestCase):
     np.testing.assert_allclose(f(a).numpy(), 14.0)
 
     # g is f with empty output instead of invalids
-    @function(precompile=True, allow_implicit=True)
+    @function(precompile=True, allow_implicit=False)
     def g(a:Tensor):
       c = Tensor(Tensor.empty(a.shape[0]//len(devs), a.shape[1], dtype=a.dtype, device=devs).uop.unshard(0), device=devs)
       return Tensor.custom_kernel(c, a, fxn=double_kernel, grad_fxn=double_grad)[0]
 
     np.testing.assert_allclose(g(a).numpy(), 14.0)
 
+  def test_custom_kernel_empty_is_local(self):
+    def write(C:UOp, A:UOp) -> UOp:
+      i = UOp.range(A.shape[0], 0)
+      return C[i].store(A[i] * 2.0).end(i).sink(arg=KernelInfo(name="write"))
+    for precompile in (False, True):
+      with self.subTest(precompile=precompile):
+        @function(precompile=precompile, allow_implicit=False)
+        def f(a:Tensor): return Tensor.custom_kernel(Tensor.empty_like(a), a, fxn=write)[0]
+        a, b = f(Tensor([1., 2.])), f(Tensor([3., 4.]))
+        Tensor.realize(a, b)
+        self.assertEqual(a.tolist(), [2., 4.])
+        self.assertEqual(b.tolist(), [6., 8.])
+        self.assertIsNot(a.uop.buffer, b.uop.buffer)
+
   def test_custom_kernel_inplace_output_is_implicit(self):
-    # a custom_kernel output the kernel also READS (in-place add) is not write-only, so it must be captured as an input
+    # caller-owned storage must be captured, even before its Buffer is bound
+    state = Tensor.empty(4)
     def inplace_add(C:UOp, A:UOp) -> UOp:
       i = UOp.range(A.shape[0], 0)
       return C[i].store(C[i].load() + A[i]).end(i).sink(arg=KernelInfo(name="inplace_add"))
     @function(precompile=True, allow_implicit=False)
-    def f(a:Tensor): return Tensor.custom_kernel(Tensor.empty(*a.shape, dtype=a.dtype, device=a.device), a, fxn=inplace_add)[0]
+    def f(a:Tensor): return Tensor.custom_kernel(state, a, fxn=inplace_add)[0]
     with self.assertRaisesRegex(RuntimeError, "implicit buffer"): f(Tensor([1., 2., 3., 4.]).contiguous().realize())
 
   def test_custom_kernel_write_only_persistent_output_is_implicit(self):
@@ -563,11 +598,14 @@ class TestFunctionTuple(unittest.TestCase):
     def write(C:UOp, A:UOp) -> UOp:
       i = UOp.range(A.shape[0], 0)
       return C[i].store(A[i] * 2.0).end(i).sink(arg=KernelInfo(name="write"))
-    state = Tensor([100., 200., 300., 400.], device="CPU").contiguous().realize()
-    @function(precompile=True, allow_implicit=True)
-    def f(a:Tensor): return Tensor.custom_kernel(state, a, fxn=write)[0]
-    f(Tensor([1., 2., 3., 4.], device="CPU").contiguous().realize()).realize()
-    np.testing.assert_allclose(state.numpy(), [2., 4., 6., 8.])
+    for realize in (False, True):
+      with self.subTest(realize=realize):
+        state = Tensor.empty(4, device="CPU")
+        if realize: state.realize()
+        @function(precompile=True, allow_implicit=True)
+        def f(a:Tensor): return Tensor.custom_kernel(state, a, fxn=write)[0]
+        f(Tensor([1., 2., 3., 4.], device="CPU").contiguous().realize()).realize()
+        np.testing.assert_allclose(state.numpy(), [2., 4., 6., 8.])
 
   def test_custom_kernel_program_invalids_not_captured(self):
     # llama FP8 kernels are PROGRAM with bare-buffer sinks (no analyzable stores), so the invalids scratch
@@ -578,7 +616,7 @@ class TestFunctionTuple(unittest.TestCase):
       sink = UOp.sink(C.base, A.base, arg=KernelInfo(name="k"))
       return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)),
                                    UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)),
-                 arg=ProgramInfo(name="k", global_size=(1, 1, 1), local_size=(1, 1, 1), globals=(0, 1)))
+                 arg=ProgramInfo(global_size=(1, 1, 1), local_size=(1, 1, 1), globals=(0, 1)))
 
     @function(precompile=True)
     def f(a:Tensor):

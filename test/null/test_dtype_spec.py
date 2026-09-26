@@ -71,10 +71,10 @@ class TestHelpers(unittest.TestCase):
   def test_dtype_range(self):
     for dt in core_dtypes:
       if dtypes.is_float(dt):
-        np.testing.assert_equal(dt.min, -math.inf)
-        np.testing.assert_equal(dt.max, math.inf)
-        np.testing.assert_equal(dt.min, -math.inf)
-        np.testing.assert_equal(dt.max, math.inf)
+        # e4m3 and the fnuz fp8s have no inf: their range ends at the largest normal
+        finite = {dtypes.fp8e4m3: FP8E4M3_MAX, dtypes.fp8e4m3fnuz: 240.0, dtypes.fp8e5m2fnuz: FP8E5M2_MAX}
+        self.assertEqual(dt.min, -finite.get(dt, math.inf))
+        self.assertEqual(dt.max, finite.get(dt, math.inf))
       elif dtypes.is_int(dt):
         info = np.iinfo(_to_np_dtype(dt))
         np.testing.assert_equal(dt.min, info.min)
@@ -419,7 +419,7 @@ class TestAutoCastType(unittest.TestCase):
     self.check_where_alternate_input_other(3, True, dtypes.weakint)
 
   def test_where_non_bool_cond_raises(self):
-    with self.assertRaises(RuntimeError): Tensor([1, 0, 2]).where(1, 0)
+    with self.assertRaises(RuntimeError): Tensor([1, 0, 2]).where(1, 0).dtype
     self.check_where_alternate_input_other(False, True, dtypes.bool)
 
   @given(strat.sampled_from(core_dtypes), strat.sampled_from(core_dtypes))
