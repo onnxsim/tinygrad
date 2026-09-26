@@ -1,0 +1,21 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+/* Golden-tile capture for mb_hvx.h's three steps, on V69. The inputs are fixed tile-layout blobs
+ * (mcc_case.py) and the outputs are the bytes the phone computes for them; test_mcc.py compares tinygrad's
+ * lowering of the same steps against those bytes. `goldens` is how they were captured (commit, phone,
+ * mcc_golden_client's stdout, the float64 references' commit). */
+interface mcc_golden_rpc : remote_handle64 {
+  // bit 0 turbo, bit 1 HMX power vote (the layout helpers do not need HMX, but the call site is shared
+  // with mcc_hmx_rpc and the vote is what makes the DSP run at its best corner)
+  long perf_vote(in long flags, rout long rc);
+  // steps: bit 0 layernorm, bit 1 softmax, bit 2 gelu. x (rt x MB_KT tiles) -> h; s (rt x 8 tiles) + q, k, pv
+  // (rt tiles each) -> spv (the P tiles) and pvout (the p_self tiles); g (nt tiles) -> gout (GELU is in
+  // place, so the skel copies the result out before it restores the input). Every step is a separate
+  // output, so one golden is one skel call's output, and `it` repeats it on the same inputs (the qfloat
+  // rounding is data-independent, so the goldens are stable run to run: the case says how many repeats
+  // there were).
+  long run(in long steps, in long rt, in long nt, in long it, in sequence<uint16> x, in sequence<uint16> s,
+           in sequence<uint16> q, in sequence<uint16> k, in sequence<uint16> g, in sequence<uint16> ln,
+           rout sequence<uint16> h, rout sequence<uint16> spv, rout sequence<uint16> gout,
+           rout sequence<uint16> pvout, rout sequence<uint64> times, rout sequence<long> codes);
+};

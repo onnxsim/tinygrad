@@ -1,0 +1,13 @@
+{
+  "rt": 4,
+  "nt": 4,
+  "rows": 128,
+  "seen": 197,
+  "seed": 0,
+  "x0": "/mnt/data/cache/claude-work/mcc_hmx/q128/x0.bin",
+  "source_commit": "fc010b7b1",
+  "tile_bytes": 2048,
+  "scale2": 0.25503486164919736,
+  "eps": 1e-06,
+  "goldens": null
+}
