@@ -9,10 +9,11 @@ name: Hexagon DSP (qemu-hexagon + hexagon-sim)
 #   1. dsp-render    test/unit/test_dsp_render.py -- renders the DSP kernels and checks the emitted C source.
 #                     No toolchain at all (the tests stub the compiler), so it is fast and always available.
 #   2. dsp-oracles   test/external/dsp/ -- the hand-written Hexagon kernels kept as tinygrad oracles, and the
-#                     whole-graph QDQ lowering. Needs clang (MOCKDSP) + the Hexagon open-access toolchain for
-#                     hexagon-sim; without it the tests skip themselves, which this job tolerates but reports.
-#   3. dsp-hexsim    the same oracle tests with the toolchain required -- the expensive one (hexagon-sim runs
-#                     every captured kernel), so it is separated and allowed to be slower.
+#                     whole-graph QDQ lowering, run under qemu-hexagon with MOCKDSP. The hand drivers need the
+#                     toolchain's target headers and libgcc.a even under qemu, so the toolchain is installed
+#                     here too; what distinguishes this tier is that nothing needs hexagon-sim to execute.
+#   3. dsp-hexsim    the same oracle tests with hexagon-sim actually executing them (-mv69 --mhmx 1). The
+#                     expensive one, and the only tier that exercises the simulator at all.
 #
 # Tiers 1 and 2 are separate jobs on purpose: the two suites are order-dependent (running them in one
 # pytest process fails 22 oracle tests that pass on their own -- see test/external/dsp/hand/ORDERING.md), so
@@ -88,9 +89,10 @@ jobs:
       - uses: ./.github/actions/llvm-hexagon
       - name: Install test dependencies
         run: python -m pip install numpy pytest onnx onnxruntime
-      # No hexagon-toolchain action here: this tier is the qemu one. The hand kernels are built for
-      # hexagonv65 and run under qemu-hexagon, so the Qualcomm toolchain is not needed - the tests that
-      # want it skip themselves, and dsp-hexsim below runs those with it. Cheap tier, so it goes first.
+      # The toolchain IS needed here, contrary to what this job's comment said a moment ago: the hand
+      # oracle drivers #include the toolchain's target headers (hexagon_types.h, hvx_hexagon_protos.h)
+      # and link its libgcc.a, so without it they fail to build rather than skipping. Found by CI.
+      - uses: ./.github/actions/hexagon-toolchain
       - name: Run the DSP oracle tests
         shell: bash  # -o pipefail: the default `bash -e` would let tee swallow pytest's exit code
         # CC and HEXAGON_CLANG come from the llvm-hexagon action, which probes for a clang that can
