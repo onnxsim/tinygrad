@@ -46,15 +46,23 @@ import pytest
 # Hexagon target that cannot link standalone (the mock has no __extendhfsf2 and no QuRT). This test is the
 # other kind: its oracle is the *phone's* bytes, not a rendered kernel, so it needs the host device.
 #
-# That cannot be arranged at module scope. hand/conftest.py runs first and has already set DEV=DSP, and
-# tinygrad reads DEV once, when it is first imported - which any earlier test module in the same process may
-# already have done. So the device is requested here, honoured if it takes effect, and checked below: if
-# something else won the race the tests skip rather than failing on a device they cannot use. Running this
-# file on its own (`pytest test/external/dsp/hand/mcc`) always gets the host.
+# It cannot ask for one here. hand/conftest.py runs first and has already set DEV=DSP, and tinygrad reads
+# DEV once, when it is first imported. Setting it again at module scope is worse than useless: if this file
+# happens to be collected before the conftest, `setdefault("DEV", "CPU")` sticks and every *other* oracle in
+# the same process then runs on the host with MOCKDSP=1 still set - which is how the CI run got 49 failures
+# with `FileNotFoundError: '/dev/ion'`, the real-phone path's dma-buf allocator, which does not exist on a
+# runner. So this file states no preference and instead checks below, skipping with that reason if it did
+# not get the host. Run it on its own (`pytest test/external/dsp/hand/mcc`) and it always does.
 os.environ.setdefault("MCC_TEST_DEVICE", "CPU")
-os.environ.setdefault("DEV", "CPU")
-os.environ.pop("MOCKDSP", None)
-os.environ.pop("DEV_MOCKDSP", None)
+# Deliberately does NOT pop MOCKDSP, and does not touch DEV. Both are process-global and tinygrad
+# reads them once, at first import: clearing MOCKDSP here (as an earlier version of this file did)
+# silently un-mocked the *other* oracles whenever this module was collected before them, which broke
+# hand/layout with "FileNotFoundError: '/dev/ion'" - the real-phone path's dma-buf allocator, which
+# exists on a device and not on a CI runner. 49 tests failed that way.
+#
+# The check below is the whole mechanism: if this file did not get the host device, it skips with that
+# reason. Run it on its own (`pytest test/external/dsp/hand/mcc`) and it always does, because nothing
+# else has set DEV by then.
 os.environ.setdefault("FLOAT_REASSOC", "0")  # a plain host float reassociation would change the qf32 sums
 
 import mcc_case as MC  # noqa: E402
@@ -64,8 +72,8 @@ from tinygrad import Device, Tensor  # noqa: E402
 pytestmark = pytest.mark.skipif(
   Device.DEFAULT != os.environ["MCC_TEST_DEVICE"],
   reason=(f"these lowerings must run on {os.environ['MCC_TEST_DEVICE']}, but tinygrad came up on "
-          f"{Device.DEFAULT}: hand/conftest.py sets DEV=DSP and wins the import race in a mixed run. "
-          f"Run this file on its own, or set MCC_TEST_DEVICE."),
+          f"{Device.DEFAULT}: hand/conftest.py sets DEV=DSP for the other oracles and wins the import "
+          f"race. Run this file on its own, or set MCC_TEST_DEVICE."),
 )
 
 HERE = Path(__file__).resolve().parent
