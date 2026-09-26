@@ -47,6 +47,13 @@ runs:
         for v in 19 18 17 20; do
           sudo apt-get install -y --no-install-recommends "clang-$v" || echo "clang-$v unavailable, skipping"
         done
+        # The apt.llvm.org packages install into /usr/lib/llvm-N/bin and put only versioned symlinks
+        # in /usr/bin. That is enough for the probe below, but the oracle harnesses resolve their
+        # compiler with shutil.which(CC) and would not find it, so every HMX test would skip itself
+        # with "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang" while the toolchain is present.
+        for v in 20 19 18 17 16 15; do
+          [ -d "/usr/lib/llvm-$v/bin" ] && echo "/usr/lib/llvm-$v/bin" >> "$GITHUB_PATH"
+        done
 
     - name: Select a clang that can target hexagonv65
       shell: bash
@@ -56,12 +63,18 @@ runs:
           echo 'int main(void){return 0;}' | "$1" --target=hexagon -mcpu=hexagonv65 \
             -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null - 2>/dev/null
         }
+        # CC is set to an absolute path on purpose. The oracle harnesses resolve the compiler with
+        # shutil.which(CC), and the apt.llvm.org packages' versioned symlinks are not reliably on PATH
+        # (they live in /usr/lib/llvm-N/bin, with only some of them in /usr/bin). A bare "clang-20" in
+        # CC would then fail to resolve, and every HMX test would skip itself with
+        # "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang" while the toolchain is right there.
         found=""
-        for c in clang-20 clang-19 clang-18 clang-17 clang-16 clang-15 /usr/lib/llvm-19/bin/clang; do
-          command -v "$c" > /dev/null 2>&1 || [ -x "$c" ] || continue
-          if probe "$c"; then
-            echo "::notice::$c can target hexagonv65"
-            [ -n "$found" ] || found="$c"
+        for c in clang-20 clang-19 clang-18 clang-17 clang-16 clang-15; do
+          p="$(command -v "$c" 2>/dev/null || true)"
+          [ -n "$p" ] || continue
+          if probe "$p"; then
+            echo "::notice::$c ($p) can target hexagonv65"
+            [ -n "$found" ] || found="$p"
           else
             echo "::notice::$c cannot target hexagonv65, skipping"
           fi
@@ -73,6 +86,7 @@ runs:
         {
           echo "HEXAGON_CLANG_FOUND=$found"
           # DSPCompiler reads CC; the hand-kernel harness reads HEXAGON_CLANG, then falls back to CC.
+          # Both get the absolute path (hexsim.mockdsp_ok does shutil.which on it).
           echo "CC=$found"
           echo "HEXAGON_CLANG=$found"
         } >> "$GITHUB_ENV"
