@@ -534,6 +534,7 @@ static inline void __hmx_pack2(__fp16* dst, const __fp16* r0, const __fp16* r1) 
 #ifndef __HMX_CONV
 #define __HMX_CONV
 """ + _HMX_REF_CONV + r"""#endif
+@RQSTUB@
 static __fp16 __hmx_ra[2][1024] __attribute__((aligned(128))), __hmx_rb[2][1024] __attribute__((aligned(128)));
 static __fp16 __hmx_ro[1024] __attribute__((aligned(128)));
 static double __hmx_racc[1024];
@@ -995,11 +996,35 @@ __attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __
 __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
     const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo, __hmx_u32x32* fl) {
   const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
+  __hmx_i32x32 x0 = a[0] + b, x1 = a[1] + b, x2 = a[2] + b, x3 = a[3] + b;
+#if HMX_RQ_STUB
+  /* HMX_RQ_STUB is a measurement build, not a mode: it replaces the ORT-exact requantization
+     arithmetic (the per-lane normalization, the 24x24 product, the tie window) with a plain
+     saturating pack of the accumulator, leaving the bias add, the |acc| > 2^24 flag, the two packs
+     and the four stores alone. So the difference from the real build is the price of the
+     requantization itself.
+
+     Measured on the phone (Xiaomi 12S, ResNet-18 QDQ, HMX_VTCM_KB=4096), both arms built from
+     this tree back to back: 22,328.6 us with the real requant and 22,277.0 with the stub, so the
+     requantization costs **52 us, 0.2% of the graph**. That is far less than the HMX README's
+     bisection of the 3x3 family suggests (~48% of that family) and means QC_FAST's host-table
+     rewrite is not worth its accuracy cost on this graph - the epilogue's cost is the stores and
+     the flag reduction, which the stub keeps.
+
+     Two earlier attempts to measure this were wrong and are recorded so they are not repeated:
+     HMX_RQ=0 drops the epilogue, the rewrite bails and the kernel falls back to scalar (24x
+     slower), and HMX_RQ_PROBE skips the requantize *rows*, which reshapes the addq folding and
+     store chain and came out *slower* than the baseline. An intermediate hand-edit of this
+     function also reported 2,178 us - that was measured against a build from a different tree
+     than the one edited, and the flag now makes both arms come from one place. */
+  __hmx_v y0 = (__hmx_v)x0, y1 = (__hmx_v)x1, y2 = (__hmx_v)x2, y3 = (__hmx_v)x3;
+#else
   __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7;
   __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
-  __hmx_i32x32 x0 = a[0] + b, x1 = a[1] + b, x2 = a[2] + b, x3 = a[3] + b;
   __hmx_v y0 = __hmx_rqwf(x0, mm7, emf, zy, lo, fl), y1 = __hmx_rqwf(x1, mm7, emf, zy, lo, fl);
   __hmx_v y2 = __hmx_rqwf(x2, mm7, emf, zy, lo, fl), y3 = __hmx_rqwf(x3, mm7, emf, zy, lo, fl);
+#endif
+  (void)m; (void)zy; (void)lo;
   *fl |= (__hmx_u32x32)(((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))) & (int)0xff000000);
   __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
   __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
@@ -1019,8 +1044,8 @@ static inline int __hmx_rq_any(__hmx_u32x32 fl) {
   return __builtin_HEXAGON_V6_extractw_128B(v, 0);
 }
 #endif
-""".replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB)).replace("@AO@", str(_HMX_AO))
-
+""".replace("@CA@", str(_HMX_CA)).replace("@CB@", str(_HMX_CB)).replace("@AO@", str(_HMX_AO)) \
+  .replace("@RQSTUB@", f"#define HMX_RQ_STUB {int(getenv('HMX_RQ_STUB', 0))}")
 def _hmx_lane(u:UOp):
   # lane j of a vector value: INDEX(value, CAST(CONST j)) -> (value, j)
   if u.op is not Ops.INDEX or len(u.src) != 2: return None
@@ -1788,15 +1813,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
       "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
   if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", 1):
-    nrq = 0 if getenv("HMX_RQ_PROBE") else _hmx_rq_rows(uops, users, drop, before, replace, pos)
-    # HMX_RQ_PROBE keeps the :cm tile path and only stops the requantize rows from being emitted.
-    # **It does not measure the requantization, and do not read a number off it.** Measured on the
-    # phone it came out *slower* than the baseline (22,508 us against 22,208), which is impossible if
-    # it were isolating the epilogue: dropping rows reshapes the surrounding codegen - the addq folding
-    # and the store chain - and that costs more than the requant saves. Under hexagon-sim it does not
-    # finish at all within 40 minutes. To price the requant properly, keep the epilogue and replace
-    # only its body; that is not written.
-    if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}{' (skipped, HMX_RQ_PROBE)' if getenv('HMX_RQ_PROBE') else ''}")
+    nrq = _hmx_rq_rows(uops, users, drop, before, replace, pos)
+    if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}")
   if not replace: return _hmx_bail(uops, 9)
   if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
   out = []
