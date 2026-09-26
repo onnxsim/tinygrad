@@ -44,9 +44,15 @@ import pytest
 # The lowerings below have to run on the host. `hand/conftest.py` sets DEV=DSP (MOCKDSP=1) for the hand-kernel
 # oracles, because those tests want tinygrad's own DSP renderer, and MOCKDSP=1 compiles the kernels for a
 # Hexagon target that cannot link standalone (the mock has no __extendhfsf2 and no QuRT). This test is the
-# other kind: its oracle is the *phone's* bytes, not a rendered kernel, so the device is set here instead,
-# before tinygrad is imported, and the conftest is left alone.
-os.environ["DEV"] = os.environ.get("MCC_TEST_DEVICE", "CPU")
+# other kind: its oracle is the *phone's* bytes, not a rendered kernel, so it needs the host device.
+#
+# That cannot be arranged at module scope. hand/conftest.py runs first and has already set DEV=DSP, and
+# tinygrad reads DEV once, when it is first imported - which any earlier test module in the same process may
+# already have done. So the device is requested here, honoured if it takes effect, and checked below: if
+# something else won the race the tests skip rather than failing on a device they cannot use. Running this
+# file on its own (`pytest test/external/dsp/hand/mcc`) always gets the host.
+os.environ.setdefault("MCC_TEST_DEVICE", "CPU")
+os.environ.setdefault("DEV", "CPU")
 os.environ.pop("MOCKDSP", None)
 os.environ.pop("DEV_MOCKDSP", None)
 os.environ.setdefault("FLOAT_REASSOC", "0")  # a plain host float reassociation would change the qf32 sums
@@ -54,6 +60,13 @@ os.environ.setdefault("FLOAT_REASSOC", "0")  # a plain host float reassociation 
 import mcc_case as MC  # noqa: E402
 import tg_mcc as TG  # noqa: E402
 from tinygrad import Device, Tensor  # noqa: E402
+
+pytestmark = pytest.mark.skipif(
+  Device.DEFAULT != os.environ["MCC_TEST_DEVICE"],
+  reason=(f"these lowerings must run on {os.environ['MCC_TEST_DEVICE']}, but tinygrad came up on "
+          f"{Device.DEFAULT}: hand/conftest.py sets DEV=DSP and wins the import race in a mixed run. "
+          f"Run this file on its own, or set MCC_TEST_DEVICE."),
+)
 
 HERE = Path(__file__).resolve().parent
 CASES = HERE / "goldens"

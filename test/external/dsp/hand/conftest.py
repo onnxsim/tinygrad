@@ -2,7 +2,12 @@
 # set them before any test module imports tinygrad.
 import os, sys, pathlib
 
-os.environ.setdefault("DEV", "DSP")
+# `mcc` is the exception and says so itself: it is a phone-golden oracle (mb_hvx.h's own steps against bytes
+# captured off the device) and contains no tinygrad-built kernel, so it needs the host device. Claiming DEV=DSP
+# for it here would win the import race against its own `setdefault("DEV", "CPU")` -- tinygrad reads DEV once,
+# when it is first imported -- and leave it running on a Hexagon target with no QuRT, failing on a compiler it
+# cannot use. test_mcc.py checks Device.DEFAULT and skips with that reason if something else won.
+os.environ.setdefault("DEV", "CPU" if os.environ.get("DSP_HAND_HOST_ONLY") == "1" else "DSP")
 os.environ.setdefault("MOCKDSP", "1")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from harness import clang  # noqa: E402
@@ -15,7 +20,12 @@ if int(os.environ.get("HVX_ARCH", "v65").lstrip("v")) < 68:
   # contracts are ORT's exact float op order
   os.environ.setdefault("FLOAT_REASSOC", "0")
   cc = os.environ.get("CC") or clang()
-  if cc is not None and "-ffp-contract" not in cc: os.environ["CC"] = f"{cc} -ffp-contract=off"
+  # Only the DSP path takes CC as a *command* (tinygrad/runtime/ops_dsp.py splits it); the host CPU
+  # compiler (tinygrad/runtime/support/compiler_cpu.py) takes it as a single argv element, so a CC
+  # carrying "-ffp-contract=off" makes it exec a file literally named "clang-19 -ffp-contract=off".
+  # That is the whole difference the mcc phone-golden oracle needs (it runs on the host), so the flag
+  # goes only where it is actually consumed.
+  if cc is not None and os.environ.get("DEV") != "CPU" and "-ffp-contract" not in cc: os.environ["CC"] = f"{cc} -ffp-contract=off"
 else:
   if clang() is not None: os.environ.setdefault("CC", clang())
   # The qemu (v65) families don't run under the HMX families' HVX_ARCH=v69: don't collect them at all (instead of a
