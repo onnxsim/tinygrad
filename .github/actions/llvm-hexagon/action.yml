@@ -1,0 +1,38 @@
+name: LLVM clang-19 with the Hexagon backend
+description: >-
+  Installs clang-19 + lld-19 + qemu-hexagon and verifies clang can target hexagonv65. The
+  apt.llvm.org build is required: Ubuntu's own clang-19 package has no hexagonv65 target, and so
+  does the Qualcomm toolchain's hexagon-clang 19 (it dropped v65), so the upstream LLVM build is the
+  only one that can compile the qemu-based oracles.
+runs:
+  using: "composite"
+  steps:
+    - name: Add the apt.llvm.org repository
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends wget gnupg ca-certificates
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" \
+          | sudo tee /etc/apt/sources.list.d/llvm19.list > /dev/null
+        sudo apt-get update
+
+    - name: Install clang-19, lld-19, qemu-hexagon
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static libncurses6
+        echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+        qemu-hexagon-static -version
+
+    # Fail here rather than 58 tests in: without the hexagonv65 target every kernel build dies with
+    # "error: unknown target CPU 'hexagonv65'", which reads as a kernel failure rather than a
+    # missing toolchain. The Qualcomm toolchain's hexagon-clang 19 fails this probe too, which is
+    # the whole reason these tests use the upstream LLVM clang.
+    - name: Verify clang can target hexagonv65
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo 'int main(void){return 0;}' | clang-19 --target=hexagon -mcpu=hexagonv65 \
+          -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null -
