@@ -28,11 +28,10 @@ def tinygrad_layer(c):
   return ((acc.cast(dtypes.float32) * Tensor(c["m"])).round() + float(c["zy"])).clip(c["lo"], 255).cast(dtypes.uint8)
 
 @unittest.skipUnless(hexsim.tools() is not None and hexsim.mockdsp_ok(), "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang")
-@unittest.skip("hexagon-sim aborts (SIGABRT) on tinygrad's captured kernel; see the note on TestHandHmxQconv3x3._run")
 class TestHandHmxQconv1x1(unittest.TestCase):
-  # Quarantined with the 3x3 family: same failure mode, same shared cause. Locally test_qconv1x1 fails
-  # and then aborts the process, and on CI it hangs hexagon-sim until the job's timeout. See the note on
-  # TestHandHmxQconv3x3._run for what is and is not known.
+  # Not quarantined: this passes, bit-exact against the hand kernel and ORT, in ~295 s. It was switched
+  # off alongside the 3x3 family on the assumption they shared a fault; they do not. See
+  # ORACLE_QUARANTINE.md.
   def _run(self, M, K, N, zx, zy, relu, seed=0):
     c = case(M, K, N, zx, zy, relu, seed)
     with tempfile.TemporaryDirectory() as d:
