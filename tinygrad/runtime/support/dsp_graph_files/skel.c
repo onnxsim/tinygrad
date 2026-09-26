@@ -12,11 +12,12 @@
 #include "hmx_runtime.h"
 extern unsigned long long HAP_perf_get_time_us(void);
 #define G_NPROF 256
+/* G_PROF has to be defined before graph.h, which is where the calls are emitted. g_p_last is the
+   per-call cursor and is deliberately NOT g_last: g_run's own G_PROF(i) updates it on every call, so
+   sharing one variable with the total's start would leave t[0] measuring only the final call. */
 static uint64 g_prof[G_NPROF];
-static unsigned long long g_last;
-/* G_PROF(i) has to be defined before graph.h, which is where the calls are emitted. It is empty unless
-   the client asked for the breakdown, so the default hot path costs nothing. */
-#define G_PROF(i) (g_prof[i] += HAP_perf_get_time_us() - g_last, g_last = HAP_perf_get_time_us())
+static unsigned long long g_p_last, g_t0;
+#define G_PROF(i) (g_prof[i] += HAP_perf_get_time_us() - g_p_last, g_p_last = HAP_perf_get_time_us())
 #include "graph.h"
 
 unsigned char* __hmx_vtcm;
@@ -34,9 +35,9 @@ static void worker(void* p) {
   j->codes[2] = qurt_hvx_lock(QURT_HVX_MODE_128B);
   j->codes[3] = j->codes[2] ? -1 : HAP_compute_res_hmx_lock(j->rt->ctx);
   if (j->codes[3] == 0) {
-    g_last = HAP_perf_get_time_us();
+    g_t0 = g_p_last = HAP_perf_get_time_us();
     for (int it = 0; it < j->iters; it++) g_run(j->B);
-    j->t[0] = HAP_perf_get_time_us() - g_last;
+    j->t[0] = HAP_perf_get_time_us() - g_t0;
     HAP_compute_res_hmx_unlock(j->rt->ctx);
   }
   if (j->codes[2] == 0) qurt_hvx_unlock();
