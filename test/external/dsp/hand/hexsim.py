@@ -18,7 +18,11 @@ def tools() -> pathlib.Path|None:
   return t if (t / "bin" / "hexagon-sim").exists() and (t / "bin" / "hexagon-clang").exists() else None
 
 def mockdsp_ok() -> bool:
-  cc = os.environ.get("CC", "clang")
+  # CC may carry flags: conftest.py appends -ffp-contract=off to it. shutil.which() on the whole string
+  # ("/usr/bin/clang-19 -ffp-contract=off") finds nothing, so the HMX tests would skip themselves
+  # everywhere - including CI, where the toolchain was installed and the skip looked inexplicable.
+  # Probe the compiler itself, not the whole command line.
+  cc = (os.environ.get("CC") or "clang").split()[0]
   return shutil.which(cc) is not None
 
 def _sim(work:pathlib.Path, elf:str, *args) -> str:
