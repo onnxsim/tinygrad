@@ -1,12 +1,23 @@
 /* FastRPC skel around a whole tinygrad-generated graph (tinygrad/runtime/support/dsp_graph.py: k<n>.c + graph.h): one call runs every kernel in order
  * on one HVX + HMX worker thread (runtime: hmx_runtime.h, from onnxsim hmx_gemm). a = the graph input, b = the constants blob
  * (graph.h's offsets), c = the output; t[0] = the kernels' time over `iters` inferences (the copies in/out excluded). */
+/* Per-call timing. G_PROF(i) is an empty macro by default, so the hot path is untouched and t[0] is
+   the only number that matters. Defining G_PROF (the phone's client passes a "prof" argument) swaps in
+   HAP_perf_get_time_us per call, which is what produces the device-side breakdown in place of having
+   to trust hexagon-sim's per-kernel shares - the simulator is a different machine and the .sf
+   float paths do not even agree with the hardware. */
 #include <stdlib.h>
 #include <string.h>
 #include "tg_hmx_rpc.h"
 #include "hmx_runtime.h"
-#include "graph.h"
 extern unsigned long long HAP_perf_get_time_us(void);
+#define G_NPROF 256
+static uint64 g_prof[G_NPROF];
+static unsigned long long g_last;
+/* G_PROF(i) has to be defined before graph.h, which is where the calls are emitted. It is empty unless
+   the client asked for the breakdown, so the default hot path costs nothing. */
+#define G_PROF(i) (g_prof[i] += HAP_perf_get_time_us() - g_last, g_last = HAP_perf_get_time_us())
+#include "graph.h"
 
 unsigned char* __hmx_vtcm;
 unsigned int __hmx_gen;
@@ -23,9 +34,9 @@ static void worker(void* p) {
   j->codes[2] = qurt_hvx_lock(QURT_HVX_MODE_128B);
   j->codes[3] = j->codes[2] ? -1 : HAP_compute_res_hmx_lock(j->rt->ctx);
   if (j->codes[3] == 0) {
-    unsigned long long t0 = HAP_perf_get_time_us();
+    g_last = HAP_perf_get_time_us();
     for (int it = 0; it < j->iters; it++) g_run(j->B);
-    j->t[0] = HAP_perf_get_time_us() - t0;
+    j->t[0] = HAP_perf_get_time_us() - g_last;
     HAP_compute_res_hmx_unlock(j->rt->ctx);
   }
   if (j->codes[2] == 0) qurt_hvx_unlock();
@@ -36,6 +47,7 @@ int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const
                    uint64* t, int tLen, int* codes, int codesLen) {
   if (tLen < 1 || codesLen < 7 || bLen < G_BLOB_BYTES || aLen > (int)G_BYTES[G_INPUT] || cLen > (int)G_BYTES[G_OUTPUT]) return AEE_EBADPARM;
   memset(t, 0, tLen * sizeof(uint64)); memset(codes, 0, codesLen * sizeof(int));
+  memset(g_prof, 0, sizeof(g_prof));
   codes[0] = hmx_rt_power((void*)tg_hmx_rpc_run, 1);
   if (codes[0]) return 0;
   hmx_rt_t rt;
@@ -61,6 +73,9 @@ int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const
   qurt_thread_t tid; int st;
   codes[5] = qurt_thread_create(&tid, &ta, worker, &j);
   if (codes[5] == 0) qurt_thread_join(tid, &st);
+  /* t[1..] = the per-call breakdown, averaged over iters, when the caller passed room for it. t[0]
+     above is the total, so a caller that only wants the number keeps asking for tLen=1. */
+  for (int i = 1; i < tLen && i - 1 < G_NPROF; i++) t[i] = g_prof[i - 1] / (iters > 0 ? iters : 1);
   memcpy(c, B[G_OUTPUT], cLen);
   codes[6] = (int)(total >> 10);  /* KB of DSP heap */
   free(raw);
