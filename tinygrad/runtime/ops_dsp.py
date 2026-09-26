@@ -985,8 +985,14 @@ __attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __
   __hmx_v z = __builtin_HEXAGON_V6_vd0_128B();
   __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7, fl = 0;
   __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
+#if HMX_RQ_STUB
+  (void)mb; (void)mm7; (void)emf;
+  __hmx_v y = (__hmx_v)x;  /* the measurement build: the arithmetic out, the packs and the store in */
+#else
   __hmx_v y = __hmx_rqwf(x, mm7, emf, zy, lo, &fl);
   if (__builtin_expect(__hmx_any_big(x ^ (x >> 31), fl), 0)) y = __hmx_rqw(x, mb, zy, lo);
+#endif
+  (void)zy; (void)lo; (void)fl;
   __hmx_st32(d, __builtin_HEXAGON_V6_vpackhub_sat_128B(z, __builtin_HEXAGON_V6_vpackwh_sat_128B(z, y)), 0);
 }
 /* four rows sharing bias and scale (the four rows at acc, one 128-lane accumulator-array vector): the fixed-point fast path,
@@ -998,25 +1004,14 @@ __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, 
   const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
   __hmx_i32x32 x0 = a[0] + b, x1 = a[1] + b, x2 = a[2] + b, x3 = a[3] + b;
 #if HMX_RQ_STUB
-  /* HMX_RQ_STUB is a measurement build, not a mode: it replaces the ORT-exact requantization
-     arithmetic (the per-lane normalization, the 24x24 product, the tie window) with a plain
-     saturating pack of the accumulator, leaving the bias add, the |acc| > 2^24 flag, the two packs
-     and the four stores alone. So the difference from the real build is the price of the
-     requantization itself.
-
-     Measured on the phone (Xiaomi 12S, ResNet-18 QDQ, HMX_VTCM_KB=4096), both arms built from
-     this tree back to back: 22,328.6 us with the real requant and 22,277.0 with the stub, so the
-     requantization costs **52 us, 0.2% of the graph**. That is far less than the HMX README's
-     bisection of the 3x3 family suggests (~48% of that family) and means QC_FAST's host-table
-     rewrite is not worth its accuracy cost on this graph - the epilogue's cost is the stores and
-     the flag reduction, which the stub keeps.
-
-     Two earlier attempts to measure this were wrong and are recorded so they are not repeated:
-     HMX_RQ=0 drops the epilogue, the rewrite bails and the kernel falls back to scalar (24x
-     slower), and HMX_RQ_PROBE skips the requantize *rows*, which reshapes the addq folding and
-     store chain and came out *slower* than the baseline. An intermediate hand-edit of this
-     function also reported 2,178 us - that was measured against a build from a different tree
-     than the one edited, and the flag now makes both arms come from one place. */
+  /* HMX_RQ_STUB is a measurement build, not a mode. It keeps the whole epilogue - the bias add, the |acc| > 2^24 flag,
+     the two packs, the four stores, the __hmx_rq_any check and the out-of-line __hmx_rq4x exact redo - and replaces only
+     the ORT-exact arithmetic of the fast path (__hmx_rqwf: the per-lane normalization, the 24x24 product, the tie window).
+     The one thing it also drops is __hmx_rqwf's *fast-path* flag (window lanes), so a tile that would have redone exactly
+     no longer does; __hmx_rq4x is data-dependent and dropping its *fast-path* trigger is what makes the A/B isolate the
+     arithmetic, so both arms on one tree pay that event rate. It never drops a |acc| > 2^24 redo (that flag is kept in
+     rq4f below), and on ResNet-18 no tile takes the exact redo at all, so here the two arms differ by exactly the
+     fast-path arithmetic and nothing else. See test/external/dsp/hand/REQUANT_RECONCILE.md. */
   __hmx_v y0 = (__hmx_v)x0, y1 = (__hmx_v)x1, y2 = (__hmx_v)x2, y3 = (__hmx_v)x3;
 #else
   __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7;
