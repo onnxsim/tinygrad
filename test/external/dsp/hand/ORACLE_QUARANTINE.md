@@ -55,12 +55,25 @@ Changing the cases to 32x32 does make them much cheaper standalone (12.7 s again
 3. Then lift the quarantine on the 3x3 and whole-graph tests and keep the 1x1 ones running -
    **those already pass**, bit-exact, in 295 s, and the quarantine on them is wrong.
 
-## The 1x1 family: not affected
+## The 1x1 family: passes here, aborts on the CI runner
 
-`TestHandHmxQconv1x1::test_qconv1x1` **passes**, bit-exact, in ~280 s. Verified 2026-09-26 on a
-clean checkout at this commit, three ways: system python, the venv python, and under gdb. It was
-switched off with the 3x3 family on a fault they do not share, and it has been switched back on.
+`TestHandHmxQconv1x1` **passes on this machine** - 2 passed in 411 s, and under gdb, and with
+either python. On the GitHub runner it aborts in `_sim` after ~5 minutes, in the same
+`subprocess.run` frame as the 3x3 family:
 
-Two notes in this file's history claimed otherwise - first that it aborted, then that it passed
-- before the answer was checked properly on a clean tree with nothing else running. The earlier
-aborts came from running several suites concurrently. Only the 3x3 family is quarantined.
+    test_hand_hmx_gemm.py::TestHandHmxGemmF16::test_gemm_f16_small SKIPPED [ 90%]
+    16:14:17 Fatal Python error: Aborted
+      File "test/external/dsp/hand/hexsim.py", line 31 in _sim
+      File "test/external/dsp/hand/hexsim.py", line 95 in run_captured
+      File "test/external/dsp/hand/test_hand_hmx_qconv.py", line 47 in _run
+
+It was un-quarantined on the strength of the local passes, and that turned the hexsim job red.
+Re-quarantined: a test that only passes on the developer's machine is not a test the job can
+trust, and leaving it in trades a reliably red job for a flaky one.
+
+So the picture is now: everything runs and passes here (49 passed, 11 skipped, 642 s for the
+hexsim tier's exact command), and the CI runner cannot complete `run_captured` for the HMX
+kernels at all. That is a runner-environment problem, not a code one, and it is worth its own
+investigation: the two data points to collect are the simulator child's exit status and its
+stderr on the runner, and whether the abort is OOM (the 1x1 tile is 150 MB peak locally) rather
+than anything to do with pytest.

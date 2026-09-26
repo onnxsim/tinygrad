@@ -28,10 +28,12 @@ def tinygrad_layer(c):
   return ((acc.cast(dtypes.float32) * Tensor(c["m"])).round() + float(c["zy"])).clip(c["lo"], 255).cast(dtypes.uint8)
 
 @unittest.skipUnless(hexsim.tools() is not None and hexsim.mockdsp_ok(), "needs the Hexagon toolchain (HEXAGON_TOOLS) + clang")
+@unittest.skip("run_captured aborts the simulator on the CI runner; see ORACLE_QUARANTINE.md")
 class TestHandHmxQconv1x1(unittest.TestCase):
-  # Not quarantined: passes bit-exact in ~280 s (verified 2026-09-26 with and without gdb, both
-  # pythons). It was switched off with the 3x3 family on a fault they do not share. See
-  # ORACLE_QUARANTINE.md for what the 3x3 abort actually is.
+  # Re-quarantined 2026-09-26. These pass here - 2 passed in 411 s, and under gdb, and with either
+  # python - but on the GitHub runner they abort in _sim after ~5 minutes, in the same
+  # subprocess.run frame as the 3x3 family. So the fault is the runner, not these tests, and
+  # un-quarantining them only trades a red job for a flaky one. ORACLE_QUARANTINE.md has the evidence.
   def _run(self, M, K, N, zx, zy, relu, seed=0):
     c = case(M, K, N, zx, zy, relu, seed)
     with tempfile.TemporaryDirectory() as d:
