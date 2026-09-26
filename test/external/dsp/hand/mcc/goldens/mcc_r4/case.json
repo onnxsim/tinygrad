@@ -5,9 +5,16 @@
   "seen": 197,
   "seed": 0,
   "x0": "/mnt/data/cache/claude-work/mcc_hmx/q128/x0.bin",
-  "source_commit": "fc010b7b1",
+  "source_commit": "4ed2571ee",
   "tile_bytes": 2048,
   "scale2": 0.25503486164919736,
   "eps": 1e-06,
-  "goldens": null
+  "goldens": null,
+  "score_max": -0.66845703125,
+  "score_span_max": 0.79736328125,
+  "score_span_median": 0.656982421875,
+  "score_span_under_13": 128,
+  "score_span_over_13": 0,
+  "gelu_x_absmax": 60000.0,
+  "layernorm_x_absmax": 0.445556640625
 }

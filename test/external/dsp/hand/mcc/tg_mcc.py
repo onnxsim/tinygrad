@@ -18,6 +18,7 @@ numbers).
 """
 
 import numpy as np
+from tinygrad import Tensor, dtypes
 
 D, KT, ST, HD, SEEN, SEEN_PAD, TILE, TH = 512, 16, 7, 32, 197, 224, 2048, 1024
 SCALE = 0.17677669529663687
@@ -28,6 +29,17 @@ PAD = -65504.0  # the padded score columns, as mcc_block.h's ts6 biases them
 
 _I, _J = np.meshgrid(np.arange(32), np.arange(32), indexing="ij")
 IDX = 64 * (_I // 2) + 2 * _J + _I % 2
+
+
+def T(x, dtype=None):
+    """numpy array / numpy scalar / Tensor -> Tensor. The three lowerings take their arguments this way
+    so a caller can hand them either the case's raw numpy tiles or another Tensor. Two things to know:
+    tinygrad's `Tensor(other_tensor)` is a *cast*, not an adopt (it silently reinterprets the other's
+    buffer as this dtypes' -- which is how the first version of these functions lost the dtypes of the
+    qf16 chain), and a numpy scalar is not a data source at all (a 0-d array is)."""
+    if isinstance(x, Tensor): return x
+    if dtype is not None: return Tensor(np.array(x, dtype=np.float16 if dtype == dtypes.half else np.float32), dtype=dtype)
+    return Tensor(x)
 
 
 def tiles(a, stride=None):
@@ -71,24 +83,25 @@ def layernorm_ref(x, gamma, beta, eps=EPS):
 
 def softmax_ref(s, s_self, seen=SEEN):
     """float64 reference of mbv_softmax with its clamps: m7 = max(row max, s_self) - 7 (so the largest e
-    is 2^7 = 128) and t = max(s - m7, -13). Returns (P over the 224 columns, p_self)."""
-    m7 = np.maximum(s.max(-1, keepdims=True), s_self) - 7.0
+    is 2^7 = 128) and t = max(s - m7, -13), over the *seen* scores only (mcc_case.py spells out why the
+    27 padded columns are out of the max and the sum). Returns (P over the 224 columns, p_self)."""
+    live = np.arange(s.shape[-1]) < seen
+    seen_max = np.where(live, s, -np.inf).max(-1, keepdims=True)
+    m7 = np.maximum(seen_max, s_self) - 7.0
     e = np.exp2(np.maximum(s - m7, -13.0))
     e_self = np.exp2(np.maximum(s_self - m7, -13.0))
-    tot = e.sum(-1, keepdims=True) + e_self
+    tot = np.where(live, e, 0.0).sum(-1, keepdims=True) + e_self
     return e / tot, (e_self / tot)[:, 0]
 
 
 def layernorm(x, gamma, beta, eps=EPS):
     """(rows, 512) half x -> (rows, 512) half. The statistics in float (as mbv_layernorm's qf32 sums),
     the apply in float too, and the result rounded back to half once (the kernel's qf32 -> hf narrow)."""
-    from tinygrad import Tensor, dtypes
-
-    f = x.float()
+    f = T(x, dtypes.half).float()
     mean = f.mean(-1, keepdim=True)
     var = (f * f).mean(-1, keepdim=True) - mean * mean  # one pass, as the kernel's sums do
     rstd = (var.maximum(0.0) + eps).rsqrt()
-    return ((f - mean) * rstd * gamma.float() + beta.float()).cast(dtypes.half)
+    return ((f - mean) * rstd * T(gamma, dtypes.half).float() + T(beta, dtypes.half).float()).cast(dtypes.half)
 
 
 def softmax_base2_self_term(s, q, k, seen=SEEN, pad=PAD):
@@ -97,23 +110,27 @@ def softmax_base2_self_term(s, q, k, seen=SEEN, pad=PAD):
     columns at -65504, the max taken over the whole row and the self score, e = 2^[s - (max - 7)] with
     the -13 floor, and P = e / (sum over the 224 columns + the self term).
 
-    Returns (P (rows, 224) half, p_self (rows,) half). The exponentials run in half (the kernel's exp2 is
-    an hf helper) and the sums / reciprocal in float (its qf32 sums and srecip). `pad` is the tile filler of
-    the score columns past the first: the committed S tiles hold -65504 there (mcc_case.py), and that
-    subtract in half overflows to -inf, which is the same 0 * 1/N the kernel's own -13 floor produces there.
-    """
-    from tinygrad import Tensor, dtypes
+    The padded columns (>= seen) are hidden exactly as mbv_softmax hides them: the kernel's row max and
+    its qf32 sum only ever run over the first MB_ST * 32 == 224 lanes of a vector, which are the 197 seen
+    scores plus the self term. A lowering that took the max (or the sum) over all 224 columns would see
+    -65504 and get both wrong: 27 padded lanes pull the max down by 27 * 2^-13 == 0.0033, which is
+    0.23% off every P in the row, and they add 27 * 2^-13 == 3.3e-3 to the sum. The clamp is applied
+    over all 224 columns, because the kernel does apply it there: the padded ones land on the -13 floor
+    and then contribute exp2(-13) == 1.2e-4 of the row's total, which is the kernel's own stand-in for
+    0 on them, and the golden shows the same residue in its own P (test_mcc.py measures it).
 
-    q, k = q.float(), k.float()
+    Returns (P (rows, 224) half, p_self (rows,) half). The exponentials run in half (the kernel's exp2 is
+    an hf helper) and the sums / reciprocal in float (its qf32 sums and srecip)."""
+    q, k = T(q, dtypes.half).float(), T(k, dtypes.half).float()
     s_self = (q * k).sum(-1, keepdim=True) * SCALE2
-    s = s.float()
-    s = Tensor.where(Tensor.arange(s.shape[-1]).reshape(1, -1) < seen, s, Tensor(pad).float())
-    # the row max is over the 224 columns of S (the padded ones hold -65504) and the self score
-    m = s.max(-1, keepdim=True).maximum(s_self)
+    s = T(s, dtypes.half).float()
+    live = Tensor(np.arange(s.shape[-1]) < seen).reshape(1, -1)  # bool, the 197 seen columns
+    # the row max is over the seen scores only, then over the self score
+    m = Tensor.where(live, s, Tensor(-np.inf, dtype=s.dtype)).max(-1, keepdim=True).maximum(s_self) - 7.0
     # the exponentials in half, as the kernel's hf exp2 is, with the kernel's -13 floor
     e = (s - m).cast(dtypes.half).maximum(-13.0).cast(dtypes.half).exp2().contiguous()
     e_self = (s_self - m).cast(dtypes.half).maximum(-13.0).cast(dtypes.half).exp2()
-    tot = e.float().sum(-1, keepdim=True) + e_self.float()
+    tot = Tensor.where(live, e.float(), Tensor(0.0, dtype=s.dtype)).sum(-1, keepdim=True) + e_self.float()
     p = (e.float() / tot).cast(dtypes.half)
     return p, (e_self / tot).cast(dtypes.half)
 
@@ -122,15 +139,14 @@ def gelu(x, half_intermediates=True):
     """the tanh form mbv_tile_gelu computes: x * 1 / (1 + 2^t) with t = -2.3022082 x (1 + 0.044715 x^2)
     clamped to [-12, 12] (2.3022082 = 1.5957691 * log2(e)), the -12 floor clamped back up to -12, and
     x < -4 -> 0. In half when half_intermediates, as the kernel's qf16 chain is; the result is half."""
-    from tinygrad import Tensor, dtypes
-
     half = dtypes.half
-    c = Tensor(np.float16(0.044715) if half_intermediates else np.float32(0.044715))
-    k = Tensor(np.float16(-2.3022082) if half_intermediates else np.float32(-2.3022082))
-    lo, hi = Tensor(np.float16(-12.0) if half_intermediates else np.float32(-12.0)), \
-        Tensor(np.float16(12.0) if half_intermediates else np.float32(12.0))
-    cut = Tensor(np.float16(-4.0) if half_intermediates else np.float32(-4.0))
-    xh = x.cast(half)
+    fl = half if half_intermediates else dtypes.float
+    c = T(np.float16(0.044715) if half_intermediates else np.float32(0.044715), fl)
+    k = T(np.float16(-2.3022082) if half_intermediates else np.float32(-2.3022082), fl)
+    lo, hi = T(np.float16(-12.0) if half_intermediates else np.float32(-12.0), fl), \
+        T(np.float16(12.0) if half_intermediates else np.float32(12.0), fl)
+    cut = T(np.float16(-4.0) if half_intermediates else np.float32(-4.0), fl)
+    xh = T(x, half).cast(half)
     # the clamps are on t, before its exp2 (a float maximum of a half tensor would widen it)
     t = (((xh * xh * c + 1.0) * (xh * k)).cast(half).maximum(lo).minimum(hi))
     g = xh * (t.exp2() + 1.0).reciprocal()

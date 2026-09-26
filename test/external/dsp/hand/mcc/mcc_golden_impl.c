@@ -36,6 +36,9 @@ typedef struct {
  * in-place steps' inputs: the restore at the end of a repeat reads from there, never from the buffer the
  * step just overwrote (which is what a naive `memcpy(b.s, s, ...)` off the incoming argument does -- the
  * step has already eaten it, so the restore is a copy of the result and the next repeat degenerates).
+ * H (the LayerNorm output) is a buffer of its own here rather than aliasing X as the block does, because
+ * mbv_layernorm is out of place: the next repeat then still sees the original scores in X, so the last
+ * one of them is the same as the first and the repeat count cannot change the golden.
  * The order inside the layout allocation is the same relative order as mcc_block.h's mb_layout (X, H,
  * S, q, k, p_self, then the GELU input, which in the block is the MLP's hid scratch). */
 static int mg_layout(mg_blk* b, int rt, int nt) {
@@ -104,9 +107,10 @@ int mcc_golden_rpc_run(remote_handle64 h, int steps, int rt, int nt, int it, con
   }
   memset(t, 0, tLen * sizeof *t);
   memset(codes, 0, codesLen * sizeof *codes);
+  /* LayerNorm is out of place (b.h is its own buffer, rt*16 tiles), so its golden can be copied out
+   * after the loop, once. The two in-place steps cannot: their golden *is* the buffer the step overwrote,
+   * and it has to be copied out inside the loop, before the restore below puts the input back. */
   memcpy(b.x, x, b.xb);
-  memcpy(b.h, x, b.hb); /* H aliases X, the way the block reuses the same VTCM: mbv_layernorm is
-                        * out-of-place, so the next repeat still sees the original scores in X */
   /* The padded score columns (197..223 of the 224, i.e. j >= 5 of S tile 6) are already -65504 in the
    * case file, exactly what mcc_block.h's ts6 column table makes the HMX GEMM write, so the skel must NOT
    * re-apply that bias: the tile is row-pair interleaved, so "half the tile" is not a contiguous run, and
@@ -132,17 +136,20 @@ int mcc_golden_rpc_run(remote_handle64 h, int steps, int rt, int nt, int it, con
     for (int n = 0; n < b.nt; n++) mbv_tile_gelu(b.g + (size_t)n * MB_TB);
     pl[2] = MB_NOW() - c2;
     t0 += HAP_perf_get_time_us() - a;
-    /* Both in-place steps leave their result in the buffer they read, and the goldens are the results,
-     * so the copy out happens *before* the restore -- otherwise the restore wipes them. */
-    if (steps & MG_STEP_SM) {
+    /* Both in-place steps leave their result in the buffer they read, and the goldens are the results, so
+     * the copy out happens *before* the restore -- the first version of this skel restored first and
+     * handed back the input a second time. (The restore itself has to read the pristine copies the
+     * mg_layout + memcpy pair above set up; the skel used to read them off the incoming `s` / `g`
+     * arguments, which the step has already eaten.) It only copies out on the last repeat, so the bytes
+     * do not depend on `it`. */
+    const int last = i + 1 == it;
+    if (last && (steps & MG_STEP_SM)) {
       memcpy(spv, b.s, b.sb);
       memcpy(pvout, b.pv, b.pvb);
-      memcpy(b.s, b.sg, b.sb);
     }
-    if (steps & MG_STEP_GELU) {
-      memcpy(gout, b.g, b.gb);
-      memcpy(b.g, b.gg, b.gb);
-    }
+    if (steps & MG_STEP_SM) memcpy(b.s, b.sg, b.sb);
+    if (last && (steps & MG_STEP_GELU)) memcpy(gout, b.g, b.gb);
+    if (steps & MG_STEP_GELU) memcpy(b.g, b.gg, b.gb);
   }
   t[0] = t0 / it;
   for (int i = 0; i < MG_NPH; i++) t[1 + i] = pl[i];

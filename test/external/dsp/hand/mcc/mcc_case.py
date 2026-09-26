@@ -99,15 +99,35 @@ def layernorm_ref(x, gamma, beta, eps=EPS):
     return (x - mean) / np.sqrt(np.maximum(var, 0.0) + eps) * gamma + beta
 
 
-def softmax_ref(s, s_self, seen=SEEN):
+def softmax_ref(s, s_self, seen=SEEN, pad=PAD16):
     """float64 reference of mbv_softmax, including its two clamps: m7 = max(row max, s_self) - 7 (so the
     largest e is 2^7 = 128) and t = max(s - m7, -13) (the floor stands in for 0: the padded columns and
-    anything that small). Returns (P over the 224 columns, p_self)."""
-    m7 = np.maximum(s.max(-1, keepdims=True), s_self) - 7.0
+    anything that small).
+
+    The reference hides the padded columns (>= seen) exactly the way the HVX kernel does -- mbv_softmax
+    only ever runs mbv_rowmax / the qf32 sum over the first MB_ST * 32 == 224 lanes, so its max and its
+    sum are over the 197 seen scores plus the self term, never over the 27 padded ones. The first version
+    of this reference took the max and the sum over all 224 columns of `s` instead. That is a genuine
+    difference, not a rounding one: the padded columns sit at -65504 fp16 and
+
+        m7_224 = max(s.max(), s_self) - 7 - 27 * 2^-13 = m7_197 - 0.0032958984375,
+
+    so the largest e becomes 2^(7 - 0.0033) rather than 2^7 and every P in the row is 0.229% low. (The
+    value in the shipped ref_s.bin was right -- it had been computed from the 197-column scores before the
+    helper was generalised -- which is why the committed goldens survived the bug; the tests on top of
+    this helper did not.) The clamp itself is applied over all 224 columns, because the kernel does apply
+    it there: the padded ones land on the -13 floor and then contribute exp2(-13) == 2^-13 to the sum,
+    1.0e-4 of the row's total, which is the kernel's own approximation of 0 for them.
+
+    Returns (P over the 224 columns, p_self, the row max, the max - min of the seen scores)."""
+    live = np.arange(s.shape[-1]) < seen
+    seen_max = np.where(live, s, -np.inf).max(-1, keepdims=True)
+    m7 = np.maximum(seen_max, s_self) - 7.0
     e = np.exp2(np.maximum(s - m7, -13.0))
     e_self = np.exp2(np.maximum(s_self - m7, -13.0))
-    tot = e.sum(-1, keepdims=True) + e_self
-    return e / tot, (e_self / tot)[:, 0]
+    tot = np.where(live, e, 0.0).sum(-1, keepdims=True) + e_self
+    seen_s = np.where(live, s, np.inf)
+    return e / tot, (e_self / tot)[:, 0], seen_max[:, 0], (seen_max[:, 0] - seen_s.min(-1))
 
 
 def git_rev(path):
@@ -151,17 +171,25 @@ def cmd_export(a):
     s = np.full((rows, SEEN_PAD), float(PAD16), np.float64)
     s[:, :SEEN] = (q @ k.T) * SCALE2
     s16 = f16(s)
-    s_ref, pself_ref = softmax_ref(s16.astype(np.float64), (q * k[:rows]).sum(-1, keepdims=True) * SCALE2)
+    s_ref, pself_ref, s_max, s_span = softmax_ref(s16.astype(np.float64), s_self)
 
     # GELU: the fc1 output's range, with two row pairs of every tile an explicit sweep of the kernel's
     # edges (the x < -4 cutoff, the exp2 clamp at +-12 and its saturation, the fp16 top). mbv_tile_gelu
     # takes a tile pointer and sweeps its 16 vectors, so a tile is the unit: nt tiles of 32x32.
     g = f16(np.resize(x0.astype(np.float64) * 1.5 + 0.3, (nt, TH)))
     # 32 values, laid down in the tile's (row pair, column) halfword order, over row pair 0 of each tile
+    # (-4.5 is -4.5, not the fp16 -inf: the sweep is a probe of the kernel's arithmetic, and an input
+    # that is not finite would only measure the cutoff. The overflow the previous sweep invited
+    # (65504 * 0.044715 * 65504 = 1.9e11 >> the fp16 top) is 5 steps past the saturating exp2 anyway, and
+    # the same overflow reaches the affine rows it was meant to cover: they are plain x * 1.5 + 0.3, so
+    # with the sweep in row pair 0 every tile still has |x| <= 6.5 in its other 15 row pairs.)
     sweep = f16(np.array([-4.5, -4.0, -3.999, -3.0, -2.0, -1.0, -0.5, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
-                           0.9, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 11.0, 12.0, 12.5, 20.0, 64.0, 1000.0, 1e4, 65504.0]))
+                           0.9, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 11.0, 12.0, 12.5, 20.0, 64.0, 1000.0, 1e4, 6e4]))
     for i in range(nt):
         g[i, mb_idx(0, np.arange(32))] = sweep
+    # the reference is the *output* (g_ref), not the input: the first version of this case wrote g, i.e.
+    # gelu's own input, and the shipped ref_gelu.bin is that tile, which is why the first GELU comparison
+    # read as "the phone returned its input unchanged" -- the golden was fine, the file next to it was not.
     g_ref = gelu_tanh(g.astype(np.float64))
 
     (out / "x.bin").write_bytes(f16(tiles(x0)).tobytes())
@@ -173,14 +201,24 @@ def cmd_export(a):
     (out / "ref_h.bin").write_bytes(h_ref.astype(np.float32).tobytes())
     (out / "ref_s.bin").write_bytes(s_ref.astype(np.float32).tobytes())
     (out / "ref_pv.bin").write_bytes(pself_ref.astype(np.float32).tobytes())
-    (out / "ref_gelu.bin").write_bytes(untiles(g, nt * 32, 32).astype(np.float32).ravel().tobytes())
+    (out / "ref_gelu.bin").write_bytes(untiles(g_ref, nt * 32, 32).astype(np.float32).ravel().tobytes())
     (out / "case.json").write_text(json.dumps({
         "rt": rt, "nt": nt, "rows": rows, "seen": SEEN, "seed": a.seed, "x0": source,
         "source_commit": git_rev(HERE.parents[4]), "tile_bytes": TILE, "scale2": SCALE2, "eps": EPS,
-        "goldens": None,  # filled in by test_mcc.py's README / the capture commit message
+        "goldens": None,  # filled in by the capture commit message / README
+        # how hard the case pushes each step, so a golden's accuracy can be read off the case alone
+        "score_max": float(s_max.max()), "score_span_max": float(s_span.max()),
+        "score_span_median": float(np.median(s_span)),
+        "score_span_under_13": int((s_span < 13).sum()), "score_span_over_13": int((s_span > 13).sum()),
+        "gelu_x_absmax": float(np.abs(g.astype(np.float64)).max()),
+        "layernorm_x_absmax": float(np.abs(x0.astype(np.float64)).max()),
     }, indent=2) + "\n")
-    sizes = {p.name: p.stat().st_size for p in sorted(out.glob("*.bin"))}
     print(f"-> {out}: rt {rt} (Q {rows}), nt {nt}, seen {SEEN}, {source}")
+    print(f"   scores: max {s_max.min():.3f}..{s_max.max():.3f}, span median {np.median(s_span):.3f} "
+          f"max {s_span.max():.3f}, {int((s_span < 13).sum())} rows within 13 of their max and "
+          f"{int((s_span > 13).sum())} beyond (the -13 floor stands in for 0 there)")
+    print(f"   |x| max {np.abs(x0.astype(np.float64)).max():.3f}, |g| max {np.abs(g.astype(np.float64)).max():.1f}")
+    sizes = {p.name: p.stat().st_size for p in sorted(out.glob("*.bin"))}
     for n, s_ in sizes.items():
         print(f"   {n:16s} {s_:8d} B")
     print(f"   total {sum(sizes.values())} B")

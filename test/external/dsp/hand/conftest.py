@@ -18,6 +18,8 @@ if int(os.environ.get("HVX_ARCH", "v65").lstrip("v")) < 68:
   if cc is not None and "-ffp-contract" not in cc: os.environ["CC"] = f"{cc} -ffp-contract=off"
 else:
   if clang() is not None: os.environ.setdefault("CC", clang())
-  # the qemu (v65) families don't run under the HMX families' HVX_ARCH=v69: don't collect them at all (instead of a
-  # skip per test), so an HMX run reports only HMX results
-  collect_ignore = ["rpn", "roialign", "msda", "layout", "mcc"]
+  # The qemu (v65) families don't run under the HMX families' HVX_ARCH=v69: don't collect them at all (instead of a
+  # skip per test), so an HMX run reports only HMX results. `mcc` is the exception: its test_mcc.py holds no
+  # tinygrad-built kernel (it is a phone-golden oracle, mb_hvx.h's own steps against bytes captured off the
+  # device), so it runs on whatever host device it names itself and is the one test here that an HMX run can
+  # add. Everything else in the list compiles for HVX and belongs to the v65 tier.

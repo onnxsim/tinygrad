@@ -77,7 +77,6 @@ int main(int argc, char** argv) {
     spit(dir, "gold_pv.bin", po, (size_t)rt * 2048);
   }
   if (steps & STEP_GELU) spit(dir, "gold_gelu.bin", go, (size_t)nt * 2048);
-  printf("wrote gold_h.bin / gold_spv.bin / gold_pv.bin / gold_gelu.bin / gold_times.txt in %s\n", dir);
   {
     char p[512];
     snprintf(p, sizeof p, "%s/gold_times.txt", dir);
@@ -86,7 +85,9 @@ int main(int argc, char** argv) {
             rt, nt, it, (double)t[0], t[1], t[2], t[3]);
     fclose(f);
   }
-  printf("wrote gold_h.bin / gold_spv.bin / gold_times.txt in %s\n", dir);
+  printf("wrote gold_h.bin (%d B) / gold_spv.bin (%d B) / gold_pv.bin (%d B) / gold_gelu.bin (%d B) / gold_times.txt in %s\n",
+         (steps & STEP_LN) ? rt * 16 * 2048 : 0, (steps & STEP_SM) ? rt * 8 * 2048 : 0,
+         (steps & STEP_SM) ? rt * 2048 : 0, (steps & STEP_GELU) ? nt * 2048 : 0, dir);
   mcc_golden_rpc_close(h);
   return 0;
 }
