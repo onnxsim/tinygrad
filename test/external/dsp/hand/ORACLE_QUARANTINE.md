@@ -77,3 +77,51 @@ kernels at all. That is a runner-environment problem, not a code one, and it is 
 investigation: the two data points to collect are the simulator child's exit status and its
 stderr on the runner, and whether the abort is OOM (the 1x1 tile is 150 MB peak locally) rather
 than anything to do with pytest.
+
+## 2026-09-27: the diagnostics, and a correction to "runner-only"
+
+`_sim` and `_cc` no longer use `check=True`. Both now report the child's return code, the **signal
+name** if it was killed, its stderr, the tail of its stdout, and the exact command line. With
+`check=True` pytest reported only `CalledProcessError`, which is why every one of these runs looked
+like the same undifferentiated abort.
+
+Two things that surfaced immediately.
+
+**1. The abort is not runner-only, and it is not deterministic.** Lifting the quarantine on
+`test_hand_hmx_qconv.py` locally:
+
+| run | result |
+|---|---|
+| to a file | `2 passed, 2 skipped in 438 s`, **exit 0** |
+| under a pty (`script -qec`, which is what the runner gives pytest) | `2 passed, 2 skipped in 427 s`, **exit 0** |
+| to a pipe (`| grep`) | `2 passed, 2 skipped`, then **`Fatal Python error: Aborted (core dumped)`** |
+
+So the same tests, the same tree, pass twice and abort once. That rules out the framing this
+document previously used - "passes here, aborts on the runner" implies a difference *between* the
+machines, and there does not seem to be one. It is more likely a race or an at-exit fault whose
+timing depends on how long the ~7-minute run leaves the process in a given state.
+
+**2. When it aborts, the tests have already passed.** The `Fatal Python error` frame is in
+`pytest`'s own `wrap_session` at interpreter shutdown, well after `2 passed` is printed, and
+`ulimit -c` is `unlimited` here, so the message is `Aborted (core dumped)`. This is a *parent*
+abort at exit, not a child abort mid-test. That is consistent with the earlier observation that
+"the abort lands in Python's `subprocess` frame" and with the suggestion that the fault is at
+`hexagon-sim` teardown rather than during any kernel.
+
+**Core dumps are unavailable either way.** `core_pattern` is
+`|/usr/share/apport/apport -p%p -s%s -c%c -d%d -P%P -u%u -g%g -F%F -- %E` and apport is not
+installed, so the kernel hands the core to a handler that is not there. `_core_dumps_enabled()`
+reads `core_pattern` and says so in the failure message, so the next runner failure will say
+directly that there is nothing to inspect rather than leaving it to be rediscovered.
+
+**What this changes about the plan.** Item 1 ("get the parent's core dump") is still the right next
+step, but it needs a runner where `core_pattern` is a plain path - neither the GitHub runner nor
+this machine can produce one. Until then, the most likely cheap discriminators are: run the same
+test under `gdb --args python -m pytest ...` (a core is not needed to catch SIGABRT), and
+bisect on *what the parent was doing when it exited* - the 1x1 tile is 150 MB peak locally, so OOM
+at teardown is still live and the runner may simply have less headroom than this box.
+
+**The 1x1 quarantine is still correct.** Two local passes are not a test the job can trust, and
+this is now known to be intermittent rather than environment-specific - which is a reason to fix
+the fault, not a reason to lift the quarantine.
+

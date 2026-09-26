@@ -9,7 +9,7 @@ toolchain (HEXAGON_TOOLS, default ~/.cache/hexagon-oa-19/Tools) or a Hexagon-cap
   run_hand(c_file, work, *args, includes=(), defines=()) build + run a hand driver -> stdout (drivers print their own results)
 """
 from __future__ import annotations
-import os, re, shutil, subprocess, pathlib, contextlib
+import os, re, shutil, signal, subprocess, pathlib, contextlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -25,16 +25,47 @@ def mockdsp_ok() -> bool:
   cc = (os.environ.get("CC") or "clang").split()[0]
   return shutil.which(cc) is not None
 
+def _core_dumps_enabled() -> bool:
+  """True when an aborting child would leave a core file we can read.
+
+  The GitHub runner's core_pattern pipes cores to apport (`|/usr/share/apport/apport ...`) and apport
+  is not installed, so a SIGSEGV/SIGABRT child produces *no* file and the abort is invisible. This
+  is read-only and advisory: it is used to say so in the failure message, not to change the system.
+  """
+  try:
+    pat = pathlib.Path("/proc/sys/kernel/core_pattern").read_text().strip()
+  except OSError:
+    return False
+  return not pat.startswith("|") and not pat.startswith("/")
+
 def _sim(work:pathlib.Path, elf:str, *args) -> str:
   from tinygrad.runtime import ops_dsp
   t = tools()
-  r = subprocess.run([str(t / "bin/hexagon-sim"), "-mv69", "--mhmx", "1", "--timing", elf, "--", *map(str, args)], cwd=work,
-                     env=ops_dsp._hexsim_env(t, work), capture_output=True, text=True, check=True)
+  cmd = [str(t / "bin/hexagon-sim"), "-mv69", "--mhmx", "1", "--timing", elf, "--", *map(str, args)]
+  r = subprocess.run(cmd, cwd=work, env=ops_dsp._hexsim_env(t, work), capture_output=True, text=True)
+  # check=True raises CalledProcessError and pytest reports only the exit status, which is useless: the
+  # 1x1 and 3x3 HMX oracles both abort on the GitHub runner (a SIGSEGV/SIGABRT from the simulator child,
+  # not a test assertion) and pass locally, so the job failed with no indication of what the child did.
+  # Report the child's own diagnostics verbatim - signal, returncode, stderr, the tail of stdout and the
+  # exact command line - so the runner log carries the answer instead of needing a local repro.
+  if r.returncode != 0:
+    sig = -r.returncode if r.returncode < 0 else None
+    why = f"killed by signal {sig} ({signal.Signals(sig).name})" if sig else f"exit {r.returncode}"
+    if sig and not _core_dumps_enabled():
+      why += ("\n  NOTE: /proc/sys/kernel/core_pattern pipes cores to a handler, so the child's core was discarded\n"
+              "        and there is nothing to inspect. On a self-hosted runner, set it to 'core.%p' to capture one.")
+    tail = r.stdout.strip().splitlines()[-12:]
+    raise RuntimeError(f"hexagon-sim failed: {why}\n  cmd: {' '.join(cmd)}\n  cwd: {work}\n"
+                       f"  stderr:\n{r.stderr or '  (empty)'}\n  stdout tail:\n" + "\n".join(f"    {l}" for l in tail))
   return r.stdout
 
 def _cc(work:pathlib.Path, srcs, out:str, extra=()):
-  subprocess.run([str(tools() / "bin/hexagon-clang"), "-mv69", "-mhmx", "-mhvx", "-mhvx-length=128B", "-O2", "-Wno-deprecated-non-prototype",
-                  *extra, *map(str, srcs), "-o", out, "-lhexagon", "-lm"], cwd=work, check=True)
+  cmd = [str(tools() / "bin/hexagon-clang"), "-mv69", "-mhmx", "-mhvx", "-mhvx-length=128B", "-O2", "-Wno-deprecated-non-prototype",
+         *extra, *map(str, srcs), "-o", out, "-lhexagon", "-lm"]
+  r = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+  # same reasoning as _sim: check=True hides the compiler's own diagnostics, which are the whole point
+  if r.returncode != 0:
+    raise RuntimeError(f"hexagon-clang failed: exit {r.returncode}\n  cmd: {' '.join(cmd)}\n  stderr:\n{r.stderr or '  (empty)'}")
 
 @contextlib.contextmanager
 def capture_dsp(match=("__hmx_", "WMMA")):
