@@ -1,9 +1,20 @@
-name: LLVM clang-19 with the Hexagon backend
+name: LLVM clang with the Hexagon backend
 description: >-
-  Installs clang-19 + lld-19 + qemu-hexagon and verifies clang can target hexagonv65. The
-  apt.llvm.org build is required: Ubuntu's own clang-19 package has no hexagonv65 target, and so
-  does the Qualcomm toolchain's hexagon-clang 19 (it dropped v65), so the upstream LLVM build is the
-  only one that can compile the qemu-based oracles.
+  Installs an LLVM clang that can target hexagonv65, plus lld and qemu-hexagon, and exports CC.
+
+  The qemu-based oracles (rpn, roialign, msda, layout, mcc) build for hexagonv65, and which LLVM
+  versions still have that target varies by build, not just by version number:
+
+    * Ubuntu 24.04's clang-19      - has v65
+    * the GitHub runner's clang-19  - does NOT ("unknown target CPU 'hexagonv65'"; its valid
+                                      target CPU list starts at hexagonv68)
+    * apt.llvm.org's clang-19       - does NOT either (same, starts at v68)
+    * the Qualcomm toolchain's hexagon-clang 19 - dropped v65, which is why the upstream LLVM
+                                      clang is used at all
+
+  So this probes the candidates and picks the first that can actually compile for v65, instead of
+  pinning a version and hoping. It fails loudly if none can: otherwise the symptom appears 58 tests
+  into a run as "unknown target CPU" and reads like a kernel bug rather than a missing toolchain.
 runs:
   using: "composite"
   steps:
@@ -14,25 +25,55 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends wget gnupg ca-certificates
         wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" \
-          | sudo tee /etc/apt/sources.list.d/llvm19.list > /dev/null
+        for v in 20 19 18 17; do
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-$v main" \
+            | sudo tee /etc/apt/sources.list.d/llvm$v.list > /dev/null
+        done
         sudo apt-get update
 
-    - name: Install clang-19, lld-19, qemu-hexagon
+    - name: Install lld and qemu-hexagon
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static libncurses6
-        echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+        sudo apt-get install -y --no-install-recommends lld-19 qemu-user-static libncurses6
         qemu-hexagon-static -version
 
-    # Fail here rather than 58 tests in: without the hexagonv65 target every kernel build dies with
-    # "error: unknown target CPU 'hexagonv65'", which reads as a kernel failure rather than a
-    # missing toolchain. The Qualcomm toolchain's hexagon-clang 19 fails this probe too, which is
-    # the whole reason these tests use the upstream LLVM clang.
-    - name: Verify clang can target hexagonv65
+    - name: Install the LLVM clangs
       shell: bash
       run: |
         set -euo pipefail
-        echo 'int main(void){return 0;}' | clang-19 --target=hexagon -mcpu=hexagonv65 \
-          -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null -
+        # Best-effort: not every series is published for every Ubuntu release, and which ones install
+        # is not the point - the selection step probes whatever arrived.
+        for v in 19 18 17 20; do
+          sudo apt-get install -y --no-install-recommends "clang-$v" || echo "clang-$v unavailable, skipping"
+        done
+
+    - name: Select a clang that can target hexagonv65
+      shell: bash
+      run: |
+        set -euo pipefail
+        probe() {
+          echo 'int main(void){return 0;}' | "$1" --target=hexagon -mcpu=hexagonv65 \
+            -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null - 2>/dev/null
+        }
+        found=""
+        for c in clang-20 clang-19 clang-18 clang-17 clang-16 clang-15 /usr/lib/llvm-19/bin/clang; do
+          command -v "$c" > /dev/null 2>&1 || [ -x "$c" ] || continue
+          if probe "$c"; then
+            echo "::notice::$c can target hexagonv65"
+            [ -n "$found" ] || found="$c"
+          else
+            echo "::notice::$c cannot target hexagonv65, skipping"
+          fi
+        done
+        if [ -z "$found" ]; then
+          echo "::error::no installed clang can target hexagonv65; the qemu oracles need it"
+          exit 1
+        fi
+        {
+          echo "HEXAGON_CLANG_FOUND=$found"
+          # DSPCompiler reads CC; the hand-kernel harness reads HEXAGON_CLANG, then falls back to CC.
+          echo "CC=$found"
+          echo "HEXAGON_CLANG=$found"
+        } >> "$GITHUB_ENV"
+        "$found" --version | head -2

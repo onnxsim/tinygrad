@@ -87,13 +87,8 @@ jobs:
       - uses: ./.github/actions/hexagon-toolchain
       - name: Run the DSP oracle tests
         shell: bash  # -o pipefail: the default `bash -e` would let tee swallow pytest's exit code
-        env:
-          # CC is what tinygrad's DSPCompiler invokes; HEXAGON_CLANG is what the hand-kernel harness
-          # invokes. Both have to be pinned: the runner's default `clang` is 18, whose Hexagon float
-          # division is a call to __hexagon_divsf3 rather than clang-19's inlined Newton-Raphson
-          # sequence, and the qfloat tests check the generated source, which is clang-19's output.
-          CC: clang-19
-          HEXAGON_CLANG: clang-19
+        # CC and HEXAGON_CLANG come from the llvm-hexagon action, which probes for a clang that can
+        # target hexagonv65 rather than pinning a version (the runner's clang-19 cannot; see that action).
         run: python -m pytest -v -rs --durations=0 test/external/dsp/ | tee pytest.log
 
   dsp-hexsim:
@@ -111,9 +106,7 @@ jobs:
       - uses: ./.github/actions/hexagon-toolchain
       - name: Run the oracle tests with the toolchain required
         shell: bash
-        env:
-          CC: clang-19
-          HEXAGON_CLANG: clang-19
+        # CC and HEXAGON_CLANG come from the llvm-hexagon action (see above).
         run: |
           python -m pytest -v -rs --durations=0 test/external/dsp/hand test/external/dsp/test_qdq_onnx_dsp.py | tee pytest.log
           # everything is installed here, so a skip means a tool went missing, not an absent toolchain
