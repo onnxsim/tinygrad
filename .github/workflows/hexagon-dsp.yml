@@ -1,0 +1,126 @@
+name: Hexagon DSP (qemu-hexagon + hexagon-sim)
+
+# Runs the DSP stack's own tests inside this repository, so the work is verified here rather than only by a
+# downstream consumer. onnxsim/onnxsim's hexagon-tinygrad.yml checks the *pipeline* against a pinned SHA of
+# this fork; this workflow checks the fork itself, on every push to the DSP branches and every PR against them.
+#
+# Three tiers, cheapest first, each job independent so a toolchain problem does not hide a code problem:
+#
+#   1. dsp-render    test/unit/test_dsp_render.py -- renders the DSP kernels and checks the emitted C source.
+#                     No toolchain at all (the tests stub the compiler), so it is fast and always available.
+#   2. dsp-oracles   test/external/dsp/ -- the hand-written Hexagon kernels kept as tinygrad oracles, and the
+#                     whole-graph QDQ lowering. Needs clang (MOCKDSP) + the Hexagon open-access toolchain for
+#                     hexagon-sim; without it the tests skip themselves, which this job tolerates but reports.
+#   3. dsp-hexsim    the same oracle tests with the toolchain required -- the expensive one (hexagon-sim runs
+#                     every captured kernel), so it is separated and allowed to be slower.
+#
+# Tiers 1 and 2 are separate jobs on purpose: the two suites are order-dependent (running them in one
+# pytest process fails 22 oracle tests that pass on their own -- see test/external/dsp/hand/ORDERING.md), so
+# each job runs its own suite and nothing else.
+#
+# Why hexagon-sim and not the phone: qemu cannot execute HMX, so MOCKDSP builds the HMX tile op as a scalar
+# reference on the same layout and hexagon-sim runs it with -mv69 --mhmx 1. The phone remains the only way to
+# check the float paths, which the simulator runs as IEEE where V69 hardware computes qf32.
+
+on:
+  push:
+    branches:
+      - "dsp-*"
+      - "hvx-*"
+      - "vrmpy-*"
+      - "hand-kernel-*"
+      - "demo-app-cl"
+      - "master"
+    paths:
+      - "tinygrad/**"
+      - "test/external/dsp/**"
+      - "test/unit/test_dsp_render.py"
+      - ".github/workflows/hexagon-dsp.yml"
+  pull_request:
+    paths:
+      - "tinygrad/**"
+      - "test/external/dsp/**"
+      - "test/unit/test_dsp_render.py"
+      - ".github/workflows/hexagon-dsp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hexagon-dsp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
+  HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
+
+jobs:
+  dsp-render:
+    name: DSP renderer (no toolchain)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install numpy pytest
+      # The render tests stub the compiler and only check the emitted source, so this needs no Hexagon
+      # toolchain -- it is the tier that must never be skipped, since it is what catches a bad rewrite.
+      - name: Render and check every DSP kernel form
+        run: python -m pytest -v -rs --durations=0 test/unit/test_dsp_render.py
+
+  dsp-oracles:
+    name: DSP oracles (MOCKDSP / qemu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clang-19, lld, qemu-hexagon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static libncurses6
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+          qemu-hexagon-static -version
+          # the toolchain's own hexagon-clang 19 no longer accepts hexagonv65, which MOCKDSP targets, so the
+          # MOCKDSP builds use upstream clang-19 and only hexagon-sim comes from the toolchain
+          echo 'int main(void){return 0;}' | /usr/lib/llvm-19/bin/clang --target=hexagon -mcpu=hexagonv65 \
+            -mhvx=v65 -mhvx-length=128b -x c -c -o /dev/null -
+          python -m pip install numpy pytest onnx onnxruntime
+      - uses: ./.github/actions/hexagon-toolchain
+      - name: Run the DSP oracle tests
+        shell: bash  # -o pipefail: the default `bash -e` would let tee swallow pytest's exit code
+        run: python -m pytest -v -rs --durations=0 test/external/dsp/ | tee pytest.log
+
+  dsp-hexsim:
+    name: DSP oracles (hexagon-sim, HMX on)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clang-19, lld, qemu-hexagon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static libncurses6
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+          qemu-hexagon-static -version
+          python -m pip install numpy pytest onnx onnxruntime
+      - uses: ./.github/actions/hexagon-toolchain
+      - name: Run the oracle tests with the toolchain required
+        shell: bash
+        env:
+          HEXAGON_CLANG: clang-19
+        run: |
+          python -m pytest -v -rs --durations=0 test/external/dsp/hand test/external/dsp/test_qdq_onnx_dsp.py | tee pytest.log
+          # everything is installed here, so a skip means a tool went missing, not an absent toolchain
+          if grep '^SKIPPED' pytest.log; then
+            echo "::error::unexpected skips with the toolchain installed"; exit 1
+          fi

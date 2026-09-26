@@ -1,0 +1,56 @@
+name: Hexagon open-access toolchain
+description: >-
+  Downloads the Hexagon open-access toolchain (hexagon-sim, hexagon-clang, the vNN target headers and
+  libgcc.a) and puts its bin/ on PATH as HEXAGON_TOOLS. Cached; the restore and save are separate steps so
+  a ~1.1 GB download is kept even when the calling job's tests fail afterwards.
+inputs:
+  version:
+    description: Hexagon open-access version, e.g. "19.0.02"
+    required: false
+    default: "19.0.02"
+  url:
+    description: >-
+      Download URL for the toolchain tarball. Defaults to the Qualcomm software center path for `version`.
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+    - name: Restore Hexagon toolchain
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/hexagon-toolchain
+        key: hexagon-open-access-${{ inputs.version }}-v1
+
+    - name: Download Hexagon open-access toolchain
+      id: download
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        URL="${{ inputs.url }}"
+        if [ -z "$URL" ]; then
+          URL="https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/${{ inputs.version }}/Hexagon_open_access.Core.${{ inputs.version }}.Linux-Any.tar.gz"
+        fi
+        mkdir -p ~/hexagon-toolchain
+        curl -fsSL "$URL" -o ~/hexagon-toolchain/toolchain.tar.gz
+        tar xzf ~/hexagon-toolchain/toolchain.tar.gz -C ~/hexagon-toolchain
+        rm ~/hexagon-toolchain/toolchain.tar.gz
+
+    - name: Save Hexagon toolchain
+      if: always() && steps.download.conclusion == 'success'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/hexagon-toolchain
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+    - name: Put hexagon-sim on PATH
+      shell: bash
+      run: |
+        set -euo pipefail
+        TOOLS=$(dirname "$(dirname "$(find ~/hexagon-toolchain -path '*/bin/hexagon-sim' | head -1)")")
+        test -n "$TOOLS" || { echo "::error::hexagon-sim not found under ~/hexagon-toolchain"; exit 1; }
+        echo "HEXAGON_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+        echo "$TOOLS/bin" >> "$GITHUB_PATH"
+        ls "$TOOLS/bin" | grep -E '^hexagon-(clang|sim)$'
