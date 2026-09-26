@@ -67,6 +67,28 @@ vote is not optional. ResNet-18 QDQ, both arms built from `tinygrad@6565de79` ba
 Default build verified unchanged by the same commit: 0/25088 mismatch, 23,946,105 pcycles,
 `test_dsp_render.py` 37 passed.
 
+### Independent reproduction (2026-09-27)
+
+Re-measured on the phone from the already-deployed probe builds, to confirm the figure is not an
+artefact of one build. Both arms, `HMX_VTCM_KB=4096` (the device reports `vtcm 4194304`), 5 iters:
+
+| arm | time |
+|---|---|
+| `rn18-rqreal` (real requantization) | 22,862.6 us |
+| `rn18-rqstub` (arithmetic stubbed) | 22,800.0 us |
+| `rn18-rqstub13` (a later stub revision) | 22,703.4 us |
+| **difference (rqreal - rqstub)** | **62.6 us = 0.27%** |
+
+Both arms report `0/25088 mismatches`, so the stub is a correct-output build and not a
+fast-but-wrong one. The 62.6 us sits alongside the 52 us from the single-tree A/B: two independent
+build pairs, two runs, the same order of magnitude and the same sub-1% conclusion. The requant is
+not a lever on this graph.
+
+(For anyone re-running these: the skel only loads with `ADSP_LIBRARY_PATH="."` and a **relative**
+`file:///tg_hmx_rpc.so?...` URI, from inside the build's own directory. Absolute paths and
+`ADSP_LIBRARY_PATH=/data/local/tmp/<build>` both fail with `open failed -2147482618`, which looks
+like a build problem and is not.)
+
 ## What this means
 
 Requantization is **not** a lever on this graph. `QC_FAST` - the host-table rewrite that would trade
