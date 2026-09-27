@@ -249,11 +249,16 @@ class Scheduler:
             srcs = [x.substitute({ne[a]: ne[b] for a,b in rl.items()}, walk=True) for x,rl in zip(ins, tc.relabel())]
             if tc.dtype_in_b is not None: srcs = [_narrow_int(x) for x in srcs]
             # get upcast axes for the tensor cores
-            base_upcast_axes = [ne[c].axis_id for c in tc.base_upcast_axes()]
             upcast_cnt = [len(f[1]) for f in (tc.frag_a, tc.frag_b, tc.frag_c)]
-            # each operand upcasts its first upcast_cnt axes, the axes only A or B upcast are size 1 so the operands broadcast
-            tc_upcast_axes = tuple([tuple([(a, 2 if j < cnt else 1) for j,a in enumerate(base_upcast_axes[:max(cnt, *upcast_cnt[:2])])])
-                                    for cnt in upcast_cnt])
+            # Each operand gets its OWN slot order (TensorCore.operand_upcast_axes). One shared list
+            # (tc.base_upcast_axes(), built from frag_c plus the k bits) can only express frag_c's
+            # orientation, and HMX orients A and B differently - A = IDX(m, k), B = IDX(k, n) - so the
+            # shared list leaves B's STACK lane-ordered instead of interleaved, which silently disables
+            # the HMX accumulator path. operand_upcast_axes keeps the length at len(axis_coords) so the
+            # unroll shape is unchanged, and every bit comes from tc.axis_coords() so ne[c] is set.
+            tc_upcast_axes = tuple(tuple((ne[c].axis_id, 2 if j < upcast_cnt[i] else 1)
+                                         for j, c in enumerate(tc.operand_upcast_axes(i)))
+                                   for i in range(3))
             # construct the op
             # TODO: remove tc_upcast_axes from the arg
             tc_uop = UOp.wmma(srcs[0], srcs[1], UOp.const((0.0,)*2**upcast_cnt[2], tc.dtype_out),

@@ -23,8 +23,11 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
     used = self.frag_a[0] + self.frag_a[1] + self.frag_c[0] + self.frag_c[1]
     return [f"{d}{i}" for d in "nmk" for i in range(1+max([int(c[1:]) for c in used if c[0] == d], default=-1))]
   def relabel(self) -> list[dict[str, str]]:
-    # tc axis -> fragment slot axis, per operand
-    return [{c: y for y,c in zip(self.frag_c[0] + self.base_upcast_axes()[:len(f[1])][::-1], f[0]+f[1])} for f in (self.frag_a, self.frag_b)]
+    # tc axis -> fragment slot axis, per operand. The slot axis for an operand's i-th bit is the i-th
+    # of that operand's own slot order (operand_upcast_axes, least significant first), not frag_c's -
+    # see that method for why A and B differ. frag_c[0] (the lane bits) is shared and goes first.
+    return [{c: y for y,c in zip(self.frag_c[0] + self.operand_upcast_axes(i)[:len(f[1])][::-1], f[0]+f[1])}
+            for i, f in enumerate((self.frag_a, self.frag_b))]
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def frag_coords(self) -> list[list[list[tuple[int, int]]]]:
     # [operand][lane][element] -> tile coordinate
@@ -39,14 +42,24 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   @property
   def threads(self) -> int: return 2**len(self.frag_c[0]) # threads that construct the warp
   def operand_upcast_axes(self, idx:int) -> tuple:
-    """this operand's own element bits, in its own fragment order.
+    """this operand's slot-ordered element bits, most significant first, length == len(axis_coords).
 
-    base_upcast_axes() is a single shared list built from frag_c plus the k bits, which cannot express
-    that A is laid out (m, k) while B is (n, k): it interleaves m and n, so both operands end up with
-    the same axis list. Hexagon's HMX gives A and B different crouton orientations (IDX(m, k) and
-    IDX(k, n)), so each operand needs its own list - and getting this wrong left B's STACK lane-ordered
-    [0,1,0,1,...] instead of the interleaved [0,0,1,1,...] the row packer requires."""
-    return self.frag_a[1] if idx == 0 else self.frag_b[1] if idx == 1 else self.frag_c[1]
+    base_upcast_axes() is one shared list built from frag_c plus the k bits, so it can only express
+    frag_c's orientation. relabel() pairs an operand's bits against the *first* len(frag) entries of
+    that list positionally, which works for A (its bits already sit in C's slot order) and not for B
+    (they do not) - Hexagon's HMX gives A and B different crouton orientations, A = IDX(m, k) and
+    B = IDX(k, n). Getting this wrong leaves B's STACK lane-ordered [0,1,0,1,...] instead of the
+    interleaved [0,0,1,1,...] the HMX row packer requires, which silently disables the whole
+    accumulator path.
+
+    The length must stay len(axis_coords): expand_wmma looks every axis up in the range map, and
+    unroll_axis takes its unroll sizes from this list, so a shorter list changes the unroll shape.
+    So each operand contributes its own bits, then the axes it does not carry, k bits last."""
+    frag = (self.frag_a, self.frag_b, self.frag_c)[idx][1]
+    other = [c for c in self.axis_coords() if c not in frag]
+    k = [c for c in other if c[0] == "k"]
+    rest = [c for c in other if c[0] != "k"]
+    return tuple(frag[::-1] + tuple(rest) + tuple(k))
 
   def base_upcast_axes(self):
     # element slots, most significant bit first: upcast then reduce
@@ -187,7 +200,14 @@ hexagon_hmx = [TensorCore(dtype_in=dtypes.half, dtype_out=dtypes.half,
   # i4 i3 i2 i1 | j4 j3 j2 j1 j0 | i0, so LSB-first that is: the low M bit, then all five of the other
   # axis, then the four high M bits. A is IDX(m, k), B is IDX(k, n), C is IDX(m, n).
   frag_a=((), ("m0", "k0", "k1", "k2", "k3", "k4", "m1", "m2", "m3", "m4")),
-  frag_b=((), ("n0", "k0", "k1", "k2", "k3", "k4", "n1", "n2", "n3", "n4")),
+  # B must lead with k0, not n0. All three operands are unrolled by C's slot order (unroll_axis
+  # permutes by out0), and frag_coords shows A's *first* coordinate - the K axis - alternating fastest.
+  # Leading B with n0 made its K axis the slow one, so B's STACK came out lane-ordered
+  # [0,1,0,1,...] where A's was interleaved [0,0,1,1,...], and the HMX row packer rejected it -
+  # silently, with the whole accumulator path off. The shape below is (k0, [n0..n4], k1..k4):
+  # K's low bit leading, the N axis in the middle, K's high bits trailing, mirroring A's
+  # (m0, [k0..k4], m1..m4).
+  frag_b=((), ("k0", "n0", "n1", "n2", "n3", "n4", "k1", "k2", "k3", "k4")),
   frag_c=((), ("m0", "n0", "n1", "n2", "n3", "n4", "m1", "m2", "m3", "m4")))]
 
 # Hexagon HMX int8 ":cm" mode (V69): D (int32, 64 x 32) = C + A (u8, 64 x 32) . B (s8, 32 x 32), exact.

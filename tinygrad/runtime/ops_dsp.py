@@ -1189,7 +1189,7 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
     if getenv("HMX_DEBUG"): print("i8 live users of dropped uops:", bad[:6])
     return 29
   drop |= dead
-  before.setdefault(pos[eo.src[1]] if eo is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), "__hmx_i8_begin();"))
+  before.setdefault(pos[eo.src[1]] if eo is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), ("__hmx_i8_begin();", dtypes.void)))
   ptr = [f"((const unsigned char*){{{vals.index(v)}}}+{b})" if b else f"((const unsigned char*){{{vals.index(v)}}})" for v, b in ra] + \
         [f"((const signed char*){{{vals.index(v)}}}+{b})" if b else f"((const signed char*){{{vals.index(v)}}})" for v, b in rb]
   pa = "".join(f" __hmx_i8_pack_a4((unsigned char*)_a+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
@@ -1275,7 +1275,7 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
       code = "{{ " + ca + cb + " __hmx_i8_mac(_a, _b); }}"
       srcs = srcs + (*reds[:-1], e.src[1], outer, inner)
     if getenv("HMX_DEBUG"): print(f"i8 plan: rank {rank} (quad {is_quad}, quad A {qa}) A {na} B {nb} slots of {pool}, kt {kt}, swap {sw}")
-  replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
+  replace[w] = UOp(Ops.CUSTOM, srcs, (code, dtypes.void))
   end_at = pos[eo] if eo is not None else max(pos[so] for so, _, _ in stores)
   body = []
   for k, (_, l0, n) in enumerate(stores):
@@ -1286,11 +1286,11 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
     nm, p1 = quad
     for k_, v_ in ((f"{{{len(srcs)-2}}}", f"{{{len(accs)}}}"), (f"{{{len(srcs)-1}}}", f"{{{len(accs)+1}}}")):
       nm, p1 = nm.replace(k_, v_), p1.replace(k_, v_)
-    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, accs + (srcs[-2], srcs[-1]),
+    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, accs + (srcs[-2], (srcs[-1], dtypes.void)),
       f"{{{{ const unsigned char* _P = ({nm}%2==0) ? __hmx_i8_store2({p1}) : (const unsigned char*)({p1});" + "".join(body) + " }}"))
   else:
-    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, accs,
-                                            "{{ const unsigned char* _P = __hmx_i8_store();" + "".join(body) + " }}"))
+    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, accs,
+                                            ("{{ const unsigned char* _P = __hmx_i8_store();" + "".join(body) + " }}", dtypes.void)))
   return None
 
 def _hmx_cval(u:UOp):
@@ -1298,7 +1298,7 @@ def _hmx_cval(u:UOp):
   while u.op is Ops.CAST: u = u.src[0]
   if u.op is not Ops.CONST: return None
   try: return float(u.arg)
-  except (TypeError, ValueError): return None
+  except (TypeError, (ValueError, dtypes.void)): return None
 
 def _hmx_cadd(u:UOp):
   # x + c (either order) -> (x, c), else None
@@ -1432,7 +1432,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
       code = (f"__hmx_u32x32 _rqf = (__hmx_u32x32)(0), _rqg[{len(run)}]; for (int _g = 0; _g < {len(run)}; _g++) {{{{ _rqg[_g] = "
               f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}} if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
               f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});")
-      replace[st_last] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
+      replace[st_last] = UOp(Ops.CUSTOM, srcs, (code, dtypes.void))
       drop.discard(st_last)
       continue
     # per group its own flags (_rqg[n]) and the run's OR (_rqf): the rare flagged run then redoes only its flagged groups
@@ -1447,7 +1447,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
         code = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base - len(srcs)}}}", code)
         code += " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
         srcs = allsrc
-      replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
+      replace[st] = UOp(Ops.CUSTOM, srcs, (code, dtypes.void))
       drop.discard(st)
   # rows no group took: one __hmx_rq1 each, one CUSTOM per store (a store none of whose rows is grouped)
   grouped = {r[0] for r in done_rows}
@@ -1467,7 +1467,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
     srcs.append(st.src[0])
     code_s = " ".join(code)
     for j, *_ in rs: code_s = code_s.replace(f"@P{j}@", rp(kp, j))
-    replace[st] = UOp(Ops.CUSTOM, dtypes.void, tuple(srcs), code_s)
+    replace[st] = UOp(Ops.CUSTOM, tuple(srcs), (code_s, dtypes.void))
   # a store half grouped (its other rows single) isn't expected: leave it, and its lanes, to the plain rendering
   done = {st for st in grouped if all(((st, j) in done_rows) for j in range(len(st.src[1].src) // 32))} | set(singles)
   for st in grouped - done: drop.discard(st)
@@ -1603,7 +1603,7 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
     Y, A, B = Y.flatten(), A.flatten(), B.flatten()
     i = UOp.range((n + 2047) // 2048, 0)
     cu = UOp(Ops.CUSTOM, (Y.index(i * 2048), A.index(i * 2048), B.index(i * 2048), i),
-             arg=f"__hmx_qadd_chunk({{0}}, {{1}}, {{2}}, {nv}-16*{{3}} < 16 ? {nv}-16*{{3}} : 16, {fl(ra)}, {fl(rb)}, {fl(fixed)}, {c});")
+             arg=(f"__hmx_qadd_chunk({{0}}, {{1}}, {{2}}, {nv}-16*{{3}} < 16 ? {nv}-16*{{3}} : 16, {fl(ra)}, {fl(rb)}, {fl(fixed)}, {c});", dtypes.void))
     return cu.end(i).sink(arg=KernelInfo(name=f"qadd_{n}", opts_to_apply=()))
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
   return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
@@ -1660,7 +1660,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if any(any(v not in dead and v.op not in (Ops.GROUP, Ops.END) for v in users.get(d, [])) for d in dead): return _hmx_bail(uops, 8)
     drop |= dead
     end_at = pos[e] if e is not None else max(pos[so] for so in stores)  # where the reduction is complete
-    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), "__hmx_begin();"))
+    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), ("__hmx_begin();", dtypes.void)))
     rows = ra + rb
     vals = list(dict.fromkeys(v for v, _ in rows))
     if all(v.op is Ops.LOAD and len(v.src) == 1 and all(u in dead or u.op in (Ops.GROUP, Ops.END) for u in users.get(v, [])) for v in vals):
@@ -1744,8 +1744,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       pb = "".join(f" *(__hmx_h64*)(_b+{64*q}) = __builtin_shufflevector({{{32+2*q}}},{{{33+2*q}}},{_ILV});" for q in range(16))
       srcs = tuple(v for v, _ in rows)
     else: return _hmx_bail(uops, 10)
-    replace[w] = UOp(Ops.CUSTOM, dtypes.void, srcs, "{{ __fp16* _a = __hmx_sa(); __fp16* _b = __hmx_sb(); __fp16* _s = 0; (void)_s;"+pa+pb+
-                     (" (void)_a; (void)_b; }}" if w in span else " __hmx_mac(_a, _b); }}"))
+    replace[w] = UOp(Ops.CUSTOM, srcs, ("{{ __fp16* _a = __hmx_sa(); __fp16* _b = __hmx_sb(); __fp16* _s = 0; (void)_s;"+pa+pb+
+                     (" (void)_a; (void)_b; }}" if w in span else " __hmx_mac(_a, _b); }}"), dtypes.void))
     def span_mac(srcs0:tuple) -> tuple[str, tuple]:
       # after the loop: the spanning load pair(s) over all K tiles, rendered with the tile loops' indices
       if w not in span: return "", ()
@@ -1789,16 +1789,16 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
                 f" else if (({n0})%2==0) {{{{{mac0} const __fp16* _p = __hmx_store();{pairs} }}}} }}}}")
         at = max(pos[g] for g in gone if g.op is Ops.STORE)
         after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
-                                        [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+(o_, i_), code)])
+                                        [UOp(Ops.CUSTOM, tuple(rowptr)+(o_, (i_, dtypes.void)), code)])
         continue
       # where the last replaced store was: every row pointer expression is rendered by then
       at = max(pos[g] for g in gone if g.op is Ops.STORE)
       sm, sx = span_mac(tuple(rowptr))
       after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
-                                      [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}")])
+                                      [UOp(Ops.CUSTOM, tuple(rowptr)+sx, ("{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}", dtypes.void))])
       continue
     row_of = {}
-    for so in stores:  # stores that are exactly the tile's 32 rows (IDX(i, 0..31)): the HVX row-pair output
+    for so in stores:  # stores that are exactly the tile's 32 rows (IDX(i, (0..31), dtypes.void)): the HVX row-pair output
       lanes = [l[1] for x in so.src[1].src if (l:=_hmx_lane(x)) is not None]
       i = 2 * (lanes[0] // 64) + lanes[0] % 2 if lanes else -1
       if len(lanes) != 32 or lanes != [64*(i//2) + 2*j + i%2 for j in range(32)] or i in row_of: break
@@ -1807,16 +1807,16 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       rowptr = [row_of[i] for i in range(32)]
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       sm, sx = span_mac(tuple(rowptr))
-      after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}"))
+      after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, tuple(rowptr)+sx, ("{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}", dtypes.void)))
       continue
     sm, sx = span_mac(tuple(so.src[0] for so in stores))
-    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
+    after.setdefault(end_at, ([], dtypes.void)).append(UOp(Ops.CUSTOM, tuple(so.src[0] for so in stores)+sx,
       "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
-  if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", 1):
+  if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", (1, dtypes.void)):
     nrq = _hmx_rq_rows(uops, users, drop, before, replace, pos)
     if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}")
   if not replace: return _hmx_bail(uops, 9)
-  if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, (), "__hmx_call_start();"))
+  if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, (), ("__hmx_call_start();", dtypes.void)))
   out = []
   for i, u in enumerate(uops):
     out += before.get(i, [])
