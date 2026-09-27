@@ -284,6 +284,27 @@ and at that density there is very little left to remove.
 not broken down individually; layer4 is 6.7 ms and already at rank 2. If more is wanted it is in the
 loop split for layer4's B operand (the pool needs `ti*kt <= 1920` and it is 2,304), not in the stem.
 
+## Why the tile-loop change is safe
+
+It is a caching change, so it deserves the argument rather than just the measurement.
+
+**It can only move a kernel from uncached to cached, never to a half-cached state.** `plan()`
+returns one rank for both operands - 4 (quad), 3 (both), 2 (A only), 1 (B only), 0 (neither) - and
+the emitted code branches on that single value. If neither operand fits, it falls through to the
+uncached `__hmx_i8sa`/`__hmx_i8_sb` path, which is what 14 of the 16 int8 convs already used.
+
+**The pool sizing and the emitted slot arithmetic are the same expression, so they cannot
+disagree.** With one tile loop the operand *is* indexed by that loop, so `deps == {inner}` and
+`need(r) = ti * kt`; the slot is `(tile) * kt + k`, which ranges over exactly `ti * kt` values. The
+number the planner reserved is the number the emitted index can reach.
+
+**It fires in exactly one situation:** `len(loops) == 1` and at least one reduce loop is open.
+Before, that returned `None` unconditionally and the whole cache block was skipped.
+
+And it is verified end to end, not just argued: `0/25088` against ORT on the phone (a wrong VTCM
+slot reads garbage and would show up immediately), `test_dsp_render` 37 passed, and the three
+device runs agreeing to within 50 us.
+
 ## What this rules out
 
 The requantization is **0.2-0.27%** (`REQUANT_RECONCILE.md`, 52 us single-tree and 62.6 us reproduced
