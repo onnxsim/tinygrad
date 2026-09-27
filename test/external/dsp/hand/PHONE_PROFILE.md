@@ -129,12 +129,44 @@ which is the best possible answer, and every int8 conv in the graph reports rank
 definitions - and uses `__hmx_i8_mac` / `__hmx_i8_mac2` with `__hmx_i8_copy_a` + 9 `__hmx_i8_pack_b4`
 per mac, i.e. the uncached path. The plan and the emission disagree.
 
-`_hmx_i8_rewrite` can only reach the cached branch if it gets past its `return 21..28` bails, and the
-one between the plan and the emission is the `return 23..27` accumulator walk (lane INDEX -> STACK(128)
--> ADD(LOAD, STACK) -> STORE) - the same walk that is still failing in the rebase branch. On
-`dsp-consolidated` layer4 clearly reaches it (it emits the cached form), so this is a measurement to
-make next, not a conclusion: **print which bail layer4 hits on this tree**, and if it is reaching the
-cached branch, find where the `__hmx_ca` call goes between `plan()` and `replace[w]`.
+**Root cause, found.** The int8 rewrite's cache block is gated on
+
+    if loops is not None and e is not None and all(ro) and getenv("HMX_I8_CACHE", 1):
+
+and `_hmx_tile_loops` returns `None` when the kernel has **fewer than two output-tile loops**
+(`if len(loops) < 2: return None`). A temporary `HMX_DBG_EMIT` print on that gate reports, for the whole
+ResNet-18 graph:
+
+    3 convs:  loops=NONE   e=yes  ro=[True, True]     <- layer4
+    16 convs: loops=yes    e=yes  ro=[True, True]
+
+**Those three are exactly the layer4 triple (34.1% of the graph).** Confirmed in the emitted C:
+
+| kernel | Lidx loops | `__hmx_ca` uses | branch |
+|---|---|---|---|
+| k72 (call 129) | `Lidx4<16`, `Lidx5<2` | 36 | quad, cached |
+| k75 (call 132) | `Lidx4<16` | **0** | plain `__hmx_i8_mac` + 8 `pack_b4` |
+| k81 (call 138) | `Lidx4<16` | 0 | plain |
+| k82 (call 143) | `Lidx4<16` | 0 | plain |
+
+Layer4's 16 output channels fit in a single `Lidx4<16` tile loop, so there is no second tile axis to
+index the VTCM pool by, and the whole cached path is skipped. The other 3x3 convs have two tile loops
+(`Lidx<16>` x `Lidx<2>`) and are cached.
+
+So this is not a tuning knob and not an emission bug - it is a precondition that does not hold for
+this shape. The two ways forward, in order of cost:
+
+1. **Let the single-tile-loop case use the pool anyway**, keyed on the one tile loop it does have
+   (`slot()` already handles `deps == {inner}` and `deps == {outer}`; the blocker is only that
+   `outer`/`inner` come from a pair). The natural split is (reduce loop, tile loop) rather than
+   (outer tile, inner tile). That reuses all the existing fill/slot logic.
+2. **Tile layer4's output into two loops** so it matches its siblings, at the cost of splitting the
+   accumulator and the store.
+
+(1) is the smaller change and does not alter what the kernel computes. It is not started here: the
+`plan()` arithmetic assumes `outer` and `inner` are both tile loops, so the pool sizing
+(`need(r)` returning `ti*kt` or `kt`) has to be re-derived, and getting that wrong produces a kernel
+that reads the wrong VTCM slot - correct-looking, wrong answer.
 
 The useful consequence either way: the next win is not a micro-optimization, it is making layer4 use
 the cache the planner already thinks it is using. That is worth up to ~7 ms on a 22.8 ms graph, and it
