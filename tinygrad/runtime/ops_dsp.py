@@ -347,7 +347,7 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not _hvx_qfloat(): return None
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
   if not _vec_column_ok(srcs): return None
-  return UOp(s0.op, s0.dtype, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)
+  return UOp(s0.op, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)
 
 pm_hvx_revectorize = PatternMatcher([(UPat(Ops.STACK, name="x"), hvx_revectorize)])
 
@@ -1119,7 +1119,7 @@ def _hmx_direct_out(uops, pos, users, at:int, stores):
           if any(l is None for l in lanes): return None
           i = 2 * (lanes[0] // 64) + lanes[0] % 2
           if lanes != [64*(i//2) + 2*j + i%2 for j in range(32)]: return None
-          ptr = g.src[0] if c == 0 else UOp(Ops.CUSTOMI, g.src[0].dtype, (g.src[0],), f"({{0}}+{32*c})")
+          ptr = g.src[0] if c == 0 else UOp(Ops.CUSTOMI, (g.src[0],), f"({{0}}+{32*c})")
           if rows.setdefault(i, ptr) is not ptr: return None
   if sorted(rows) != list(range(32)): return None
   return [rows[i] for i in range(32)], gone
