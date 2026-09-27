@@ -1,5 +1,17 @@
 # Per-kernel phone profile (ResNet-18 QDQ, Xiaomi 12S V69)
 
+## Where the graph is now
+
+| | us | vs 22,808.6 baseline |
+|---|---|---|
+| baseline (before this session's work) | 22,808.6 | - |
+| + layer4 caches its activation tile | 21,753.8 - 21,910.6 | -1.05 ms, -4.6% |
+| + the VTCM pool takes the whole 4 MB grant | **21,511.0 - 21,558.0** | **-1.29 ms, -5.7%** |
+
+Both changes are `0/25088` vs ORT and `test_dsp_render` 37 passed throughout. Three runs of the
+final build: 21,511.0 / 21,528.0 / 21,558.0.
+
+
 The first **device-side** per-kernel breakdown. Every earlier per-kernel number in this project came
 from hexagon-sim, which had already proved wrong twice (per-kernel shares off by up to 1.5x; V69 `.sf`
 float paths run as IEEE where the hardware computes qf32). The phone has had a per-call profiler the
