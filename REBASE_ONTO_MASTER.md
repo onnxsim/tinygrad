@@ -1,8 +1,7 @@
 # Rebasing `dsp-consolidated` onto upstream master
 
-**Status: the tree imports and 21 of 37 render tests pass (up from 0). The `rangeify.py` conflict is
-resolved; 15 render tests remain, all HMX tensor-core, from one structural cause. Details below,
-with the measurements.**
+**Status: the tree imports and 28 of 37 render tests pass. The `rangeify.py` conflict is resolved;
+9 remain, 6 of them HMX int8. Details below, with the measurements.**
 
 ## Progress
 
@@ -11,11 +10,11 @@ with the measurements.**
 | conflicts resolved, tree does not import | 0 |
 | rangeify ported, tree imports | 0 (instant `AttributeError`) |
 | `UOp`'s dropped `dtype` parameter fixed | 3 passed / 35 failed |
-| `wmma_args` 7-tuple -> 5-tuple fixed | 16 passed / 21 failed |
-| HMX + int8 fragment element order fixed | **22 passed / 15 failed** |
-
-The 15 remaining are all `TestDSPHmx` / `TestDSPHmxI8` and all one cause: the fp16 path's **B
-operand** reaches the HMX row packer lane-ordered instead of interleaved. See "The open one" below.
+| `wmma_args` 7-tuple -> 5-tuple fixed | 16 / 21 |
+| HMX + int8 fragment element order fixed | 22 / 15 |
+| B leads with `k0`, CUSTOM arg carries its dtype | 25 / 12 |
+| three regex-mangled CUSTOM sites repaired | 27 / 10 |
+| qadd helper check reads `arg[0]` | **28 / 9** |
 
 ## What upstream actually did
 
@@ -84,33 +83,36 @@ fork was the **consumer** — nothing produced them:
 
 Plus `pm_no_views` grafted in, the `PCONTIG` branch removed, and `FUNCTION` -> `STAGE`.
 
-## The open one: the fp16 HMX B operand
+## The open one: HMX int8 has no accumulator chain to rewrite
 
-**Symptom.** All 15 remaining failures are HMX tensor-core tests. `_hmx_acc_rewrite` bails at
-`HMX_DEBUG`'s "check 1" — `_hmx_rows` returned `None` — so `self._hmx_acc` stays `False` and
-`_HMX_ACC_HELPERS` is never appended. The output is **12** `__hmx_` references where green has
-**529**. No error anywhere: the path is simply off.
+**Symptom.** Six of the nine remaining failures are `TestDSPHmxI8`. The `:cm` tile op is correct —
+`activation.ub = mxmem(%0,%1):cm` is emitted and the tile op itself is right — but
+`_hmx_acc_rewrite` bails at **check 25** and the output carries 2 `__hmx_` references where the fp16
+path now carries 529. So `:deep`, `#ifdef HMX_REF` and the `__hmx_i8_begin()` bookkeeping are all
+missing: the int8 tiles are emitted one at a time with no accumulator kept across the K loop.
 
-**Measured.** Both operands reach the packer as 1024-lane STACKs. A's lanes are `[0,0,1,1,2,2]` —
-identical to green. B's are `[0,1,0,1,0,1]`. `_hmx_rows` maps `p -> (2*(p//64) + p%2, (p%64)//2)` and
-needs consecutive `p` to share a value in pairs, so A passes and B fails.
+**Measured.** Both int8 operands pass the row packer (`_hmx_rows_i8` returns rows for A at
+`32*m + k` and B at `128*(k//4) + 4*n + k%4`), so this is not the fragment order — that was the
+earlier bug and it is fixed. The bail is one step later. The rewrite walks
 
-**Why.** HMX gives A and B different crouton orientations: A is `IDX(m, k)` and B is `IDX(k, n)`. The
-new fragment API's `relabel()` maps each fragment bit to a slot axis **positionally** — pairing
-`frag_b[i]` with `base_upcast_axes()[:len(frag_b)][::-1][i]` — and `base_upcast_axes()` is a single
-shared list built from `frag_c` plus the k bits. It interleaves `m` and `n`, so it cannot express the
-A/B asymmetry: both operands get the same axis list. A happens to come out right because its bits
-already sit in C's slot order; B's do not.
+    lane INDEX -> STACK(128) -> ADD(LOAD acc, STACK) -> STORE acc
 
-**What I tried, and why it is not landed.** Giving each operand its own element-bit list
-(`TensorCore.operand_upcast_axes`, added) and building `tc_upcast_axes` per operand is the right
-shape — but `expand_wmma` looks every axis up in the range map, and the per-operand lists are 10
-entries where the shared one is 15, so it raised `KeyError (13,)`; padding to equal length did not
-fix it either, and reversing to MSB-first changed the key to `(17,)` without resolving it. I reverted
-rather than land it half-done. The session established that **all three candidate B orders and the
-A/B k-consistency check** agree the current `frag_b = (n0, k0..k4, n1..n4)` is the only
-self-consistent one — so the fragments are right and the fix has to happen in how the axis list is
-built, not in the fragment declarations.
+and the graph now has **no ADD**: the STACK's only consumer is a `STORE`. On some shapes there is a
+`CAST` in between (`int -> short`, i.e. the 8-bit lanes summed into a 16-bit accumulator), which the
+fork did not have; I made the walk see through int-to-int casts in either direction, and that moved
+the bail for the `int -> short` shapes but not for these, where the ADD is absent altogether.
+
+**Why this is not simply fixed.** The accumulator `LOAD` is the thing the rewrite exists to keep
+resident in VTCM, so its absence is the symptom, not the cause. Something upstream is now folding the
+`+=` into the tile before the rewrite sees it — plausibly one of the `permutes_for_shape_str` ->
+`relabel()` or `srcs`-rewriting changes in `_apply_tc_opt`, but I have not isolated which, and
+guessing would risk landing a rewrite that silently computes the wrong thing. The right next step is
+to dump the int8 AST just before `_hmx_i8_rewrite` and compare it against the green branch's, the way
+the fragment bug was found.
+
+**Also still open**, from the same family: `test_strided_reduce_prefetches_rows_ahead` and
+`test_epilogue_single_m_tile` / `test_single_k_tile_matmul` — these are `assertIn` failures on
+expected source text, not crashes, and are likely downstream of the same int8 issue once it lands.
 
 ## What is done and worth keeping
 
