@@ -466,7 +466,11 @@ static inline {vt_c} __{name}({vt_a} a, {vt_b} b, {vt_c} c) {{
 # every K panel at a stride of _hmx_stride(kt) slots -- no load pair (<= 32 tiles) crosses a 256 KB window (a PD fault), so
 # whole weight matrices (fc2: 16 x 64 tiles) stay packed across a call instead of being repacked per output tile
 HMX_VTCM_KB = getenv("HMX_VTCM_KB", 256)
-_HMX_AO, _HMX_CA, _HMX_CB = (65536, (HMX_VTCM_KB // 2 - 32 - 128) // 128 * 128, 128) if HMX_VTCM_KB > 256 else (16384, 76, 40)
+_HMX_AO = 65536  # activation staging, ahead of the operand pool in VTCM
+# _HMX_CB (128 slots of 2 KB) is reserved out of the same VTCM as the A region, and the whole
+# grant is shared rather than half of it: at the phone's 4 MB the old half-pool left 192 KB
+# accounted for by nothing.
+_HMX_CA, _HMX_CB = ((HMX_VTCM_KB - _HMX_AO // 1024 - 32 - 256) // 2, 128) if HMX_VTCM_KB > 320 else (76, 40)
 def _hmx_stride(kt:int) -> int:
   # slots per K panel: a power of two (<= 32 tiles) or a multiple of 32, so from a 32-slot aligned base no 32-tile load pair
   # crosses a 128-slot (256 KB) window; the default layout packs panels densely (it is one window)
@@ -1229,7 +1233,7 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
       if na is not None and na <= pool: return (2, na, 0, False)
       if nb is not None and nb <= pool: return (1, 0, nb, False)
       return (0, 0, 0, False)
-    orders = [(loops[0], loops[1], False)] + ([(loops[1], loops[0], True)] if loops[3] else [])
+    orders = [(loops[0], loops[1], False)] + ([(loops[1], loops[0], True)] if loops[3] and not loops[4] else [])
     # best rank; ties keep the default (the longer loop outermost)
     outer, inner, sw = max(orders, key=lambda o: (plan(o[0], o[1])[0], o[2] == loops[2]))
     swap_out.append(sw)
@@ -1933,12 +1937,26 @@ def _hmx_tile_loops(uops:list[UOp], at:int):
     if u.op is Ops.RANGE: open_.append(u)
     elif u.op is Ops.END and len(u.src) > 1 and u.src[1] in open_: open_.remove(u.src[1])
   loops = [r for r in open_ if r in end_of and r.arg[-1] != AxisType.REDUCE]
-  if len(loops) < 2: return None
-  o, i = loops[-2], loops[-1]
+  red_pair = None
+  if len(loops) < 2:
+    # Only one output-tile loop - the shape where a whole layer's output fits a single tile
+    # (ResNet-18's layer4 3x3s: 16 channels = Lidx4<16 and nothing else). There is no second tile
+    # axis to index the VTCM pool by, so this used to return None and skip caching entirely, which is
+    # why the cache was worth 7.8 ms on every other conv and 34 us on the three that are a third of
+    # the graph. Pair the single tile loop with the innermost *reduce* loop: plan() only asks which of
+    # (outer, inner) an operand is indexed by, and with one tile loop the operand is indexed by the
+    # tile, so (reduce, tile) gives the same dependency answer the two-tile case gives. The pair is
+    # reported separately (red_pair) so only the int8 path opts in - the fp16 path must not treat a
+    # reduce loop as a tile loop.
+    reds_open = [r for r in open_ if r in end_of and r.arg[-1] == AxisType.REDUCE]
+    if len(loops) != 1 or not reds_open: return None
+    o, i, red_pair = reds_open[-1], loops[-1], reds_open[-1]
+  else:
+    o, i = loops[-2], loops[-1]
   mid = uops[pos[o]+1:pos[i]]
   between_ends = [u for u in uops[pos[end_of[i]]+1:pos[end_of[o]]] if u.op not in (Ops.GROUP, Ops.NOOP)]
-  legal = bool(getenv("HMX_INTERCHANGE", 1)) and not between_ends and not any(_hmx_uses(x, i) for x in mid)
-  return o, i, legal and o.vmax < i.vmax, legal
+  legal = red_pair is None and bool(getenv("HMX_INTERCHANGE", 1)) and not between_ends and not any(_hmx_uses(x, i) for x in mid)
+  return o, i, legal and o.vmax < i.vmax, legal, red_pair
 
 def _hmx_interchange(uops:list[UOp], o:UOp, i:UOp) -> list[UOp]:
   pos = {u:k for k,u in enumerate(uops)}
