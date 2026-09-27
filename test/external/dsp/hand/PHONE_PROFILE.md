@@ -172,6 +172,32 @@ The useful consequence either way: the next win is not a micro-optimization, it 
 the cache the planner already thinks it is using. That is worth up to ~7 ms on a 22.8 ms graph, and it
 is a correctness-of-emission question, not a tuning one.
 
+## FIXED: layer4 caches its activation tile - 22,808.6 -> 21,910.6 us
+
+The fix described below, taken: pair the single tile loop with the innermost reduce loop, int8 only.
+
+| call | kernel | before | after |
+|---|---|---|---|
+| 132 | `r_16_..._3_3_16` | 2,533 | **2,183** |
+| 138 | `r_16_..._3_3_16` | 2,610 | **2,272** |
+| 143 | `r_16_..._3_3_16` | 2,602 | **2,260** |
+| | **graph** | **22,808.6** | **21,910.6** (-898.4, -3.9%) |
+
+`0/25088` vs ORT, and `test_dsp_render` 37 passed unchanged. In the emitted C, k75/k81/k82 went from
+**0** `__hmx_ca` uses to 1 each.
+
+**It lands on rank 2 (A cached, B streamed), which is the right answer.** With `ti = 16` (the tile
+loop) and `kt = 144` (all reduce iterations), caching B would need `ti*kt = 2,304` slots against a
+**1,920**-slot pool. A - the activation crouton, re-read once per tap - is what the 898 us is. B, the
+weight, is still gathered by 8 `pack_b4` per mac.
+
+**What is left, and why the pool is not the lever.** Caching B needs `ti*kt <= pool`, which at
+`ti = 16, kt = 144` is 2,304 against 1,920. The pool cannot grow: VTCM is already at the device's
+4 MB maximum and 8 MB measured *worse* (23,110.7 us) than 4 MB. The lever is the loop split - either
+a smaller inner loop (fewer K blocks resident per tile) or a smaller `kt` by hoisting a reduce
+outside - and both change what the accumulator holds, so they need their own verification rather than
+an assumption.
+
 ## What this rules out
 
 The requantization is **0.2-0.27%** (`REQUANT_RECONCILE.md`, 52 us single-tree and 62.6 us reproduced
