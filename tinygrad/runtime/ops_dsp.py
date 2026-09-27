@@ -1286,8 +1286,8 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
     nm, p1 = quad
     for k_, v_ in ((f"{{{len(srcs)-2}}}", f"{{{len(accs)}}}"), (f"{{{len(srcs)-1}}}", f"{{{len(accs)+1}}}")):
       nm, p1 = nm.replace(k_, v_), p1.replace(k_, v_)
-    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, accs + (srcs[-2], (srcs[-1], dtypes.void)),
-      f"{{{{ const unsigned char* _P = ({nm}%2==0) ? __hmx_i8_store2({p1}) : (const unsigned char*)({p1});" + "".join(body) + " }}"))
+    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, accs + (srcs[-2], srcs[-1]),
+      (f"{{{{ const unsigned char* _P = ({nm}%2==0) ? __hmx_i8_store2({p1}) : (const unsigned char*)({p1});" + "".join(body) + " }}", dtypes.void)))
   else:
     after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, accs,
                                             ("{{ const unsigned char* _P = __hmx_i8_store();" + "".join(body) + " }}", dtypes.void)))
@@ -1298,7 +1298,7 @@ def _hmx_cval(u:UOp):
   while u.op is Ops.CAST: u = u.src[0]
   if u.op is not Ops.CONST: return None
   try: return float(u.arg)
-  except (TypeError, (ValueError, dtypes.void)): return None
+  except (TypeError, ValueError): return None
 
 def _hmx_cadd(u:UOp):
   # x + c (either order) -> (x, c), else None
@@ -1789,7 +1789,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
                 f" else if (({n0})%2==0) {{{{{mac0} const __fp16* _p = __hmx_store();{pairs} }}}} }}}}")
         at = max(pos[g] for g in gone if g.op is Ops.STORE)
         after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
-                                        [UOp(Ops.CUSTOM, tuple(rowptr)+(o_, (i_, dtypes.void)), code)])
+                                        [UOp(Ops.CUSTOM, tuple(rowptr)+(o_, i_), (code, dtypes.void))])
         continue
       # where the last replaced store was: every row pointer expression is rendered by then
       at = max(pos[g] for g in gone if g.op is Ops.STORE)
