@@ -2055,7 +2055,8 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
-    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
+    # the arg is (str, DType) upstream, so the text is arg[0]
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, tuple) and u.arg[0].startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
