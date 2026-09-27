@@ -103,6 +103,43 @@ VTCM pool, phone-granted 4 MB:
 2 MB costs 300 us - this is the 14.6% the handoff warned about, and it is why `HMX_VTCM_KB=4096` is
 mandatory for any measurement here.
 
+## The VTCM operand cache is worth 7.8 ms - and layer4 does not get it
+
+`HMX_I8_CACHE=0` on the device, same tree:
+
+| call | kernel | cache | no cache | delta |
+|---|---|---|---|---|
+| 129 | `r_16_..._3_3_8` | 492 | 3,354 | **+2,862** |
+| 57 | stem 1x1 | 4,701 | 5,461 | +760 |
+| 108 | 3x3 | 304 | 889 | +585 |
+| 87 | 3x3 | 441 | 1,007 | +566 |
+| 132/138/143 | **layer4 3x3** | 2,533/2,610/2,602 | 2,544/2,609/2,626 | **+11/-1/+24** |
+| | graph total | **22,808.6** | **30,587.2** | **+7,778.6** |
+
+So the cache is doing enormous work *everywhere except layer4*, which is a third of the graph.
+Layer4 gets 34 us out of a possible ~7.7 ms.
+
+**And the planner thinks it is caching layer4.** A temporary `HMX_DBG_PLAN` print in `plan()` reports
+for layer4 (`outer=16 inner=2 reds=[3,3,8]`, pool 1920 slots):
+
+    A(0) = (rank 4, A 144 slots, B 144 slots, quad=True)
+
+which is the best possible answer, and every int8 conv in the graph reports rank 4 or 3. But the
+*emitted* layer4 kernel contains no `__hmx_ca(...)` or `__hmx_cb(...)` **call** - only their
+definitions - and uses `__hmx_i8_mac` / `__hmx_i8_mac2` with `__hmx_i8_copy_a` + 9 `__hmx_i8_pack_b4`
+per mac, i.e. the uncached path. The plan and the emission disagree.
+
+`_hmx_i8_rewrite` can only reach the cached branch if it gets past its `return 21..28` bails, and the
+one between the plan and the emission is the `return 23..27` accumulator walk (lane INDEX -> STACK(128)
+-> ADD(LOAD, STACK) -> STORE) - the same walk that is still failing in the rebase branch. On
+`dsp-consolidated` layer4 clearly reaches it (it emits the cached form), so this is a measurement to
+make next, not a conclusion: **print which bail layer4 hits on this tree**, and if it is reaching the
+cached branch, find where the `__hmx_ca` call goes between `plan()` and `replace[w]`.
+
+The useful consequence either way: the next win is not a micro-optimization, it is making layer4 use
+the cache the planner already thinks it is using. That is worth up to ~7 ms on a 22.8 ms graph, and it
+is a correctness-of-emission question, not a tuning one.
+
 ## What this rules out
 
 The requantization is **0.2-0.27%** (`REQUANT_RECONCILE.md`, 52 us single-tree and 62.6 us reproduced
