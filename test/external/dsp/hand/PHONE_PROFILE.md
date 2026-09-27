@@ -50,6 +50,59 @@ The earlier diagnostics for this family stand and are not contradicted:
   costing 0.5 ms in the current build. That earlier figure does not reproduce and should not be
   trusted.
 
+## The weight repack is the layer4 cost
+
+Reading the generated kernel (`k75.c`, 629 lines) rather than guessing:
+
+    __hmx_i8_begin();
+    for (Ridx0 < 3)            // dy tap
+      for (Ridx1 < 3)          // dx tap
+        for (Ridx2 < 16)       // K block
+          __hmx_i8_copy_a(...);                                  // 1 activation copy
+          __hmx_i8_pack_b4(_b+0,   ... +0, +512, +1024, +1536);  // 9 weight packs
+          ... x9
+          __hmx_i8_mac(_a, _b);
+
+So per inference: **2,304 macs, 2,304 activation copies, 20,736 weight packs, 82,944 weight loads.**
+The packs outnumber the macs 9:1, and each `pack_b4` gathers four rows 512 bytes apart. At
+1.133 us per mac, the arithmetic is nowhere near the cost.
+
+The redundancy: `alu0 = Lidx4 << 5` puts the **output tile loop outermost**, so the same 36 weight
+values are re-gathered for all 16 output tiles - a 16x redundancy in the gather if the weights could
+be hoisted or kept in VTCM across the `Lidx4` loop.
+
+## Confirmed on the device: the quad rank is worth 1.4 ms, and only there
+
+`HMX_I8_QUAD=0`, same tree, same profile harness:
+
+| call | kernel | quad | no-quad | delta |
+|---|---|---|---|---|
+| 129 | `r_16_..._3_3_8` | 492 us | 1,222 us | **+730** |
+| 57 | `r_2_202_..._4_4` (stem) | 4,701 us | 4,806 us | +105 |
+| 132/138/143 | `r_16_..._3_3_16` (layer4) | 2,533/2,610/2,602 | 2,558/2,591/2,612 | ~0 |
+| | **sum of >100 us kernels** | **21,939** | **23,336** | **+1,397** |
+
+The whole regression is one kernel. Layer4 - a third of the graph - is **already** on the quad rank
+and does not change, so the pack count there is not the limiter; call 129 was the one that had not
+been promoted.
+
+`HMX_I8_QUAD_A=0` (the activation pack): **22,799.4 us against 22,808.6** - no difference, within
+noise. This does not reproduce the 0.5 ms figure recorded earlier from a build of a different tree,
+and PHONE_PROFILE.md and STATUS should treat that number as withdrawn.
+
+VTCM pool, phone-granted 4 MB:
+
+| pool | us/inference |
+|---|---|
+| 1 MB | 23,372.7 |
+| 2 MB | 23,108.3 |
+| **4 MB** | **22,808.6** |
+| 8 MB | 23,110.7 |
+
+4 MB is the optimum and the device grants exactly that, so the pool is already where it wants to be.
+2 MB costs 300 us - this is the 14.6% the handoff warned about, and it is why `HMX_VTCM_KB=4096` is
+mandatory for any measurement here.
+
 ## What this rules out
 
 The requantization is **0.2-0.27%** (`REQUANT_RECONCILE.md`, 52 us single-tree and 62.6 us reproduced
