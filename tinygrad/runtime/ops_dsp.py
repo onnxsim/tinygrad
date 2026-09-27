@@ -1810,9 +1810,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, tuple(rowptr)+sx, ("{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}", dtypes.void)))
       continue
     sm, sx = span_mac(tuple(so.src[0] for so in stores))
-    after.setdefault(end_at, ([], dtypes.void)).append(UOp(Ops.CUSTOM, tuple(so.src[0] for so in stores)+sx,
-      "{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}"))
-  if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", (1, dtypes.void)):
+    after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, tuple(so.src[0] for so in stores)+sx,
+      ("{{"+sm+" __fp16* _p = __hmx_store(); __hmx_h128* _o = (__hmx_h128*)_p; (void)_o;"+"".join(outs)+" }}", dtypes.void)))
+  if any(w.op is Ops.WMMA and w.arg[1] == dtypes.uint8 for w in uops) and getenv("HMX_RQ", 1):
     nrq = _hmx_rq_rows(uops, users, drop, before, replace, pos)
     if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}")
   if not replace: return _hmx_bail(uops, 9)
