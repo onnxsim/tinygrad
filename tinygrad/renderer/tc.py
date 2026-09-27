@@ -173,9 +173,12 @@ hexagon_v65 = [TensorCore(dtype_in=di, dtype_out=dtypes.int32, dtype_in_b=db,
 # before them. That is the element order below: C is (n0..n4, m0..m4) read as a bit string, A puts K in N's
 # place and B puts K in M's place, both with the same interleave.
 hexagon_hmx = [TensorCore(dtype_in=dtypes.half, dtype_out=dtypes.half,
-  frag_a=((), ("k0", "k1", "k2", "k3", "k4", "m0", "m1", "m2", "m3", "m4")),   # IDX(m, k): m0 is the LSB
-  frag_b=((), ("k0", "k1", "k2", "k3", "k4", "n0", "n1", "n2", "n3", "n4")),  # IDX(k, n): n0..n4 trailing
-  frag_c=((), ("n0", "n1", "n2", "n3", "n4", "m0", "m1", "m2", "m3", "m4")))]
+  # element bits, least significant first. HMX's IDX(i, j) = 64*(i/2) + 2*j + i%2 reads MSB..LSB as
+  # i4 i3 i2 i1 | j4 j3 j2 j1 j0 | i0, so LSB-first that is: the low M bit, then all five of the other
+  # axis, then the four high M bits. A is IDX(m, k), B is IDX(k, n), C is IDX(m, n).
+  frag_a=((), ("m0", "k0", "k1", "k2", "k3", "k4", "m1", "m2", "m3", "m4")),
+  frag_b=((), ("n0", "k0", "k1", "k2", "k3", "k4", "n1", "n2", "n3", "n4")),
+  frag_c=((), ("m0", "n0", "n1", "n2", "n3", "n4", "m1", "m2", "m3", "m4")))]
 
 # Hexagon HMX int8 ":cm" mode (V69): D (int32, 64 x 32) = C + A (u8, 64 x 32) . B (s8, 32 x 32), exact.
 # A(m, k) is plain row-major at byte 32*m + k; the weight block W(k, n) sits at byte 128*(k/4) + 4*n + k%4

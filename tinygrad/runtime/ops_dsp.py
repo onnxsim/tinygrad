@@ -1189,7 +1189,7 @@ def _hmx_i8_rewrite(w:UOp, uops, pos, users, drop, before, after, replace, swap_
     if getenv("HMX_DEBUG"): print("i8 live users of dropped uops:", bad[:6])
     return 29
   drop |= dead
-  before.setdefault(pos[eo.src[1]] if eo is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_i8_begin();"))
+  before.setdefault(pos[eo.src[1]] if eo is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), "__hmx_i8_begin();"))
   ptr = [f"((const unsigned char*){{{vals.index(v)}}}+{b})" if b else f"((const unsigned char*){{{vals.index(v)}}})" for v, b in ra] + \
         [f"((const signed char*){{{vals.index(v)}}}+{b})" if b else f"((const signed char*){{{vals.index(v)}}})" for v, b in rb]
   pa = "".join(f" __hmx_i8_pack_a4((unsigned char*)_a+{128*q}, {ptr[4*q]}, {ptr[4*q+1]}, {ptr[4*q+2]}, {ptr[4*q+3]});" for q in range(16))
@@ -1602,7 +1602,7 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
   def kern(Y, A, B):
     Y, A, B = Y.flatten(), A.flatten(), B.flatten()
     i = UOp.range((n + 2047) // 2048, 0)
-    cu = UOp(Ops.CUSTOM, dtypes.void, (Y.index(i * 2048), A.index(i * 2048), B.index(i * 2048), i),
+    cu = UOp(Ops.CUSTOM, (Y.index(i * 2048), A.index(i * 2048), B.index(i * 2048), i),
              arg=f"__hmx_qadd_chunk({{0}}, {{1}}, {{2}}, {nv}-16*{{3}} < 16 ? {nv}-16*{{3}} : 16, {fl(ra)}, {fl(rb)}, {fl(fixed)}, {c});")
     return cu.end(i).sink(arg=KernelInfo(name=f"qadd_{n}", opts_to_apply=()))
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
@@ -1660,7 +1660,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if any(any(v not in dead and v.op not in (Ops.GROUP, Ops.END) for v in users.get(d, [])) for d in dead): return _hmx_bail(uops, 8)
     drop |= dead
     end_at = pos[e] if e is not None else max(pos[so] for so in stores)  # where the reduction is complete
-    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_begin();"))
+    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, (), "__hmx_begin();"))
     rows = ra + rb
     vals = list(dict.fromkeys(v for v, _ in rows))
     if all(v.op is Ops.LOAD and len(v.src) == 1 and all(u in dead or u.op in (Ops.GROUP, Ops.END) for u in users.get(v, [])) for v in vals):
@@ -1816,7 +1816,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     nrq = _hmx_rq_rows(uops, users, drop, before, replace, pos)
     if getenv("HMX_DEBUG"): print(f"hmx requant rows: {nrq}")
   if not replace: return _hmx_bail(uops, 9)
-  if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_call_start();"))
+  if call_start: before.setdefault(0, []).insert(0, UOp(Ops.CUSTOM, (), "__hmx_call_start();"))
   out = []
   for i, u in enumerate(uops):
     out += before.get(i, [])
