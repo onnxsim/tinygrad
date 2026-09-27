@@ -216,6 +216,29 @@ a smaller inner loop (fewer K blocks resident per tile) or a smaller `kt` by hoi
 outside - and both change what the accumulator holds, so they need their own verification rather than
 an assumption.
 
+## The stem 1x1 is now the largest kernel, and it is already cached
+
+`r_2_202_2_2_2_2_2_2_2_2_2_2_2_4_4`, 4,722 us, 21.8% of the graph. I went looking for the same
+class of miss as layer4's and did not find one: the plan reports `reds=[4,4] outer=202 inner=2
+ti=2 kt=16 rank=3`, both operands cached, and the emitted code agrees.
+
+    void* _a = __hmx_ca(0+((Ridx0)*4+Ridx1));              if ((Lidx3)==0) { copy_a(...); }
+    void* _b = __hmx_ca(16+(Lidx3)*16+((Ridx0)*4+Ridx1));   if ((Lidx4)==0) { pack_b4 x8; }
+
+B - the weight - is filled once for the whole inference. A is filled once per `Lidx4`, and that is
+**required, not redundant**: `alu20 = (Ridx0*3680) + (Ridx1<<5) + alu1` with `alu1 = Lidx4<<11`, so
+each of the 202 output tiles reads a different activation crouton. 6,464 mac iterations, 3,232
+`copy_a` calls moving **6.5 MB into VTCM**, 4,722 us - 0.731 us per mac iteration.
+
+So the stem is not a caching miss. It is VTCM write bandwidth: 202 distinct 2 KB activation
+croutons, each copied once, for a conv that only does 6,464 tiles. The lever is the *fill*, not the
+plan - either copy A straight into the HMX `:cm` load without the intermediate VTCM round trip
+(the `__hmx_i8_copy_a` + `__hmx_i8_sa` pair), or hoist A across the two `Lidx3` tiles.
+
+I have not measured either. The `__hmx_i8_copy_a` helper copies byte-by-byte in C
+(`for (int i = 0; i < 2048; i++) d[i] = src[i]`) - LLVM will vectorise that to 128-byte HVX moves, but
+it is a copy and not a fused load, and that is the thing to attack.
+
 ## What this rules out
 
 The requantization is **0.2-0.27%** (`REQUANT_RECONCILE.md`, 52 us single-tree and 62.6 us reproduced
