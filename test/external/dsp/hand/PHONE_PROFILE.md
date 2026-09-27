@@ -186,6 +186,24 @@ The fix described below, taken: pair the single tile loop with the innermost red
 `0/25088` vs ORT, and `test_dsp_render` 37 passed unchanged. In the emitted C, k75/k81/k82 went from
 **0** `__hmx_ca` uses to 1 each.
 
+A second run of the same build measures **21,753.8 us**, so the honest figure is **21.75-21.91 ms
+against a 22.81 ms baseline: about -1.05 ms, -4.6%**, with run-to-run spread of roughly 150 us. The
+per-family comparison across the two profiles:
+
+| family | before | after | delta |
+|---|---|---|---|
+| layer4 3x3 (3 calls) | 7,745 | 6,657 | **-1,088** |
+| other 3x3 (14 calls) | 5,923 | 5,933 | +10 |
+| stem 1x1 (6 calls) | 6,441 | 6,457 | +16 |
+| graph | 22,743 | 21,693 | -1,050 |
+
+The win is entirely layer4 and nothing else moved, which is what a targeted change should look like.
+
+**Layer4's share falls 34.1% -> 30.7% and the stem 1x1 becomes the largest single kernel** at 4.7 ms
+(21.8% of the graph, `r_2_202_2_2_2_2_2_2_2_2_2_2_2_4_4`). That is the next target, and it is a
+different problem: the stem is already quad on both operands and is a 1x1 conv, so there is no
+repack to hoist.
+
 **It lands on rank 2 (A cached, B streamed), which is the right answer.** With `ti = 16` (the tile
 loop) and `kt = 144` (all reduce iterations), caching B would need `ti*kt = 2,304` slots against a
 **1,920**-slot pool. A - the activation crouton, re-read once per tap - is what the 898 us is. B, the
