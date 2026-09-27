@@ -209,12 +209,29 @@ loop) and `kt = 144` (all reduce iterations), caching B would need `ti*kt = 2,30
 **1,920**-slot pool. A - the activation crouton, re-read once per tap - is what the 898 us is. B, the
 weight, is still gathered by 8 `pack_b4` per mac.
 
-**What is left, and why the pool is not the lever.** Caching B needs `ti*kt <= pool`, which at
-`ti = 16, kt = 144` is 2,304 against 1,920. The pool cannot grow: VTCM is already at the device's
-4 MB maximum and 8 MB measured *worse* (23,110.7 us) than 4 MB. The lever is the loop split - either
-a smaller inner loop (fewer K blocks resident per tile) or a smaller `kt` by hoisting a reduce
-outside - and both change what the accumulator holds, so they need their own verification rather than
-an assumption.
+**Layer4's B operand: the pool is not the lever, and the question is closed.** Caching B needs
+`ti*kt <= pool`, which at `ti = 16, kt = 144` is **2,304 against 1,920**. I checked every way to buy
+those 384 slots:
+
+| pool arrangement | slots | fits 2,304? |
+|---|---|---|
+| current (`HMX_VTCM_KB // 2`, ca=1792 + cb=128) | 1,920 | no |
+| + the 192 KB VTCM that nothing accounts for | 2,016 | no |
+| + unallocated, and hand the whole A region to B | 3,808 | yes, but then A gets nothing - rank 0 |
+
+The 192 KB gap is real (`_HMX_AO` is 64 KB, the operand pool is `HMX_VTCM_KB // 2`, so 192 KB of a
+4 MB VTCM is unallocated) and worth reclaiming on its own merits, but it is 5% of what is needed and
+does not change the answer.
+
+**There is no pool arrangement that gives layer4 both A and B.** The only lever is reducing
+`ti*kt` - splitting the loop so fewer (tile x reduce) combinations are live at once. Hoisting the dy
+tap out would make `kt = 48` and `need(B) = 768`, which fits easily, but it gives each tap its own
+accumulator: 3 zeroings and 3 stores instead of 1 each (48 stores against 2,304 mac iterations, so
+the stores are not the problem) at the cost of no longer keeping the accumulator resident across the
+taps, which is the entire point of the current form. That is a real trade, not a free win, and it
+needs its own measurement rather than an assumption.
+
+So: layer4 is at rank 2 and the next gain there is a loop-split experiment, not a knob.
 
 ## The stem 1x1 is now the largest kernel, and it is already cached
 
