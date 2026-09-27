@@ -466,7 +466,11 @@ static inline {vt_c} __{name}({vt_a} a, {vt_b} b, {vt_c} c) {{
 # every K panel at a stride of _hmx_stride(kt) slots -- no load pair (<= 32 tiles) crosses a 256 KB window (a PD fault), so
 # whole weight matrices (fc2: 16 x 64 tiles) stay packed across a call instead of being repacked per output tile
 HMX_VTCM_KB = getenv("HMX_VTCM_KB", 256)
-_HMX_AO, _HMX_CA, _HMX_CB = (65536, (HMX_VTCM_KB // 2 - 32 - 128) // 128 * 128, 128) if HMX_VTCM_KB > 256 else (16384, 76, 40)
+_HMX_AO = 65536  # activation staging, ahead of the operand pool in VTCM
+# _HMX_CB (128 slots of 2 KB) is reserved out of the same VTCM as the A region, and the whole
+# grant is shared rather than half of it: at the phone's 4 MB the old half-pool left 192 KB
+# accounted for by nothing.
+_HMX_CA, _HMX_CB = ((HMX_VTCM_KB - _HMX_AO // 1024 - 32 - 256) // 2, 128) if HMX_VTCM_KB > 320 else (76, 40)
 def _hmx_stride(kt:int) -> int:
   # slots per K panel: a power of two (<= 32 tiles) or a multiple of 32, so from a 32-slot aligned base no 32-tile load pair
   # crosses a 128-slot (256 KB) window; the default layout packs panels densely (it is one window)
