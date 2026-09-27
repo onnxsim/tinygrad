@@ -2023,7 +2023,12 @@ class DSPRenderer(ClangRenderer):
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
     prefix = list(prefix or [])
     b_dtypes = {_wmma_name(u): u.src[1].dtype for u in uops if u.op is Ops.WMMA}
-    for name, _, dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
+    a_dtypes = {_wmma_name(u): u.src[0].dtype for u in uops if u.op is Ops.WMMA}
+    # upstream's wmma_args yields 5 fields (name, arg0, arg1, dtype, per-src shapes) where the fork's
+    # yielded 7 - it dropped uop.arg[2:4] and went from len(src) to the 3 WMMA operands. The two dropped
+    # fields were unused here; A's dtype now comes from a_dtypes, which is where the 3-operand form puts it.
+    for name, _, _, dtype_out, upcast_sizes in wmma_args(uops):
+      dtype_in = a_dtypes[name]
       if dtype_in == dtypes.half:
         prefix.append(_hmx_wmma_helper(name, self._render_dtype(dtypes.half, 1024, AddrSpace.REG)))
         continue
