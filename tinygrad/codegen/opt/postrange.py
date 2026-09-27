@@ -259,13 +259,32 @@ class Scheduler:
             tc_upcast_axes = tuple(tuple((ne[c].axis_id, 2 if j < upcast_cnt[i] else 1)
                                          for j, c in enumerate(tc.operand_upcast_axes(i)))
                                    for i in range(3))
+            # with_missing_tc_axes: an operand must carry every axis the *other* operands carry, with the
+            # ones it does not have at size 1 (so they broadcast). Upstream does this and my port dropped
+            # it. Without it the int8 WMMA's C tile is not the same shape as A and B's, the reduce over K
+            # does not line up, and the accumulator ADD never appears - which is why the HMX int8 rewrite
+            # found a bare STORE where it expected ADD(LOAD acc, ...).
+            def with_missing_tc_axes(arg:tuple) -> tuple:
+              ret = list(arg)
+              have = {x[0] for x in ret}
+              for rn, _ in tc_upcast_axes[0] + tc_upcast_axes[1]:
+                if rn not in have: ret.append((rn, 1))
+              return tuple(ret)
+            tc_upcast_axes = tuple(with_missing_tc_axes(v) for v in tc_upcast_axes)
             # construct the op
             # TODO: remove tc_upcast_axes from the arg
             tc_uop = UOp.wmma(srcs[0], srcs[1], UOp.const((0.0,)*2**upcast_cnt[2], tc.dtype_out),
                               tc.dims, tc.threads, tc_upcast_axes=tc_upcast_axes)
 
-            # preserve extra reduces
-            reduce_ranges = [x for x in UOp.sink(*reduceop.src[1:]).toposort() if x.op is Ops.RANGE and x not in [ne[c] for c in ne if c[0] == "k"]]
+            # Preserve the *extra* reduces - a 3x3 conv's tap row dy sits outside the TC's own K blocks.
+            # The guard compares range *ids* (x.arg[0]), as upstream does: the fork compared UOp objects
+            # against the ne map's k entries, and since ne is keyed by axis bit name ("k0".."k4") and holds
+            # the *replacement* ranges rather than the originals, the TC's own K reduce was not excluded.
+            # That left a spurious extra REDUCE wrapping the int8 tile, whose accumulator the HMX rewrite
+            # then could not find - the tile's consumers became a bare STORE instead of ADD(LOAD, ...).
+            tc_reduce_ids = tuple(ne[c].arg[0] for c in ne if c[0] == "k")
+            reduce_ranges = [x for x in UOp.sink(*reduceop.src[1:]).toposort()
+                             if x.op is Ops.RANGE and x.arg[0] not in tc_reduce_ids]
             if len(reduce_ranges): tc_uop = UOp(Ops.REDUCE, src=(tc_uop,)+tuple(reduce_ranges), arg=(Ops.ADD, 0))
             self.ast = self.ast.substitute({reduceop: tc_uop})
           self.tensor_core = tc

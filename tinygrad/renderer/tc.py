@@ -55,6 +55,17 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
     The length must stay len(axis_coords): expand_wmma looks every axis up in the range map, and
     unroll_axis takes its unroll sizes from this list, so a shorter list changes the unroll shape.
     So each operand contributes its own bits, then the axes it does not carry, k bits last."""
+    # The *slot* order - C's element-bit order - with this operand's own axis names in it, most
+    # significant first. Upstream's equivalent is base_upcast_axes()[:log2(elements_per_thread[i])],
+    # which for a single-thread TC is exactly C's first len(frag) slots; the operand's own frag order
+    # is what renames them. That is why A's frag is (m0, k0..k4, m1..m4) and B's is
+    # (k0, n0..n4, k1..k4): each is C's (m0, n0..n4, m1..m4) shape with the middle axis renamed.
+    # Returning the operand's own bits un-renamed worked for A by coincidence and broke B; returning
+    # all of axis_coords made every operand 16 wide where upstream has 10 (plus the 1 with_missing adds).
+    # C's slot order, positionally renamed into this operand's own axes: slot j of C becomes this
+    # operand's frag bit j. A's frag is (m0, k0..k4, m1..m4) and B's is (k0, n0..n4, k1..k4) - each is
+    # C's shape with the middle axis renamed - so pairing positionally is what lets relabel() and
+    # unroll_axis place each operand's bits correctly while all three share one slot order.
     frag = (self.frag_a, self.frag_b, self.frag_c)[idx][1]
     other = [c for c in self.axis_coords() if c not in frag]
     k = [c for c in other if c[0] == "k"]
