@@ -235,9 +235,25 @@ croutons, each copied once, for a conv that only does 6,464 tiles. The lever is 
 plan - either copy A straight into the HMX `:cm` load without the intermediate VTCM round trip
 (the `__hmx_i8_copy_a` + `__hmx_i8_sa` pair), or hoist A across the two `Lidx3` tiles.
 
-I have not measured either. The `__hmx_i8_copy_a` helper copies byte-by-byte in C
-(`for (int i = 0; i < 2048; i++) d[i] = src[i]`) - LLVM will vectorise that to 128-byte HVX moves, but
-it is a copy and not a fused load, and that is the thing to attack.
+**Measured, and it is a negative result: the stem is not the target.** The `__hmx_i8_copy_a` that
+looks like a byte loop in the helper list is not what runs - a later, vectorized definition
+(`for (int q = 0; q < 16; q++) ((__hmx_v*)d)[q] = (__hmx_v)((const __hmx_i8vu*)src)[q]`, unaligned
+128-byte loads into aligned stores) overrides it, and `__hmx_i8_mac` then reads the VTCM slot
+directly (`mxmem(%0,%1):cm` with `%1 = 0x7ff`) with no second staging copy.
+
+So the arithmetic is:
+
+    6,464 mac iterations, 4,722 us  ->  0.731 us each
+    one :cm mac is 64x32 = 2,048 MACs  ->  0.36 ns/MAC  ->  ~8 cycles/MAC at 23 MHz
+
+**8 cycles/MAC is good density** - better than the stem's 823 pcy/MAC figure of a few weeks ago, and
+in the same range as the best layer4 number. The 3,232 `copy_a` calls are ~0.2% of the instruction
+count; they are not what the 4,722 us is made of. The stem is simply doing 6,464 real 64x32 tiles,
+and at that density there is very little left to remove.
+
+**Do not spend more time here.** The remaining 3x3s (14 calls, 5.9 ms) are the same shape and were
+not broken down individually; layer4 is 6.7 ms and already at rank 2. If more is wanted it is in the
+loop split for layer4's B operand (the pool needs `ti*kt <= 1920` and it is 2,304), not in the stem.
 
 ## What this rules out
 
