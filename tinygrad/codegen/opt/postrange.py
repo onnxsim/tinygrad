@@ -5,6 +5,7 @@ from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssim
 from tinygrad.uop.ops import axis_colors, axis_to_pos
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes
+from itertools import repeat
 from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, merge_dicts, get_single_element, flatten
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
@@ -253,7 +254,6 @@ class Scheduler:
             # each operand upcasts its first upcast_cnt axes, the axes only A or B upcast are size 1 so the operands broadcast
             tc_upcast_axes = tuple([tuple([(a, 2 if j < cnt else 1) for j,a in enumerate(base_upcast_axes[:max(cnt, *upcast_cnt[:2])])])
                                     for cnt in upcast_cnt])
-
             # construct the op
             # TODO: remove tc_upcast_axes from the arg
             tc_uop = UOp.wmma(srcs[0], srcs[1], UOp.const((0.0,)*2**upcast_cnt[2], tc.dtype_out),

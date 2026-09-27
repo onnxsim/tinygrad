@@ -38,6 +38,16 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
     return (2**n, 2**m, 2**k)
   @property
   def threads(self) -> int: return 2**len(self.frag_c[0]) # threads that construct the warp
+  def operand_upcast_axes(self, idx:int) -> tuple:
+    """this operand's own element bits, in its own fragment order.
+
+    base_upcast_axes() is a single shared list built from frag_c plus the k bits, which cannot express
+    that A is laid out (m, k) while B is (n, k): it interleaves m and n, so both operands end up with
+    the same axis list. Hexagon's HMX gives A and B different crouton orientations (IDX(m, k) and
+    IDX(k, n)), so each operand needs its own list - and getting this wrong left B's STACK lane-ordered
+    [0,1,0,1,...] instead of the interleaved [0,0,1,1,...] the row packer requires."""
+    return self.frag_a[1] if idx == 0 else self.frag_b[1] if idx == 1 else self.frag_c[1]
+
   def base_upcast_axes(self):
     # element slots, most significant bit first: upcast then reduce
     return (tuple(c for c in self.axis_coords() if c[0] == "k") + self.frag_c[1])[::-1]
@@ -186,5 +196,8 @@ hexagon_hmx = [TensorCore(dtype_in=dtypes.half, dtype_out=dtypes.half,
 # non-saturating byte-plane stores (hmx_qconv.h in onnxsim).
 hexagon_hmx_i8 = [TensorCore(dtype_in=dtypes.uint8, dtype_out=dtypes.int32, dtype_in_b=dtypes.int8,
   frag_a=((), ("k0", "k1", "k2", "k3", "k4", "m0", "m1", "m2", "m3", "m4", "m5")),  # A(m, k) row-major
-  frag_b=((), ("n0", "n1", "n2", "n3", "n4", "k0", "k1", "k2", "k3", "k4")),           # W(k, n): n low, k high
+  # W(k, n) sits at byte 128*(k//4) + 4*n + k%4, so MSB..LSB the bits are k5 k4 k3 | n4..n0 | k1 k0 and
+  # LSB-first that is k0 k1, then all five n, then k3 k4 k5. My first version put the n bits first,
+  # which left the weight operand's rows unrecognisable to _hmx_rows_i8 and silently disabled HMX_ACC.
+  frag_b=((), ("k0", "k1", "n0", "n1", "n2", "n3", "n4", "k2", "k3", "k4")),
   frag_c=((), ("n0", "n1", "n2", "n3", "n4", "m0", "m1", "m2", "m3", "m4", "m5")))]
