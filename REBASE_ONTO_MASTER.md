@@ -91,28 +91,42 @@ Plus `pm_no_views` grafted in, the `PCONTIG` branch removed, and `FUNCTION` -> `
 path now carries 529. So `:deep`, `#ifdef HMX_REF` and the `__hmx_i8_begin()` bookkeeping are all
 missing: the int8 tiles are emitted one at a time with no accumulator kept across the K loop.
 
-**Measured.** Both int8 operands pass the row packer (`_hmx_rows_i8` returns rows for A at
-`32*m + k` and B at `128*(k//4) + 4*n + k%4`), so this is not the fragment order — that was the
-earlier bug and it is fixed. The bail is one step later. The rewrite walks
+**Isolated to the WMMA application, and the WMMA itself is not the problem.** Comparing the two
+trees stage by stage on `TestDSPHmxI8.src(128, 256, 256)`:
 
-    lane INDEX -> STACK(128) -> ADD(LOAD acc, STACK) -> STORE acc
+| stage | green | this tree |
+|---|---|---|
+| scheduled AST (before codegen) | 3 ADDs, 1 REDUCE | 3 ADDs, 1 REDUCE |
+| entering `full_rewrite_to_sink` | — | 3 ADDs, 0 WMMA |
+| after `apply_opts` (first logged stage) | — | 1 WMMA, **0 `ADD(LOAD, ...)`** |
+| after `full_rewrite_to_sink` | 1 WMMA, 128 LOADs, **16 `ADD(LOAD, ...)`** | 1 WMMA, 128 LOADs, **0 `ADD(LOAD, ...)`** |
 
-and the graph now has **no ADD**: the STACK's only consumer is a `STORE`. On some shapes there is a
-`CAST` in between (`int -> short`, i.e. the 8-bit lanes summed into a 16-bit accumulator), which the
-fork did not have; I made the walk see through int-to-int casts in either direction, and that moved
-the bail for the `int -> short` shapes but not for these, where the ADD is absent altogether.
+The WMMA that comes out is identical on both sides — `uint8 x int8 -> int32`, shapes
+`(2048,), (1024,), (2048,)`, accumulator `dtypes.int` indexed 2048 ways. So the tile is right and the
+**16 accumulator `+=`s are never created**. `_hmx_rows_i8` also succeeds for both operands, so the
+earlier fragment-order bug really is fixed and this is a different thing.
 
-**Why this is not simply fixed.** The accumulator `LOAD` is the thing the rewrite exists to keep
-resident in VTCM, so its absence is the symptom, not the cause. Something upstream is now folding the
-`+=` into the tile before the rewrite sees it — plausibly one of the `permutes_for_shape_str` ->
-`relabel()` or `srcs`-rewriting changes in `_apply_tc_opt`, but I have not isolated which, and
-guessing would risk landing a rewrite that silently computes the wrong thing. The right next step is
-to dump the int8 AST just before `_hmx_i8_rewrite` and compare it against the green branch's, the way
-the fragment bug was found.
+**Ruled out, each by measurement rather than by reading:**
+
+- `do_stack_wmma` and `linearizer.py` are byte-identical to green.
+- `_apply_tc_opt`'s src fixup and its "preserve extra reduces" tail are equivalent (the two
+  divergences I did find there — `with_missing_tc_axes` dropped, and the extra-reduce guard comparing
+  UOp objects instead of range ids — are fixed in the previous commit).
+- The scheduled AST, the entering AST, and every `graph_rewrite` stage in `full_rewrite_to_sink`
+  carry 0 `ADD(LOAD, ...)` throughout, so it is not a rewrite inside codegen removing them.
+- `operand_upcast_axes` width is a symptom, not a cause: green is 11, and 10, 11 and 16 were all
+  tried. 16 is what the fp16 path needs; the others regress it.
+
+**What this leaves.** The adds have to come from something that runs between `apply_opts` and the
+first logged rewrite — i.e. inside `_apply_tc_opt` or `hand_coded_optimizations` on the *green* side
+that this port does not reproduce. Comparing those two functions line by line against green is the
+next step; the heuristic diff showed `extra_opts` exists in green's signature area but is only
+documented, never passed, so it is not that. I have not found it, and I would rather say so than land
+a guess.
 
 **Also still open**, from the same family: `test_strided_reduce_prefetches_rows_ahead` and
-`test_epilogue_single_m_tile` / `test_single_k_tile_matmul` — these are `assertIn` failures on
-expected source text, not crashes, and are likely downstream of the same int8 issue once it lands.
+`test_epilogue_single_m_tile` / `test_single_k_tile_matmul` — `assertIn` failures on expected source
+text, not crashes, and likely downstream of this once it lands.
 
 ## What is done and worth keeping
 
