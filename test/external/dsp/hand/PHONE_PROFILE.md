@@ -235,15 +235,31 @@ The 192 KB gap is real (`_HMX_AO` is 64 KB, the operand pool is `HMX_VTCM_KB // 
 4 MB VTCM is unallocated) and worth reclaiming on its own merits, but it is 5% of what is needed and
 does not change the answer.
 
-**There is no pool arrangement that gives layer4 both A and B.** The only lever is reducing
-`ti*kt` - splitting the loop so fewer (tile x reduce) combinations are live at once. Hoisting the dy
-tap out would make `kt = 48` and `need(B) = 768`, which fits easily, but it gives each tap its own
-accumulator: 3 zeroings and 3 stores instead of 1 each (48 stores against 2,304 mac iterations, so
-the stores are not the problem) at the cost of no longer keeping the accumulator resident across the
-taps, which is the entire point of the current form. That is a real trade, not a free win, and it
-needs its own measurement rather than an assumption.
+**There is no pool arrangement that gives layer4 both A and B, and a loop split would not help
+either.** I had proposed splitting the reduce nest to shrink `ti*kt`; checking the emitted addresses
+before writing any code says otherwise.
 
-So: layer4 is at rank 2 and the next gain there is a loop-split experiment, not a knob.
+layer4's two operands are indexed differently:
+
+    activation:  data1_43008 + alu19,  alu19 = (Ridx0*288) + (Ridx1<<5) + (Ridx2*2688)
+    weight:      data2_2359296 + alu18, alu18 = (Ridx2<<14) + alu0 + (Ridx1<<18) + (Ridx0*786432)
+                 with alu0 = Lidx4 << 5
+
+The activation does **not** mention `Lidx4`, so it is shared across output tiles and caches for
+`kt` slots. The weight **does** - it carries `alu0`, the tile loop - and its tap stride is
+`Ridx0 * 786432`, 512 KB apart, with `pack_b4` gathering four rows 512 bytes apart. That is a
+repacked weight buffer laid out *per output tile*, so each tile's 2 KB croutons are contiguous. The
+weight is genuinely per-tile, `need(B) = ti*kt = 2304` is the honest number, and no rearrangement of
+the loops changes it: splitting the reduce nest would shrink `kt` but the weight would still need a
+distinct slot per (tile, reduce) pair, and the accumulator would be split per tap for nothing.
+
+**So the lever is the weight layout, not the pool and not the loop order.** Laying the weights out
+once, shared across output tiles, is what would let B cache in `kt` slots instead of `ti*kt`. That is
+a change to how the weight repack in the HMX int8 path is emitted - a codegen change with its own
+verification (the `:cm` load and `pack_b4`'s row interleave both depend on the layout), not a
+parameter to turn. It is the next real piece of work on this kernel and it has not been started.
+
+Until then layer4 is at rank 2: A cached, B streamed, 6,657 us for the three calls.
 
 ## The stem 1x1 is now the largest kernel, and it is already cached
 
