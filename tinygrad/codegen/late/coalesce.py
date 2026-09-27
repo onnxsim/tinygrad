@@ -141,7 +141,9 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   # (in bytes: an int32x32 accumulator store is one 128-byte HVX register, and so is a uint8x128 load)
   dsp_load_cap = 128
   if ctx is not None and ctx.target.device == "DSP":
-    store_runs = [len(g)*buf.dtype.itemsize for (op,buf,_,_),offsets in memory.items() if op is Ops.STORE
+    # the memory key gained a 5th field upstream (ld_arg, the per-access arg - e.g. the nontemporal flag),
+    # so this has to unpack 5, not 4
+    store_runs = [len(g)*buf.dtype.itemsize for (op,buf,_,_,_),offsets in memory.items() if op is Ops.STORE
                   for _,g in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]) for g in [list(g)]]
     if store_runs: dsp_load_cap = max(4, max(store_runs))
 

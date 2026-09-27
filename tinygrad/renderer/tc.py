@@ -12,6 +12,12 @@ class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x 
   frag_a: tuple[tuple[str, ...], tuple[str, ...]]
   frag_b: tuple[tuple[str, ...], tuple[str, ...]]
   frag_c: tuple[tuple[str, ...], tuple[str, ...]]
+  # dtype for B when it differs from A's. Hexagon's HMX ":cm" tiles are u8 activations by s8 weights and
+  # vrmpybusv is u8 by s8, so one TC covers a mixed-precision pair; None means B has A's dtype. Upstream has
+  # no mixed-dtype TC, so this is a local addition and postrange.py narrows B through it.
+  dtype_in_b: DType|None = None
+  @property
+  def dtype_b(self) -> DType: return self.dtype_in if self.dtype_in_b is None else self.dtype_in_b
   def axis_coords(self) -> list[str]:
     # tile bit of each tc axis in creation order, n then m then the k unrolls. split j of a dim is bit j
     used = self.frag_a[0] + self.frag_a[1] + self.frag_c[0] + self.frag_c[1]
@@ -154,11 +160,11 @@ metal = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("k1", "m0", "m1", "k2", 
 # B is 128 elements. vrmpybusv is the (uint8, int8) entry: A u8x4 splatted into a vector, B s8 - W8A8 with
 # uint8 activations and int8 weights. A GEMV's A side (one activation row) has no M range of its own, which is
 # what dims[1]==1 encodes.
-hexagon_v65 = [TensorCore(dtype_in=di, dtype_out=dtypes.int32,
+hexagon_v65 = [TensorCore(dtype_in=di, dtype_out=dtypes.int32, dtype_in_b=db,
   frag_a=((), ("k0", "k1")),
   frag_b=((), ("n0", "n1", "n2", "n3", "n4", "k0", "k1")),
   frag_c=((), ("n0", "n1", "n2", "n3", "n4")))
-  for di in [dtypes.uint8, dtypes.int8]]
+  for di,db in [(dtypes.uint8, None), (dtypes.int8, None), (dtypes.uint8, dtypes.int8)]]
 
 # Hexagon HMX (V69 matrix unit, driven through hmx_block.h-style inline asm; see ops_dsp.py DSPRenderer):
 # D (fp16 32x32) = rne_fp16(C + A (fp16 32x32) . B (fp16 32x32)): one tile op on one thread, every operand one
@@ -175,7 +181,7 @@ hexagon_hmx = [TensorCore(dtype_in=dtypes.half, dtype_out=dtypes.half,
 # A(m, k) is plain row-major at byte 32*m + k; the weight block W(k, n) sits at byte 128*(k/4) + 4*n + k%4
 # (index bits k4 k3 k2 | n4..n0 | k1 k0); C/D are row-major (m, n). The exact int32 accumulator comes from four
 # non-saturating byte-plane stores (hmx_qconv.h in onnxsim).
-hexagon_hmx_i8 = [TensorCore(dtype_in=dtypes.uint8, dtype_out=dtypes.int32,
+hexagon_hmx_i8 = [TensorCore(dtype_in=dtypes.uint8, dtype_out=dtypes.int32, dtype_in_b=dtypes.int8,
   frag_a=((), ("k0", "k1", "k2", "k3", "k4", "m0", "m1", "m2", "m3", "m4", "m5")),  # A(m, k) row-major
   frag_b=((), ("n0", "n1", "n2", "n3", "n4", "k0", "k1", "k2", "k3", "k4")),           # W(k, n): n low, k high
   frag_c=((), ("n0", "n1", "n2", "n3", "n4", "m0", "m1", "m2", "m3", "m4", "m5")))]

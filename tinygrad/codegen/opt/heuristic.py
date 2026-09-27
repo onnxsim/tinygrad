@@ -168,8 +168,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if xb_choices:
       xb_choices = sorted(xb_choices)
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
-      k.apply_opt(Opt(OptOps.SPLIT, xb_choices[0][2], (xb_choices[0][3], AxisType.UPCAST)))
-      upcasted_axis.add(xb_choices[0][2])
+      # the tuple is (gathers, num_strides, sum_strides, -upcast_amount, axis, upcast_amount) - the DSP keys
+      # widened it from 4 entries to 6, so the axis and the size are the last two, not [2] and [3]. Reading
+      # [2]/[3] passed sum_strides as the axis, and the opt came out "invalid axis on opt.axis=10".
+      k.apply_opt(Opt(OptOps.SPLIT, xb_choices[0][4], (xb_choices[0][5], AxisType.UPCAST)))
+      upcasted_axis.add(xb_choices[0][4])
     else: break
 
   # on the DSP, a reduction nothing broadcasts into (a per-element dot product like q . k over a small head dim) got no upcast

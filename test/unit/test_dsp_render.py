@@ -4,7 +4,7 @@ from tinygrad.helpers import Target, Context
 from tinygrad.codegen import to_program
 from tinygrad.runtime import ops_dsp
 from tinygrad.runtime.ops_dsp import MockDSPRenderer
-from tinygrad.codegen.opt import tc
+from tinygrad.renderer import tc
 
 class _NoCompile:
   def compile_cached(self, src:str) -> bytes: return b""

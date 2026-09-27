@@ -6,7 +6,7 @@ from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
-from tinygrad.codegen.opt import tc
+from tinygrad.renderer import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
 if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-import
 
