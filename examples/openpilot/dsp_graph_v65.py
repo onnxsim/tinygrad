@@ -32,10 +32,11 @@ if __name__ == "__main__":
   args = p.parse_args()
   out = pathlib.Path(args.outdir)
   with open(args.pickle, "rb") as f: jit = compile3.load_pickle(f)
-  inputs = seeded_inputs(jit, args.seed)
   if args.inputs:
     npz = np.load(args.inputs)
-    inputs = {k: Tensor(npz[k].astype(t.numpy().dtype), device=t.device).realize() for k, t in inputs.items()}
+    inputs = {name: Tensor(npz[name], device=dev).realize()
+              for name, (_, _, _, dev) in zip(jit.captured.expected_names, jit.captured.expected_input_info)}
+  else: inputs = seeded_inputs(jit, args.seed)
   st = time.perf_counter()
   ref = jit(**inputs).numpy().copy()
   print(f"reference: the JIT under qemu, output {ref.shape} {ref.dtype}, {time.perf_counter()-st:.1f} s")
