@@ -142,3 +142,17 @@ def write_case(outdir, xs:list[bytes], ref:bytes) -> None:
   o = pathlib.Path(outdir)
   (o / "input.bin").write_bytes(_input_blob(xs))
   (o / "ref.bin").write_bytes(ref)
+
+ARTIFACT_MAGIC = b"TGHXV65\0"
+def pack(outdir, artifact_path, program_lines:list[str]) -> int:
+  """the runner artifact for a compiler service (tools/onnx-remote's onnx-remote-compiler in onnxsim): tg_graph.so, blob.bin and
+  program.txt (program_lines: the I/O contract, one record per line) in one little-endian container -- magic TGHXV65\\0, u32 file
+  count, then per file u32 name length, name, u64 size, bytes -- so a runner unpacks it with no archive or JSON library"""
+  import struct
+  o = pathlib.Path(outdir)
+  files = [("tg_graph.so", (o / "tg_graph.so").read_bytes()), ("blob.bin", (o / "blob.bin").read_bytes()),
+           ("program.txt", ("\n".join(program_lines) + "\n").encode())]
+  with open(artifact_path, "wb") as f:
+    f.write(ARTIFACT_MAGIC + struct.pack("<I", len(files)))
+    for name, data in files: f.write(struct.pack("<I", len(name)) + name.encode() + struct.pack("<Q", len(data)) + data)
+  return pathlib.Path(artifact_path).stat().st_size

@@ -32,6 +32,9 @@ if __name__ == "__main__":
   p.add_argument("--inputs", help="an .npz of the inputs by name (default: seeded random ones)")
   p.add_argument("--qemu", action="store_true", help="run the emitted program under qemu and compare with the reference")
   p.add_argument("--build", action="store_true", help="build the FastRPC skel and Android client")
+  p.add_argument("--onnx", help="the ONNX model the pickle came from: its input order and output shapes define the artifact's I/O")
+  p.add_argument("--artifact", help="with --onnx and --build: pack a compiler-service artifact (dsp_graph_v65.pack) here")
+  p.add_argument("--manifest", help="with --artifact: write the compiler manifest (docs/remote-manifest.md in onnxsim) here")
   args = p.parse_args()
   out = pathlib.Path(args.outdir)
   with open(args.pickle, "rb") as f: jit = compile3.load_pickle(f)
@@ -68,3 +71,32 @@ if __name__ == "__main__":
       print(f"  {np.sum(yy != ref.ravel())} of {ref.size} differ, max |diff| {np.nanmax(np.abs(yy - ref.ravel()))}")
       sys.exit(1)
   if args.build: print("built", *dsp_graph_v65.build(out))
+  if args.artifact:
+    import onnx
+    from tinygrad.helpers import getenv
+    model = onnx.load(args.onnx, load_external_data=False)
+    slot = {name: i for i, name in enumerate(inputs)}  # the program's input order (compile3 sorts by name)
+    # program.txt, one record per line. The runner receives ONNX inputs in graph order (the transport's tensors are positional):
+    #   input <onnx index> <onnx dtype> <bytes> <program slot, or -1 when no kernel reads it>
+    #   output <onnx dtype of the returned tensor, always FLOAT> <elements> <dims...>   (compile3 ALL_OUTPUTS: float32, concatenated)
+    lines = [f"ncalls {info['calls']}", f"threads {max(1, getenv('DSP_THREADS', 1))}", f"output_bytes {info['output_bytes']}"]
+    for i, vi in enumerate(model.graph.input):
+      nbytes = inputs[vi.name].nbytes() if vi.name in inputs else 0
+      lines.append(f"input {i} {vi.type.tensor_type.elem_type} {nbytes} {slot.get(vi.name, -1)}")
+    total = 0
+    for vo in model.graph.output:
+      dims = [d.dim_value or 1 for d in vo.type.tensor_type.shape.dim]
+      total += int(np.prod(dims)); lines.append(f"output 1 {int(np.prod(dims))} " + " ".join(map(str, dims)))
+    if total * 4 != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} floats) don't match the program output ({info['output_bytes']} bytes)")
+    size = dsp_graph_v65.pack(out, args.artifact, lines)
+    manifest = {"schema_version": 1,
+                "compiler": {"name": "tinygrad-dsp_graph_v65", "version": "1", "id": "tinygrad-hexagon-v65"},
+                "target": {"backend": "hexagon-fastrpc", "device": "cdsp", "chip": "v65"},
+                "artifact": {"format": "tghx-v65", "abi": "tg_graph-idl-1"},
+                "io": {"dtype": "mixed", "layout": "onnx", "dynamic_shapes": False},
+                "capabilities": {"ops": [], "dtypes": ["float32", "uint8"]},
+                "legalization": {"profile": "none", "version": 1},
+                "program": {"calls": info["calls"], "kernels": info["kernels"], "threads": max(1, getenv("DSP_THREADS", 1)),
+                            "weights_bytes": info["blob"], "scratch_bytes": info["scratch"]}}
+    if args.manifest: pathlib.Path(args.manifest).write_text(json.dumps(manifest))
+    print(f"artifact {args.artifact}: {size/1e6:.1f} MB")
