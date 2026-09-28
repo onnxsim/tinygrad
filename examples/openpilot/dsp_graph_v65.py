@@ -79,10 +79,13 @@ if __name__ == "__main__":
     # program.txt, one record per line. The runner receives ONNX inputs in graph order (the transport's tensors are positional):
     #   input <onnx index> <onnx dtype> <bytes> <program slot, or -1 when no kernel reads it>
     #   output <onnx dtype of the returned tensor, always FLOAT> <elements> <dims...>   (compile3 ALL_OUTPUTS: float32, concatenated)
+    #   name <call index> <kernel name>
     lines = [f"ncalls {info['calls']}", f"threads {max(1, getenv('DSP_THREADS', 1))}", f"output_bytes {info['output_bytes']}"]
     for i, vi in enumerate(model.graph.input):
       nbytes = inputs[vi.name].nbytes() if vi.name in inputs else 0
       lines.append(f"input {i} {vi.type.tensor_type.elem_type} {nbytes} {slot.get(vi.name, -1)}")
+    # one line per call: its kernel name, for the runner's per-call profile events
+    lines += [f"name {i} {c[0]}" for i, c in enumerate(calls)]
     total = 0
     for vo in model.graph.output:
       dims = [d.dim_value or 1 for d in vo.type.tensor_type.shape.dim]
