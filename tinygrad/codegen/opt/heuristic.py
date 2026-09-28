@@ -64,8 +64,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   dsp_vector_lanes = max_bytes // k.reduceop.dtype.itemsize if is_dsp and max_bytes and k.reduceop is not None else 128
   # ...and there float is scalar, so a float reduction wants register blocking (small upcasts on the axes whose loads are
   # reused, as on a CPU) rather than one contiguous vector-wide axis: it takes the non-DSP upcast rules below
-  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and is_dsp and max_bytes is not None and k.reduceop is not None and \
-    dtypes.is_float(k.reduceop.dtype)
+  v65_float = is_dsp and max_bytes is not None and k.reduceop is not None and dtypes.is_float(k.reduceop.dtype)
+  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and v65_float
   # blocking only pays with reuse in two directions (a conv: inputs shared across output channels, weights across pixels); a GEMV
   # has one, and blocking its output axis measured 10x slower on the phone than the contiguous vector-style upcast
   if dsp_scalar_float:
@@ -188,7 +188,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # on the DSP, a reduction nothing broadcasts into (a per-element dot product like q . k over a small head dim) got no upcast
   # above; the unroll below would then take every "nothing upcasted" case and leave it scalar. Upcast the innermost output
   # axis first instead: a vector accumulator per 128 outputs, the reduce stays a loop
-  if is_dsp and HVX_UPCAST_CONTIG and not k.axes_of(AxisType.UPCAST) and k.axes_of(AxisType.REDUCE):
+  # (not for scalar float on v65: 128 accumulators live in memory, and a GEMV with [out, in] weights reads 128 rows per step)
+  if is_dsp and HVX_UPCAST_CONTIG and not (v65_float and getenv("DSP_SCALAR_GEMV", 1)) and not k.axes_of(AxisType.UPCAST) and \
+      k.axes_of(AxisType.REDUCE):
     for splits in [128,64,32]:
       if k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
         k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
@@ -215,7 +217,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
-  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not dsp_scalar_float else [4]):
+  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not (v65_float and getenv("DSP_SCALAR_GEMV", 1))
+                 else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
       break
