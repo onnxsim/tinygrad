@@ -23,6 +23,7 @@ HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
 HVX_ARCH = getenv("HVX_ARCH", "v65")
 HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
+DSP_THREADS = getenv("DSP_THREADS", 0)
 
 # ***** qfloat lowering (v68+) *****
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
@@ -1977,7 +1978,12 @@ def _dsp_align(u:UOp, depth:int=0) -> int:
   return 1
 
 class DSPRenderer(ClangRenderer):
-  has_threads = False
+  # DSP_THREADS=N splits a kernel's outer global loop over a `core_id` argument, as the CPU backend does. The cDSP has
+  # several hardware threads (4 on the SDM845's v65) but one caller thread runs every kernel, and v65's float math is
+  # scalar, so this is where its parallelism is. Each output keeps its reduction order, so results are unchanged.
+  has_threads = DSP_THREADS > 1
+  @property
+  def global_max(self): return (DSP_THREADS, 0, 0) if DSP_THREADS > 1 else None  # type: ignore[override]
   def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
   buffer_suffix = " restrict __attribute__((align_value(128)))"
   kernel_typedef = "__attribute__((noinline)) void"
@@ -2152,10 +2158,16 @@ class DSPProgram(Program['DSPDevice']):
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
     for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.alloc_size)
-    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v)
+    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v or 0)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
-    self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
-    return timer[0] / 1e6
+    total = 0
+    core = next((i for i,(name,*_) in enumerate(self.signature[len(bufs):], start=len(bufs)) if name == 'core_id'), None)
+    # this runner calls the kernel once per core_id, serially; a graph runner can run the slices on separate threads
+    for tid in range(global_size[0] if core is not None else 1):
+      if core is not None: struct.pack_into('i', var_vals_mv, core*8, tid)
+      self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
+      total += timer[0]
+    return total / 1e6
 
 class DSPBuffer:
   def __init__(self, va_addr:int, size:int, share_info, offset:int=0, alloc_size:int|None=None):
@@ -2408,7 +2420,12 @@ class MockDSPRenderer(DSPRenderer):
         msrc.append(f"{self._render_dtype(b[1][0].dtype)} val{i}; read(0, &val{i}, {b[1][0].dtype.itemsize});")
     msrc.append("unsigned int st = inscount();")
     params = [(f'(void*)buf{i}' if b[1][0].addrspace == AddrSpace.GLOBAL else f'val{i}') for i,b in enumerate(bufs)]
-    msrc.append(f"{function_name}({', '.join(params)});")
+    call = f"{function_name}({', '.join(params)});"
+    # a threaded kernel runs every core_id slice in turn (the caller's core_id value is read and ignored)
+    for i,b in enumerate(bufs):
+      if b[1][0].op is Ops.PARAM and b[1][0].addrspace != AddrSpace.GLOBAL and b[1][0].expr == 'core_id':
+        call = f"for (val{i} = 0; val{i} <= {int(b[1][0].vmax)}; val{i}++) {{ {call} }}"
+    msrc.append(call)
     msrc.append("unsigned int et = inscount() - st; write(1, &et, sizeof(et));")
     for i,b in enumerate(bufs):
       if b[1][0].addrspace == AddrSpace.GLOBAL: msrc.append(f"write(1, buf{i}, {b[1][0].max_numel()*b[1][0].dtype.itemsize});")
@@ -2424,7 +2441,7 @@ class MockDSPProgram(Program[DSPDevice]):
       os.chmod(dsp_lib.name, 0o0777)
       proc = subprocess.run(["qemu-hexagon-static", *(['-strace'] if DEBUG >= 5 else []), dsp_lib.name],
         input=b''.join([bytes(to_mv(x.va_addr, x.size)) for x in bufs] +
-                       [struct.pack(unwrap(dt.fmt), x) for x,(_,_,dt,_) in zip(vals, self.signature[len(bufs):])]),
+                       [struct.pack(unwrap(dt.fmt), x or 0) for x,(_,_,dt,_) in zip(vals, self.signature[len(bufs):])]),
         stdout=subprocess.PIPE, check=True)
     offset = 4
     for x in bufs:

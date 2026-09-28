@@ -4,6 +4,7 @@ if "JIT_BATCH_SIZE" not in os.environ: os.environ["JIT_BATCH_SIZE"] = "0"
 
 from tinygrad import fetch, Tensor, TinyJit, Context, GlobalCounters, Device, dtypes
 from tinygrad.helpers import DEBUG, getenv
+from tinygrad.dtype import _to_np_dtype
 from tinygrad.uop.ops import Ops
 from tinygrad.nn.onnx import OnnxRunner
 
@@ -56,7 +57,13 @@ def compile(onnx_file):
   Tensor.manual_seed(100)
   # replace symbolic dimensions (e.g. 'b' for dynamic batch) with 1
   input_shapes = {k:tuple(s if isinstance(s, int) else 1 for s in shp) for k,shp in input_shapes.items()}
-  inputs = {k:Tensor(Tensor.randn(*shp, dtype=input_types[k]).mul(8).realize().numpy(), device='NPY') for k,shp in sorted(input_shapes.items())}
+  rng = np.random.default_rng(100)
+  def make_input(shp, dt):
+    # generate on the host: uint8 camera frames (newer openpilot models) take random bytes, and on DEV=DSP the
+    # threefry kernel behind Tensor.randn needs libgcc's 64-bit division
+    if dtypes.is_int(dt): return rng.integers(0, 256, shp).astype(_to_np_dtype(dt))
+    return (rng.standard_normal(shp) * 8).astype(_to_np_dtype(dt))
+  inputs = {k:Tensor(make_input(shp, input_types[k]), device='NPY') for k,shp in sorted(input_shapes.items())}
   if getenv("DSP_ALL_INPUTS"):
     # Capture every ONNX input as a runtime DSP parameter. Without this, the non-image NPY
     # tensors are treated as capture-time constants and cannot be supplied by a phone runner.
@@ -66,7 +73,12 @@ def compile(onnx_file):
   print("created tensors")
 
   @TinyJit(prune=True)
-  def run_onnx_jit(**kwargs): return next(iter(run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()}).values())).cast('float32')
+  def run_onnx_jit(**kwargs):
+    outs = run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()})
+    # ALL_OUTPUTS=1 keeps recurrent-state outputs (e.g. next_state_*_q) as part of the graph: they are
+    # concatenated, flattened, in ONNX output order, so the capture still has exactly one output buffer
+    if getenv("ALL_OUTPUTS"): return Tensor.cat(*[v.cast('float32').flatten() for v in outs.values()])
+    return next(iter(outs.values())).cast('float32')
   for i in range(3):
     GlobalCounters.reset()
     print(f"run {i}")

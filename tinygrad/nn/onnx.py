@@ -5,7 +5,7 @@ from tinygrad.nn.state import TensorIO
 from tinygrad.tensor import Tensor, is_numpy_ndarray
 from tinygrad.mixin.op import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, TC_OPT
-from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
+from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, _to_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
 from tinygrad.uop.ops import sint, _broadcast_shape
 
@@ -34,7 +34,12 @@ class OnnxDataType(enum.IntEnum):
   FLOAT = 1; UINT8 = 2; INT8 = 3; UINT16 = 4; INT16 = 5; INT32 = 6; INT64 = 7; BOOL = 9; FLOAT16 = 10; DOUBLE = 11; UINT32 = 12 # noqa: E702
   UINT64 = 13; BFLOAT16 = 16 # noqa: E702
 
-  def to_dtype(self) -> DType: return DTYPES_DICT[self.name.lower()]
+  def to_dtype(self) -> DType:
+    dt = self.to_storage_dtype()
+    # ONNX_FP16_AS_FP32=1 computes a float16 model in float32: for targets with no fp16 hardware (e.g. Hexagon v65 HVX,
+    # where every fp16 operand is a soft-float libcall), fp16 storage only costs conversions
+    return dtypes.float32 if dt == dtypes.float16 and getenv("ONNX_FP16_AS_FP32") else dt
+  def to_storage_dtype(self) -> DType: return DTYPES_DICT[self.name.lower()]
 
 # ***** onnx spec definitions *****
 class Domain(enum.Enum):
@@ -233,16 +238,19 @@ class OnnxPBParser:
       obj["data_location"] = 0
 
     # parse tensor
-    dtype = OnnxDataType(obj['data_type']).to_dtype()
+    dtype, storage_dtype = OnnxDataType(obj['data_type']).to_dtype(), OnnxDataType(obj['data_type']).to_storage_dtype()
     shape = tuple(obj['dims'])
     present_fields = [field for field in ['float_data', 'int32_data', 'int64_data', 'double_data', 'uint64_data', 'raw_data'] if field in obj]
     assert len(present_fields) == 1, f"only 1 data field is allowed from {obj=}"
     data = obj[present_fields[0]]
     if not isinstance(data, Tensor):
-      obj["parsed_tensor"] = Tensor(data, dtype=dtype).reshape(shape)
+      obj["parsed_tensor"] = Tensor(data, dtype=storage_dtype).reshape(shape).cast(dtype)
       return obj
     assert isinstance(data, Tensor) and data.dtype == dtypes.uint8, data
-    data = data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
+    if dtype != storage_dtype:
+      # promoted on the host, so the device graph holds float32 weights and has no conversion kernel
+      data = Tensor(data.bitcast(storage_dtype).numpy().astype(_to_np_dtype(dtype))).reshape(shape).to(Device.DEFAULT)
+    else: data = data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
     # const folding
     if shape == ():
       if data.dtype == dtypes.float16 and sys.version_info < (3, 12): data = data.cast(dtypes.float32)
