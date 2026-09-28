@@ -68,6 +68,8 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         acc = term if acc is None else acc + term
   elif groups == C and Cg == 1:
     wt = Tensor(wq.astype(np.int32), device=xq.device)
+    # a materialized padded input: padding masks on every tap cost more than the multiply-adds (as CONV_PAD_MATERIALIZE)
+    if any(padding): xp = xp.contiguous()
     # u16 x s16 x taps can pass 2^31: split the activation into byte planes then (each pass stays under 2^27 for 3x3)
     for ashift, aplane in (_planes(xp, xbits) if xbits == 16 and wq.dtype == np.int16 else [(0, xp)]):
       term = aplane.conv2d(wt, stride=stride, dilation=dilation, groups=groups).cast(dtypes.float32) * float(1 << ashift)
