@@ -17,6 +17,15 @@ def _narrow_int(u:UOp) -> UOp:
       (dtypes.is_unsigned(s) or not dtypes.is_unsigned(u.dtype)): u = u.src[0]
   return u
 
+def _unit_stride_rank(u:UOp, r:UOp) -> int:
+  # 0 when r steps u's (first) load index by exactly one element, 1 otherwise
+  idx = next((x for x in u.toposort() if x.op is Ops.INDEX and len(x.src) >= 2), None)
+  if idx is None: return 1
+  e, rngs = idx.src[1], [x for x in idx.src[1].toposort() if x.op is Ops.RANGE]
+  zero = {x: x.const_like(0) for x in rngs}
+  d = (e.substitute({**zero, r: r.const_like(1)}).simplify() - e.substitute(zero).simplify()).simplify()
+  return 0 if d.op is Ops.CONST and d.arg == 1 else 1
+
 class Scheduler:
   def __init__(self, ast:UOp, ren:Renderer):
     self.ast, self.ren = ast, ren
@@ -238,6 +247,9 @@ class Scheduler:
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
           in1_ranges = sorted([u for u in in1.ranges if u not in in0.ranges], key=lambda x: x.arg[0], reverse=True)
           red_ranges = sorted(reduceop.src[1:], key=lambda x: x.arg[0], reverse=True)
+          # Hexagon vrmpy: the TC's K group is 4 consecutive bytes of each output channel's weights (B). With weights prepacked
+          # [K/4][N][4] the reduce splits in two axes; take the one B walks at unit stride first, so the operand is one load
+          if self.ren.target.device == "DSP": red_ranges = sorted(red_ranges, key=lambda r: _unit_stride_rank(in1, r))
           if DEBUG >= 3:
             print(f"TC({axis}): {[(x.arg[0],x.vmax+1) for x in in0_ranges]}",
                               f"{[(x.arg[0],x.vmax+1) for x in in1_ranges]} {[(x.arg[0],x.vmax+1) for x in red_ranges]}")

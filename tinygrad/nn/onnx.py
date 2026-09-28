@@ -438,6 +438,34 @@ class OnnxRunner:
                                       for n in self.graph_nodes)
     return self
 
+  def _qdq_int_conv(self, node, inps, opts) -> Tensor|None:
+    """ONNX_QDQ_INT_CONV=1: Conv(DequantizeLinear(xq), DequantizeLinear(wq)) with u8/u16 xq (per-tensor) and int8/int16 wq
+    (per-channel, zero point 0) as an integer convolution (nn/qconv_v65.py); None keeps the float Conv"""
+    import numpy as np
+    from tinygrad.nn.qconv_v65 import qconv2d
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    xn, wn = self._producers.get(node.inputs[0]), self._producers.get(node.inputs[1])
+    if xn is None or wn is None or xn.op != "DequantizeLinear" or wn.op != "DequantizeLinear": return None
+    if opts.get("auto_pad", "NOTSET") != "NOTSET" or len(inps[1].shape) != 4: return None
+    xq = self.graph_values[xn.inputs[0]]
+    if not isinstance(xq, Tensor) or xq.dtype not in (dtypes.uint8, dtypes.uint16): return None
+    def arr(name): return np.asarray(self.graph_values[name].numpy() if isinstance(self.graph_values[name], Tensor) else self.graph_values[name])
+    sx = arr(xn.inputs[1])
+    if sx.size != 1: return None
+    zx = int(arr(xn.inputs[2]).reshape(-1)[0]) if len(xn.inputs) > 2 and xn.inputs[2] else 0
+    if (cached:=self._qconv_w.get(node.outputs[0])) is None:
+      wq = arr(wn.inputs[0])
+      if wq.dtype not in (np.int8, np.int16): return None
+      if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
+      sw = np.broadcast_to(arr(wn.inputs[1]).astype(np.float32).reshape(-1), (wq.shape[0],)).copy()
+      cached = self._qconv_w[node.outputs[0]] = (wq, sw)
+    wq, sw = cached
+    pads = opts.get("pads", 0)
+    p = [pads] * 4 if isinstance(pads, int) else list(pads)
+    return qconv2d(xq, zx, float(sx.reshape(-1)[0]), wq, sw, inps[2] if len(inps) > 2 else None,
+                   stride=opts.get("strides", 1), dilation=opts.get("dilations", 1), padding=(p[1], p[3], p[0], p[2]),
+                   groups=opts.get("group", 1))
+
   def _get_python_const(self, name:str, op:str, idx:int) -> list[ConstType]|ConstType|bytes|Any:
     """Convert tensor to python const with name-based caching for JIT stability."""
     t = self.graph_values[name]
@@ -487,7 +515,8 @@ class OnnxRunner:
 
         if debug >= 1: print((f"[{self.graph_name}] " if self.graph_name else "") + f"{num}: op '{node.op}' opt {opts}")
         if debug >= 2 and node.inputs: print("\tinputs:\n" + "\n".join(f"\t\t{x} - {i!r}" for x,i in zip(node.inputs, inps)))
-        ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
+        if node.op == "Conv" and getenv("ONNX_QDQ_INT_CONV") and (qc:=self._qdq_int_conv(node, inps, opts)) is not None: ret = qc
+        else: ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
         ret = ret if isinstance(ret, tuple) else (ret,)
         if debug >= 2: print("\toutputs:\n" + "\n".join(f"\t\t{x} - {o!r}" for x,o in zip(node.outputs, ret)))
 
