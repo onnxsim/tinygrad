@@ -57,7 +57,11 @@ def compile(onnx_file):
   # replace symbolic dimensions (e.g. 'b' for dynamic batch) with 1
   input_shapes = {k:tuple(s if isinstance(s, int) else 1 for s in shp) for k,shp in input_shapes.items()}
   inputs = {k:Tensor(Tensor.randn(*shp, dtype=input_types[k]).mul(8).realize().numpy(), device='NPY') for k,shp in sorted(input_shapes.items())}
-  if not getenv("NPY_IMG"):
+  if getenv("DSP_ALL_INPUTS"):
+    # Capture every ONNX input as a runtime DSP parameter. Without this, the non-image NPY
+    # tensors are treated as capture-time constants and cannot be supplied by a phone runner.
+    inputs = {k:Tensor(v.numpy(), device=Device.DEFAULT).realize() for k,v in inputs.items()}
+  elif not getenv("NPY_IMG"):
     inputs = {k:Tensor(v.numpy(), device=Device.DEFAULT).realize() if 'img' in k else v for k,v in inputs.items()}
   print("created tensors")
 

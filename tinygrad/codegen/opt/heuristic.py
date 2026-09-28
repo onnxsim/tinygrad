@@ -56,6 +56,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # make a copy so it does not mutate the input
   k = k.copy()
+  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  # HVX vectors are 128 bytes. The DSP path also handles byte tensors, so the lane cap must
+  # account for the reduction dtype (e.g. 32 f32 lanes or 128 byte lanes).
+  dsp_vector_lanes = 128 // k.reduceop.dtype.itemsize if is_dsp and k.reduceop is not None else 128
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -111,7 +115,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for axis in k.upcastable_dims:
     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
     is_masked = k.rngs[axis] in where_gate_rngs
-    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+    max_masked_upcast = min(7 * 7, dsp_vector_lanes // k.upcast_size()) if is_dsp else 7 * 7
+    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= max_masked_upcast:
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
@@ -136,9 +141,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (on the DSP, one HVX-register-sized or larger vector: 128/64/32 lanes,
-    # since real shapes like ...x272 aren't multiples of 128 and would otherwise fall back to a 4-wide upcast)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128,64,32] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider upcasts up to one HVX vector (the lane count depends on the reduction dtype); real shapes like ...x272
+    # aren't multiples of 128 and would otherwise fall back to a 4-wide upcast for byte-sized reductions
+    dsp_upcast_sizes = [s for s in [128,64,32,16,8,4] if s * k.upcast_size() <= dsp_vector_lanes]
+    for axis, upcast_amount in itertools.product(k.upcastable_dims,
+        (dsp_upcast_sizes if not len(upcasted_axis) else []) if is_dsp else [3,4]):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -191,8 +198,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             break
   except KernelOptError: pass
 
-  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, as wide as the innermost dim allows, up to 128 lanes)
-  for splits in ([128,64,32,16,8,4] if is_dsp else [4]):
+  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
+  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
       break
