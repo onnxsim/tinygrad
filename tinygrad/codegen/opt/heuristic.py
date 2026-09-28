@@ -1,6 +1,7 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
+from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -61,6 +62,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # lane cap follows the reduction dtype (32 f32 lanes, 128 byte lanes). qfloat DSPs keep several-vector float accumulators
   max_bytes = getattr(k.ren, "upcast_max_bytes", None)
   dsp_vector_lanes = max_bytes // k.reduceop.dtype.itemsize if is_dsp and max_bytes and k.reduceop is not None else 128
+  # ...and there float is scalar, so a float reduction wants register blocking (small upcasts on the axes whose loads are
+  # reused, as on a CPU) rather than one contiguous vector-wide axis: it takes the non-DSP upcast rules below
+  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and is_dsp and max_bytes is not None and k.reduceop is not None and dtypes.is_float(k.reduceop.dtype)
+  # blocking only pays with reuse in two directions (a conv: inputs shared across output channels, weights across pixels); a GEMV
+  # has one, and blocking its output axis measured 10x slower on the phone than the contiguous vector-style upcast
+  if dsp_scalar_float:
+    reuse_axes = [a for a in k.upcastable_dims if k.full_shape[a] > 1 and any(k.rngs[a] not in b.src[1].get_idx().backward_slice for b in k.bufs)]
+    dsp_scalar_float = len(reuse_axes) >= 2
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -145,8 +154,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     # consider upcasts up to one HVX vector (the lane count depends on the reduction dtype); real shapes like ...x272
     # aren't multiples of 128 and would otherwise fall back to a 4-wide upcast for byte-sized reductions
     dsp_upcast_sizes = [s for s in [128,64,32,16,8,4] if s * k.upcast_size() <= dsp_vector_lanes]
+    vector_dsp = is_dsp and not dsp_scalar_float
     for axis, upcast_amount in itertools.product(k.upcastable_dims,
-        (dsp_upcast_sizes if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+        (dsp_upcast_sizes if not len(upcasted_axis) else []) if vector_dsp else [3,4]):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -165,7 +175,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if rng in idx.backward_slice and not unit: gathers += 1
         # on the DSP first avoid gathers (HVX_UPCAST_CONTIG=1), then prefer the widest vector for the same axis (both keys are 0
         # elsewhere, so ordering is unchanged)
-        xb_choices.append((gathers if is_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if is_dsp else 0,
+        xb_choices.append((gathers if vector_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if vector_dsp else 0,
                            axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
@@ -186,11 +196,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    # scalar float on v65: accumulators x unrolled taps must stay near the 32-register file, or the loop body is spills
+    scalar_cap = getenv("DSP_SCALAR_UNROLL", 16) if dsp_scalar_float else None
+    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64) and \
+        (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
-        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3 and \
+            (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
         for splits in [4]:
@@ -200,7 +214,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   except KernelOptError: pass
 
   # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
-  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp else [4]):
+  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not dsp_scalar_float else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
       break

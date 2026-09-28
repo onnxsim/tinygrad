@@ -17,6 +17,9 @@ from tinygrad.runtime.support import dsp_graph, dsp_graph_v65
 def seeded_inputs(jit, seed:int) -> dict[str, Tensor]:
   rng, ins = np.random.default_rng(seed), {}
   for name, (view, _, dt, dev) in zip(jit.captured.expected_names, jit.captured.expected_input_info):
+    # a 1-D input is recorded as the bare buffer (a NOOP view): its size isn't in the capture, so take the inputs from the npz
+    # compile3.py writes next to the pickle (--inputs)
+    if view._shape is None: raise ValueError(f"input {name} has no recorded shape; pass --inputs (compile3.py writes <pkl>_inputs.npz)")
     shape, np_dt = tuple(view.shape), np.dtype(dt.fmt)
     a = rng.integers(0, 256, shape) if np.issubdtype(np_dt, np.integer) else rng.standard_normal(shape) * 8
     ins[name] = Tensor(a.astype(np_dt), device=dev).realize()
@@ -32,6 +35,8 @@ if __name__ == "__main__":
   args = p.parse_args()
   out = pathlib.Path(args.outdir)
   with open(args.pickle, "rb") as f: jit = compile3.load_pickle(f)
+  if args.inputs is None and pathlib.Path(args.pickle.rsplit(".", 1)[0] + "_inputs.npz").exists():
+    args.inputs = args.pickle.rsplit(".", 1)[0] + "_inputs.npz"
   if args.inputs:
     npz = np.load(args.inputs)
     inputs = {name: Tensor(npz[name], device=dev).realize()
@@ -42,6 +47,10 @@ if __name__ == "__main__":
   print(f"reference: the JIT under qemu, output {ref.shape} {ref.dtype}, {time.perf_counter()-st:.1f} s")
   res: list = []
   calls, bufs = dsp_graph.capture(lambda: res.append(jit(**inputs)))
+  used = {id(b[0].base) for b in bufs.values()}
+  unused = [k for k, t in inputs.items() if id(t.uop.buffer.base) not in used]
+  if unused: print(f"inputs no kernel reads (left out of the program): {unused}")
+  inputs = {k: t for k, t in inputs.items() if k not in unused}
   info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for t in inputs.values()], res[0].uop.buffer)
   xs = [t.numpy().tobytes() for t in inputs.values()]
   dsp_graph_v65.write_case(out, xs, ref.tobytes())

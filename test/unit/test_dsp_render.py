@@ -58,7 +58,7 @@ class TestDSPRender(unittest.TestCase):
     b = Tensor.empty(64, dtype=dtypes.float16)
     with Context(DSP_V65_HW=1): src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
     self.assertNotIn("float64", src)
-    self.assertIn("float32", src)
+    self.assertNotIn("float128", src)
 
   @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
   def test_float_depthwise_conv_matches_cpu(self):

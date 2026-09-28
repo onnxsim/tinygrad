@@ -115,6 +115,8 @@ def compile(onnx_file):
     assert gated_read_image_count == allowed_gated_read_image, f"different gated read_image! {gated_read_image_count=}, {allowed_gated_read_image=}"
 
   with open(OUTPUT, "wb") as f: dump_pickle(run_onnx_jit, f)
+  # the inputs by name: a 1-D input's size is not recorded in the capture, so exporters (dsp_graph_v65.py) read them from here
+  np.savez(OUTPUT.rsplit(".", 1)[0] + "_inputs.npz", **{k: v.numpy() for k, v in inputs.items()})
   mdl_sz = os.path.getsize(onnx_file)
   pkl_sz = os.path.getsize(OUTPUT)
   print(f"mdl size is {mdl_sz/1e6:.2f}M")
