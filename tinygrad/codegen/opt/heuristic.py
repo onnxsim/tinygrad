@@ -195,9 +195,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # (not for scalar float on v65: 128 accumulators live in memory, and a GEMV with [out, in] weights reads 128 rows per step)
   if is_dsp and HVX_UPCAST_CONTIG and not (v65_float and getenv("DSP_SCALAR_GEMV", 1)) and not k.axes_of(AxisType.UPCAST) and \
       k.axes_of(AxisType.REDUCE):
-    for splits in [128,64,32]:
-      if k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-        k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+    # (on v65: the unit-stride axis, which needn't be the last -- a channel-blocked depthwise conv's is the 32 channels, its last
+    # the image width -- and at most one register of lanes)
+    axes = [k.upcastable_dims[-1]] if k.upcastable_dims else []
+    if max_bytes is not None: axes = [a for a in k.upcastable_dims if _unit_stride(k, a)][::-1] + axes
+    for axis, splits in itertools.product(axes, [s for s in [128,64,32] if max_bytes is None or s <= dsp_vector_lanes]):
+      if k.full_shape[axis] % splits == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, axis, splits))
         break
 
   # if last reduce dim is small(ish), loop unroll the reduce
