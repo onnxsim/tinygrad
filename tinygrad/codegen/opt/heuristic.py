@@ -64,7 +64,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   dsp_vector_lanes = max_bytes // k.reduceop.dtype.itemsize if is_dsp and max_bytes and k.reduceop is not None else 128
   # ...and there float is scalar, so a float reduction wants register blocking (small upcasts on the axes whose loads are
   # reused, as on a CPU) rather than one contiguous vector-wide axis: it takes the non-DSP upcast rules below
-  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and is_dsp and max_bytes is not None and k.reduceop is not None and dtypes.is_float(k.reduceop.dtype)
+  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and is_dsp and max_bytes is not None and k.reduceop is not None and \
+    dtypes.is_float(k.reduceop.dtype)
   # blocking only pays with reuse in two directions (a conv: inputs shared across output channels, weights across pixels); a GEMV
   # has one, and blocking its output axis measured 10x slower on the phone than the contiguous vector-style upcast
   if dsp_scalar_float:

@@ -2169,7 +2169,8 @@ class DSPProgram(Program['DSPDevice']):
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
     for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.alloc_size)
-    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v or 0)
+    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)):
+      struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v or 0)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
     total = 0
     core = next((i for i,(name,*_) in enumerate(self.signature[len(bufs):], start=len(bufs)) if name == 'core_id'), None)
@@ -2190,7 +2191,8 @@ class DSPAllocator(Allocator['DSPDevice']):
     alloc_size = round_up(size+128, 0x1000)
     if getenv("MOCKDSP") or getenv("HEXSIM"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
     else:
-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=alloc_size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=alloc_size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID,
+                                 flags=qcom_dsp.ION_FLAG_CACHED)
       fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
     return DSPBuffer(libc.mmap(0, alloc_size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0, alloc_size=alloc_size)
 
@@ -2204,7 +2206,8 @@ class DSPAllocator(Allocator['DSPDevice']):
   def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
   def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
   def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
-  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset, max(size, buf.alloc_size-offset))
+  def _offset(self, buf, size:int, offset:int):
+    return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset, max(size, buf.alloc_size-offset))
 
 def _find_libgcc() -> str:
   # Every kernel this backend has ever compiled before HEXSIM/float32 support (uint8/int8/int32

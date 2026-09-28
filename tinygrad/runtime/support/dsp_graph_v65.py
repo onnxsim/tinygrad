@@ -21,7 +21,8 @@ def _rnd(n:int) -> int: return (n + ALIGN - 1) // ALIGN * ALIGN + ALIGN  # + ALI
 
 def emit(outdir, calls, bufs, inputs:list, output) -> dict:
   """calls/bufs from dsp_graph.capture; inputs: the graph's input Buffers in order, output: its output Buffer"""
-  o = pathlib.Path(outdir); o.mkdir(parents=True, exist_ok=True)
+  o = pathlib.Path(outdir)
+  o.mkdir(parents=True, exist_ok=True)
   for p in o.glob("k*.c"): p.unlink()
   views = {i: v[0] for i, v in bufs.items()}
   base = {i: b.base for i, b in views.items()}
@@ -86,7 +87,10 @@ void _start(void) {
   unsigned char* blob = mmap2(0, G_BLOB_BYTES + 4096, 3, 0x21, -1, 0);
   rd(blob, G_BLOB_BYTES);
   for (int i = 0; i < G_NREG; i++) R[i] = G_REG_BLOB[i] >= 0 ? blob + G_REG_BLOB[i] : mmap2(0, G_REG_BYTES[i] + 4096, 3, 0x21, -1, 0);
-  for (int i = 0; i < G_NIN; i++) { rd(R[G_IN_REG[i]], G_IN_BYTES[i]); if (G_IN_BYTES[i] % 128) { unsigned char pad[128]; rd(pad, 128 - G_IN_BYTES[i] % 128); } }
+  for (int i = 0; i < G_NIN; i++) {
+    rd(R[G_IN_REG[i]], G_IN_BYTES[i]);
+    if (G_IN_BYTES[i] % 128) { unsigned char pad[128]; rd(pad, 128 - G_IN_BYTES[i] % 128); }
+  }
   for (int i = 0; i < G_NCALLS; i++) g_call(i, R);
   write(1, R[G_OUT_REG] + G_OUT_OFF, G_OUT_BYTES);
   exit(0);
@@ -102,7 +106,7 @@ def run_qemu(outdir, xs:list[bytes], timeout:int=3600) -> bytes:
   (o / "qemu_main.c").write_text(boiler + "\n" + QEMU_MAIN)
   flags = [*_hvx_args(), "-O2", "-fPIC", "-ffreestanding", "-nostdlib", "-fno-stack-protector", "-Wno-deprecated-non-prototype"]
   ks = sorted(p.name for p in o.glob("k*.c"))
-  run = lambda cmd: subprocess.run(cmd, cwd=o, check=True)
+  def run(cmd): subprocess.run(cmd, cwd=o, check=True)
   with ThreadPoolExecutor(os.cpu_count()) as ex: list(ex.map(lambda k: run([_cc(), "-c", *flags, "-o", f"q_{k[:-2]}.o", k]), ks))
   libgcc = ops_dsp._find_libgcc()
   run([_cc(), "-static", "-fuse-ld=lld", *flags, "-o", "graph_qemu.elf", "qemu_main.c", *[f"q_{k[:-2]}.o" for k in ks],
@@ -122,7 +126,7 @@ def build(outdir, skel_arch:str="v68", kernel_arch:str="v65", jobs:int=8) -> tup
   for f in ("skel.c", "client.c", "tg_graph.idl"): shutil.copy(FILES / f, o / f)
   inc = ["-I", ".", "-I", str(sdk / "incs"), "-I", str(sdk / "incs/stddef")]
   qurt = ["-I", str(sdk / f"rtos/qurt/compute{skel_arch}/include/qurt"), "-I", str(sdk / f"rtos/qurt/compute{skel_arch}/include/posix")]
-  run = lambda cmd: subprocess.run(cmd, cwd=o, check=True)
+  def run(cmd): subprocess.run(cmd, cwd=o, check=True)
   run([str(sdk / "ipc/fastrpc/qaic/Ubuntu/qaic"), "-I", str(sdk / "incs"), "-I", str(sdk / "incs/stddef"), "tg_graph.idl"])
   hc = [str(tc / "bin/hexagon-clang"), "-c", "-O2", "-fPIC", f"-mcpu=hexagon{skel_arch}"]
   run([*hc, *inc, "-o", "skel_rpc.o", "tg_graph_skel.c"])
