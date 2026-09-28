@@ -53,7 +53,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       # single-instruction, single-thread op with no warp/lane cooperation, so it has no LOCAL axis to use)
       if tk.ren is not None and tk.ren.has_local and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]):
         tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
-      return tk
+      # the DSP's TensorCore is one HVX thread's instruction: split its kernel over the hardware threads like any other
+      return apply_threads(tk) if tk.ren is not None and tk.ren.target.device == "DSP" else tk
 
   # make a copy so it does not mutate the input
   k = k.copy()
@@ -244,8 +245,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         k.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
         if will_delete_shape: deleted_shape += 1
 
-  # **** threading ****
+  return apply_threads(k)
 
+def apply_threads(k:Scheduler) -> Scheduler:
   if k.ren.has_threads and k.ren.global_max is not None:
     for threads in [32,16,12,8,6,5,4,3,2]:
       # Skip if too many threads. Heuristic: use about 128K ops per thread (a renderer whose per-element cost is far higher, like
@@ -257,5 +259,4 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           except KernelOptError: pass
           break
       if k.applied_opts and k.applied_opts[-1].op is OptOps.THREAD: break
-
   return k
