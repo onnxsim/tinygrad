@@ -67,9 +67,16 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
         acc = term if acc is None else acc + term
   elif groups == C and Cg == 1:
-    wt = Tensor(wq.astype(np.int32), device=xq.device)
-    # a materialized padded input: padding masks on every tap cost more than the multiply-adds (as CONV_PAD_MATERIALIZE)
-    if any(padding): xp = xp.contiguous()
+    # 32 channels per vector: the padded input (kept at its own width) is stored [C/32][H][W][32] and the weights [kh][kw][C], so
+    # one tap of 32 channels is one contiguous load of each. Both are views back to the logical NCHW / (C, 1, kh, kw) shapes.
+    # The copy also materializes the padding (padding masks on every tap cost more than the multiply-adds)
+    xpu = xq.pad(((0, 0), (0, 0), (padding[2], padding[3]), (padding[0], padding[1])), value=zx)
+    Hp, Wp = xpu.shape[2], xpu.shape[3]
+    if C % 32 == 0:
+      xpu = xpu.reshape(C // 32, 32, Hp, Wp).permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2).reshape(1, C, Hp, Wp)
+    elif any(padding): xpu = xpu.contiguous()
+    xp = xpu.cast(dtypes.int32)
+    wt = Tensor(np.ascontiguousarray(wq[:, 0].astype(np.int32).transpose(1, 2, 0)), device=xq.device).permute(2, 0, 1).reshape(N, 1, kh, kw)
     # u16 x s16 x taps can pass 2^31: split the activation into byte planes then (each pass stays under 2^27 for 3x3)
     for ashift, aplane in (_planes(xp, xbits) if xbits == 16 and wq.dtype == np.int16 else [(0, xp)]):
       term = aplane.conv2d(wt, stride=stride, dilation=dilation, groups=groups).cast(dtypes.float32) * float(1 << ashift)
