@@ -82,10 +82,12 @@ def compile(onnx_file):
   for i in range(3):
     GlobalCounters.reset()
     print(f"run {i}")
+    st = time.perf_counter()
     with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1), OPENPILOT_HACKS=1):
       ret = run_onnx_jit(**inputs).numpy()
     # copy i == 1 so use of JITBEAM is okay
     if i == 1: test_val = np.copy(ret)
+    print(f"timing: run {i} {time.perf_counter()-st:.1f} s")
   # iterate kernel CALLs in the captured LINEAR UOp; toposort descends into batched graph CUSTOM_FUNCTIONs
   kernel_asts = {Ops.PROGRAM}
   kernel_calls = [u for u in run_onnx_jit.captured.linear.toposort(gate=lambda x: x.op not in kernel_asts)

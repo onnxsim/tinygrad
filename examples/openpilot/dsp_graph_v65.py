@@ -49,7 +49,9 @@ if __name__ == "__main__":
   ref = jit(**inputs).numpy().copy()
   print(f"reference: the JIT under qemu, output {ref.shape} {ref.dtype}, {time.perf_counter()-st:.1f} s")
   res: list = []
+  st = time.perf_counter()
   calls, bufs = dsp_graph.capture(lambda: res.append(jit(**inputs)))
+  print(f"timing: capture {time.perf_counter()-st:.1f} s")
   used = {id(b[0].base) for b in bufs.values()}
   unused = [k for k, t in inputs.items() if id(t.uop.buffer.base) not in used]
   if unused: print(f"inputs no kernel reads (left out of the program): {unused}")
@@ -70,7 +72,9 @@ if __name__ == "__main__":
       yy = np.frombuffer(y, dtype=ref.dtype)[:ref.size]
       print(f"  {np.sum(yy != ref.ravel())} of {ref.size} differ, max |diff| {np.nanmax(np.abs(yy - ref.ravel()))}")
       sys.exit(1)
-  if args.build: print("built", *dsp_graph_v65.build(out))
+  if args.build:
+    st = time.perf_counter()
+    print("built", *dsp_graph_v65.build(out), f"({time.perf_counter()-st:.1f} s)")
   if args.artifact:
     import onnx
     from tinygrad.helpers import getenv
