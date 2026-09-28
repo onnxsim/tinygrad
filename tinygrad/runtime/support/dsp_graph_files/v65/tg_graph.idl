@@ -1,0 +1,10 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface tg_graph : remote_handle64 {
+  // copy one chunk of blob.bin (the weights, `total` bytes) to `offset`; chunks arrive in order, the first allocates
+  long load(in long offset, in long total, in sequence<uint8> chunk);
+  // run graph calls [start, start+count) on `threads` hardware threads; start == 0 takes the inputs (input.bin), the batch
+  // that ends the graph returns the output. times[0] = us for the batch, times[1+i] = us for call start+i (if room)
+  long run(in long start, in long count, in long threads, in sequence<uint8> input, rout sequence<uint8> output,
+           rout sequence<uint64> times);
+};
