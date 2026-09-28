@@ -245,6 +245,13 @@ def _splat_of_loaded_lane(ctx, x:UOp) -> str|None:
   if not _loaded_unchanged(ctx, v:=s.src[0], x): return None
   return f"(({ctx.render_type(x)})((({ctx.render_dtype(s.dtype)}*){ctx[v.src[0]]})[{lane}]))"
 
+def _lane_of_loaded(ctx, x:UOp) -> str|None:
+  # v65 (DSP_V65_HW): one scalar lane of a loaded vector, used on its own (a table index, say), is a scalar reload from memory:
+  # extracting lanes of an HVX register one by one costs far more than the scalar loads it saves
+  if not _v65_hw() or len(x.src) != 2 or x._shape != () or x.src[0].max_numel() <= 1 or (lane:=_lane(x.src[1])) is None: return None
+  if not _loaded_unchanged(ctx, v:=x.src[0], x): return None
+  return f"((({ctx.render_dtype(x.dtype)}*){ctx[v.src[0]]})[{lane}])"
+
 def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
   if HVX_PREFETCH_STRIDES <= 0 or len(bidx.src) < 2 or not (pos:=getattr(ctx, "_pos", None)): return HVX_PREFETCH
   idx = bidx.src[1]
@@ -307,6 +314,7 @@ dsp_string = PatternMatcher([
    f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
    if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), _subline_prefetch),
+  (UPat(Ops.INDEX, src=(UPat(Ops.LOAD), UPat()), name="x"), _lane_of_loaded),
 ])
 
 # ***** HVX re-vectorization *****

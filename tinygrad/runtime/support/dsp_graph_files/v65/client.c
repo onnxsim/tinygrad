@@ -75,7 +75,8 @@ int main(int argc, char** argv) {
   if (iters) printf("%d iters, %d threads: best %.2f ms, mean %.2f ms per inference (RPC-inclusive)\n", iters, threads, best, sum / iters);
   if (prof && iters) {
     unsigned long long tot = 0; for (int i = 0; i < ncalls; i++) tot += g_call_us[i];
-    for (int k = 0; k < 15; k++) {
+    int top = getenv("PROF_TOP") ? atoi(getenv("PROF_TOP")) : 15;  /* PROF_TOP=N lists the N slowest calls */
+    for (int k = 0; k < top; k++) {
       int m = -1; for (int i = 0; i < ncalls; i++) if (g_call_us[i] && (m < 0 || g_call_us[i] > g_call_us[m])) m = i;
       if (m < 0) break;
       printf("  call %4d %9.1f us %5.1f%%\n", m, (double)g_call_us[m] / iters, 100.0 * g_call_us[m] / tot);

@@ -450,21 +450,135 @@ class OnnxRunner:
     xq = self.graph_values[xn.inputs[0]]
     if not isinstance(xq, Tensor) or xq.dtype not in (dtypes.uint8, dtypes.uint16): return None
     def arr(name): return np.asarray(self.graph_values[name].numpy() if isinstance(self.graph_values[name], Tensor) else self.graph_values[name])
-    sx = arr(xn.inputs[1])
-    if sx.size != 1: return None
-    zx = int(arr(xn.inputs[2]).reshape(-1)[0]) if len(xn.inputs) > 2 and xn.inputs[2] else 0
-    if (cached:=self._qconv_w.get(node.outputs[0])) is None:
-      wq = arr(wn.inputs[0])
-      if wq.dtype not in (np.int8, np.int16): return None
+    # the quantization parameters and weights are constants: read once (the first, uncaptured call) and cached, since a TinyJit
+    # capture can't read tensor data. A node that doesn't qualify is cached as None and stays a float Conv
+    key = node.outputs[0]
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      sx, wq = arr(xn.inputs[1]), arr(wn.inputs[0])
+      if sx.size != 1 or wq.dtype not in (np.int8, np.int16): return None
       if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
+      zx = int(arr(xn.inputs[2]).reshape(-1)[0]) if len(xn.inputs) > 2 and xn.inputs[2] else 0
       sw = np.broadcast_to(arr(wn.inputs[1]).astype(np.float32).reshape(-1), (wq.shape[0],)).copy()
-      cached = self._qconv_w[node.outputs[0]] = (wq, sw)
-    wq, sw = cached
+      self._qconv_w[key] = (float(sx.reshape(-1)[0]), zx, wq, sw)
+    if (cached:=self._qconv_w[key]) is None: return None
+    sx_f, zx, wq, sw = cached
     pads = opts.get("pads", 0)
     p = [pads] * 4 if isinstance(pads, int) else list(pads)
-    return qconv2d(xq, zx, float(sx.reshape(-1)[0]), wq, sw, inps[2] if len(inps) > 2 else None,
+    return qconv2d(xq, zx, sx_f, wq, sw, inps[2] if len(inps) > 2 else None,
                    stride=opts.get("strides", 1), dilation=opts.get("dilations", 1), padding=(p[1], p[3], p[0], p[2]),
                    groups=opts.get("group", 1))
+
+  _QDQ_MOVES = ("Reshape", "Transpose", "Squeeze", "Unsqueeze", "Flatten", "Identity", "Slice")
+  _QDQ_VALUE = ("Gelu", "Relu", "Sigmoid", "Tanh", "Div", "Mul", "Add", "Sub", "Cast")
+
+  def _qdq_lut(self, node) -> Tensor|None:
+    """ONNX_QDQ_LUT=1, at a QuantizeLinear with per-tensor u8/u16 output parameters:
+    - Q(move(DQ(q))) with the same scale and zero point (the full-QDQ quantizer wraps even Reshape/Transpose) is move(q) on the
+      integer tensor, and Q(DQ(q)) is q;
+    - otherwise Q(f(src)), for a chain f of single-input value ops (Gelu, Relu, Sigmoid, Tanh, Div/Mul/Add/Sub by a scalar
+      constant, Cast) from a <= 16-bit integer source (DequantizeLinear of u8/u16, or a u8/u16 tensor itself, like the camera
+      frame), is a table of f over all 256/65536 source values: computed once on the host (float32 dequantize, f in float64,
+      round half to even, saturate), then one gather per element"""
+    import numpy as np, math
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    def arr(name):
+      v = self.graph_values[name]
+      return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+    def const(name):  # an initializer, a Constant, or a DequantizeLinear of constants (the full-QDQ quantizer's quantized scalars)
+      if name in self.const_names: return True
+      p = self._producers.get(name)
+      return p is not None and (p.op == "Constant" or (p.op == "DequantizeLinear" and all(const(i) for i in p.inputs if i)))
+    def qparams(n): return (arr(n.inputs[1]).reshape(-1), arr(n.inputs[2]).reshape(-1) if len(n.inputs) > 2 and n.inputs[2] else np.zeros(1))
+    key = ("q", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      sy, zy = qparams(node)
+      if sy.size != 1 or len(node.inputs) < 3 or not node.inputs[2] or zy.dtype not in (np.uint8, np.uint16): return None
+      # 1. movement fold
+      p = self._producers.get(node.inputs[0])
+      if p is not None and p.op in self._QDQ_MOVES: dq = self._producers.get(p.inputs[0])
+      else: dq, p = p, None
+      if dq is not None and dq.op == "DequantizeLinear" and all(const(x) for x in dq.inputs[1:] if x):
+        sx, zx = qparams(dq)
+        if sx.size == 1 and sx[0] == sy[0] and int(zx[0]) == int(zy[0]) and \
+           self.graph_values[dq.inputs[0]].dtype == (dtypes.uint8 if zy.dtype == np.uint8 else dtypes.uint16):
+          self._qconv_w[key] = ("move", p, dq.inputs[0])
+      # 2. table over a value chain
+      if self._qconv_w[key] is None:
+        chain, t = [], node.inputs[0]
+        while (n:=self._producers.get(t)) is not None and n.op in self._QDQ_VALUE:
+          var = [x for x in n.inputs if x and not const(x)]
+          if len(var) != 1 or any(arr(x).size != 1 for x in n.inputs if x and const(x)): return None
+          if n.op in ("Div", "Sub") and n.inputs[0] != var[0]: return None  # c / x, c - x: keep it simple
+          chain.append(n)
+          t = var[0]
+        src, x = None, None
+        if (n:=self._producers.get(t)) is not None and n.op == "DequantizeLinear" and all(const(i) for i in n.inputs[1:] if i):
+          sx, zx = qparams(n)
+          src = n.inputs[0]
+          if sx.size != 1 or self.graph_values[src].dtype not in (dtypes.uint8, dtypes.uint16): return None
+          size = 256 if self.graph_values[src].dtype == dtypes.uint8 else 65536
+          x = ((np.arange(size) - int(zx[0])).astype(np.float32) * np.float32(sx[0])).astype(np.float64)
+        elif isinstance(self.graph_values.get(t), Tensor) and self.graph_values[t].dtype in (dtypes.uint8, dtypes.uint16) and chain:
+          src, size = t, 256 if self.graph_values[t].dtype == dtypes.uint8 else 65536
+          x = np.arange(size).astype(np.float64)
+        if src is None or not chain and x is None: return None
+        for n in reversed(chain):
+          c = next((float(arr(i).reshape(-1)[0]) for i in n.inputs if i and const(i)), None)
+          if n.op == "Gelu":
+            x = 0.5 * x * (1 + (np.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)) if n.opts.get("approximate", "none") == "tanh"
+                                else np.vectorize(math.erf)(x / math.sqrt(2))))
+          elif n.op == "Relu": x = np.maximum(x, 0)
+          elif n.op == "Sigmoid": x = 1 / (1 + np.exp(-x))
+          elif n.op == "Tanh": x = np.tanh(x)
+          elif n.op == "Div": x = x / c
+          elif n.op == "Mul": x = x * c
+          elif n.op == "Add": x = x + c
+          elif n.op == "Sub": x = x - c
+          elif n.op == "Cast":
+            if OnnxDataType(n.opts["to"]).to_dtype() not in (dtypes.float32, dtypes.float16): return None
+          x = x.astype(np.float32).astype(np.float64)  # each ONNX op rounds to float32
+        info = np.iinfo(zy.dtype)
+        q = np.clip(np.rint(x.astype(np.float32) / np.float32(sy[0])) + int(zy[0]), info.min, info.max).astype(zy.dtype)
+        self._qconv_w[key] = ("lut", Tensor(q, device=self.graph_values[src].device).realize(), src)
+    if (plan:=self._qconv_w[key]) is None: return None
+    if plan[0] == "move":
+      mv, q = plan[1], self.graph_values[plan[2]]
+      if mv is None: return q
+      inps = [q] + [self._get_python_const(nm, mv.op, i) for i, nm in enumerate(mv.inputs) if i > 0]
+      return self._select_op(mv.op, mv.opset_id)(*inps, **mv.opts)
+    return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)]
+
+  def _dq_unary_lut(self, node) -> Tensor|None:
+    """ONNX_QDQ_LUT=1: f(DequantizeLinear(xq)) for f in Gelu/Sigmoid/Tanh with a per-tensor u8/u16 xq and a float consumer (a
+    float head's Gemm input, say) is a float32 table of f over the 256/65536 values: computed once instead of once per use,
+    which also stops a reduce that fuses f from recomputing it for every output"""
+    import numpy as np, math
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    key = ("f", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      dq = self._producers.get(node.inputs[0])
+      if dq is None or dq.op != "DequantizeLinear": return None
+      src = dq.inputs[0]
+      if not isinstance(self.graph_values.get(src), Tensor) or self.graph_values[src].dtype not in (dtypes.uint8, dtypes.uint16): return None
+      def arr(name):
+        v = self.graph_values[name]
+        return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+      sx = arr(dq.inputs[1]).reshape(-1)
+      zx = int(arr(dq.inputs[2]).reshape(-1)[0]) if len(dq.inputs) > 2 and dq.inputs[2] else 0
+      if sx.size != 1: return None
+      size = 256 if self.graph_values[src].dtype == dtypes.uint8 else 65536
+      x = ((np.arange(size) - zx).astype(np.float32) * np.float32(sx[0])).astype(np.float64)
+      if node.op == "Gelu":
+        y = 0.5 * x * (1 + (np.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)) if node.opts.get("approximate", "none") == "tanh"
+                            else np.vectorize(math.erf)(x / math.sqrt(2))))
+      elif node.op == "Sigmoid": y = 1 / (1 + np.exp(-x))
+      else: y = np.tanh(x)
+      self._qconv_w[key] = (Tensor(y.astype(np.float32), device=self.graph_values[src].device).realize(), src)
+    if (plan:=self._qconv_w[key]) is None: return None
+    return plan[0][self.graph_values[plan[1]].cast(dtypes.int32)]
 
   def _get_python_const(self, name:str, op:str, idx:int) -> list[ConstType]|ConstType|bytes|Any:
     """Convert tensor to python const with name-based caching for JIT stability."""
@@ -516,6 +630,8 @@ class OnnxRunner:
         if debug >= 1: print((f"[{self.graph_name}] " if self.graph_name else "") + f"{num}: op '{node.op}' opt {opts}")
         if debug >= 2 and node.inputs: print("\tinputs:\n" + "\n".join(f"\t\t{x} - {i!r}" for x,i in zip(node.inputs, inps)))
         if node.op == "Conv" and getenv("ONNX_QDQ_INT_CONV") and (qc:=self._qdq_int_conv(node, inps, opts)) is not None: ret = qc
+        elif node.op == "QuantizeLinear" and getenv("ONNX_QDQ_LUT") and (qc:=self._qdq_lut(node)) is not None: ret = qc
+        elif node.op in ("Gelu", "Sigmoid", "Tanh") and getenv("ONNX_QDQ_LUT") and (qc:=self._dq_unary_lut(node)) is not None: ret = qc
         else: ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
         ret = ret if isinstance(ret, tuple) else (ret,)
         if debug >= 2: print("\toutputs:\n" + "\n".join(f"\t\t{x} - {o!r}" for x,o in zip(node.outputs, ret)))
