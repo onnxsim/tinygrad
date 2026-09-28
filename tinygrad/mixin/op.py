@@ -1597,8 +1597,10 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     assert groups*cin == cin_ and len(self.shape) == len(weight.shape),\
         f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups*cin} vs. {cin_})"
     # conv2d is a pooling op (with padding, possibly negative — _pad_constant handles the shrink)
-    x = self._pad_constant(((0,0),)*(self.ndim-len(HW)) + flat_to_grouped(padding_), 0.0)
-    if CONV_PAD_MATERIALIZE and any(p > 0 for p in padding_): x = x.contiguous()
+    # the padded copy is its own kernel: fused into the producer, the producer would compute (masked) over the padded grid
+    x = (self.contiguous() if (pad_copy:=CONV_PAD_MATERIALIZE and any(p > 0 for p in padding_)) else self)
+    x = x._pad_constant(((0,0),)*(self.ndim-len(HW)) + flat_to_grouped(padding_), 0.0)
+    if pad_copy: x = x.contiguous()
     x = x._pool(HW, stride, dilation)
     rcout, oyx = cout//groups, x.shape[2:-len(HW)]
     x = x.reshape(bs, groups, cin, 1, *oyx, *HW).expand(bs, groups, cin, rcout, *oyx, *HW)\
