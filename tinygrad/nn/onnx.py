@@ -548,7 +548,8 @@ class OnnxRunner:
       if mv is None: return q
       inps = [q] + [self._get_python_const(nm, mv.op, i) for i, nm in enumerate(mv.inputs) if i > 0]
       return self._select_op(mv.op, mv.opset_id)(*inps, **mv.opts)
-    return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)]
+    # its own buffer: fused into a consumer's padding, the gather's index load lost the pad mask (a phone TLB miss, qemu passed)
+    return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)].contiguous()
 
   def _dq_unary_lut(self, node) -> Tensor|None:
     """ONNX_QDQ_LUT=1: f(DequantizeLinear(xq)) for f in Gelu/Sigmoid/Tanh with a per-tensor u8/u16 xq and a float consumer (a
@@ -578,7 +579,7 @@ class OnnxRunner:
       else: y = np.tanh(x)
       self._qconv_w[key] = (Tensor(y.astype(np.float32), device=self.graph_values[src].device).realize(), src)
     if (plan:=self._qconv_w[key]) is None: return None
-    return plan[0][self.graph_values[plan[1]].cast(dtypes.int32)]
+    return plan[0][self.graph_values[plan[1]].cast(dtypes.int32)].contiguous()
 
   def _get_python_const(self, name:str, op:str, idx:int) -> list[ConstType]|ConstType|bytes|Any:
     """Convert tensor to python const with name-based caching for JIT stability."""
