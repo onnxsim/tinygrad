@@ -551,6 +551,34 @@ class OnnxRunner:
     # its own buffer: fused into a consumer's padding, the gather's index load lost the pad mask (a phone TLB miss, qemu passed)
     return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)].contiguous()
 
+  def _qdq_int_gemm(self, node, inps, opts) -> Tensor|None:
+    """ONNX_QDQ_INT_GEMM=1: Gemm (alpha = beta = 1, transA = 0) / MatMul with B = DequantizeLinear(int8/int16 constant, per output
+    channel, zero point 0) and a float A (a head) as integer vrmpy passes, A quantized to uint16 at run time (nn/qconv_v65.qmatmul)"""
+    import numpy as np
+    from tinygrad.nn.qconv_v65 import qmatmul
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    key = ("g", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      if node.op == "Gemm" and (opts.get("alpha", 1.0) != 1.0 or opts.get("beta", 1.0) != 1.0 or opts.get("transA", 0)): return None
+      wn = self._producers.get(node.inputs[1])
+      if wn is None or wn.op != "DequantizeLinear" or wn.inputs[0] not in self.const_names: return None
+      def arr(name):
+        v = self.graph_values[name]
+        return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+      wq = arr(wn.inputs[0])
+      if wq.dtype not in (np.int8, np.int16) or wq.ndim != 2: return None
+      if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
+      transB = node.op == "Gemm" and bool(opts.get("transB", 0))
+      sw = arr(wn.inputs[1]).astype(np.float32).reshape(-1)
+      n_out = wq.shape[0] if transB else wq.shape[1]
+      if sw.size not in (1, n_out) or (sw.size > 1 and wn.opts.get("axis", 1) != (0 if transB else 1)): return None
+      self._qconv_w[key] = (np.ascontiguousarray(wq.T if transB else wq), np.broadcast_to(sw, (n_out,)).copy())
+    if (plan:=self._qconv_w[key]) is None or not isinstance(inps[0], Tensor) or not dtypes.is_float(inps[0].dtype): return None
+    bias = inps[2] if node.op == "Gemm" and len(inps) > 2 and isinstance(inps[2], Tensor) else None
+    if bias is not None and bias.numel() != plan[0].shape[1]: return None
+    return qmatmul(inps[0], plan[0], plan[1], bias.reshape(-1) if bias is not None else None)
+
   def _dq_unary_lut(self, node) -> Tensor|None:
     """ONNX_QDQ_LUT=1: f(DequantizeLinear(xq)) for f in Gelu/Sigmoid/Tanh with a per-tensor u8/u16 xq and a float consumer (a
     float head's Gemm input, say) is a float32 table of f over the 256/65536 values: computed once instead of once per use,
@@ -633,6 +661,7 @@ class OnnxRunner:
         if node.op == "Conv" and getenv("ONNX_QDQ_INT_CONV") and (qc:=self._qdq_int_conv(node, inps, opts)) is not None: ret = qc
         elif node.op == "QuantizeLinear" and getenv("ONNX_QDQ_LUT") and (qc:=self._qdq_lut(node)) is not None: ret = qc
         elif node.op in ("Gelu", "Sigmoid", "Tanh") and getenv("ONNX_QDQ_LUT") and (qc:=self._dq_unary_lut(node)) is not None: ret = qc
+        elif node.op in ("Gemm", "MatMul") and getenv("ONNX_QDQ_INT_GEMM") and (qc:=self._qdq_int_gemm(node, inps, opts)) is not None: ret = qc
         else: ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
         ret = ret if isinstance(ret, tuple) else (ret,)
         if debug >= 2: print("\toutputs:\n" + "\n".join(f"\t\t{x} - {o!r}" for x,o in zip(node.outputs, ret)))

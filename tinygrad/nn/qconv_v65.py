@@ -85,3 +85,36 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
   assert acc is not None
   y = (acc + corr) * scale
   return y if bias is None else y + bias.reshape(1, N, 1, 1)
+
+def qmatmul(a:Tensor, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None) -> Tensor:
+  """a (..., K) float @ dequantized wq (K, N) int8/int16 (per output channel scale sw (N,), zero point 0) on the vrmpy passes.
+  The activation has no QDQ of its own (a float head), so it is quantized here at run time: per tensor, asymmetric, uint16
+  over its [min, max]. That quantization is the one approximation; the integer passes are exact. Returns float32 (..., N)"""
+  K, N = wq.shape
+  lead = a.shape[:-1]
+  M = int(np.prod(lead)) if lead else 1
+  K4 = (K + 3) // 4 * 4
+  a2 = a.reshape(M, K).float()
+  lo, hi = a2.min(), a2.max()
+  s = ((hi - lo) / 65535.0).maximum(1e-30)
+  z = (-lo / s).round().clip(0, 65535)
+  aq = ((a2 / s).round() + z).clip(0, 65535).cast(dtypes.int32)
+  if K4 != K: aq = aq.pad(((0, 0), (0, K4 - K)))
+  w = np.zeros((K4, N), dtype=np.int32)
+  w[:K] = wq
+  colsum = Tensor(w.sum(0).astype(np.float32), device=a.device)
+  acc: Tensor|None = None
+  for ashift, aplane in _planes(aq, 16):
+    ap = aplane.cast(dtypes.uint8).contiguous()
+    for wshift, plane in _planes(w, 8 if wq.dtype == np.int8 else 16):
+      signed = wshift == 8 or wq.dtype == np.int8
+      # [K/4][N][4]: one vrmpy operand (32 outputs x 4 k) is one 128-byte load
+      packed = np.ascontiguousarray(plane.reshape(K4 // 4, 4, N).transpose(0, 2, 1)).astype(np.int8 if signed else np.uint8)
+      wv = Tensor(packed, device=a.device).permute(1, 0, 2).reshape(1, N, K4)
+      part = (ap.reshape(M, 1, K4).cast(dtypes.int32) * wv.cast(dtypes.int32)).sum(-1, dtype=dtypes.int32).realize()
+      term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
+      acc = term if acc is None else acc + term
+  assert acc is not None
+  y = (acc - z * colsum.reshape(1, N)) * (s * Tensor(sw.astype(np.float32), device=a.device).reshape(1, N))
+  if bias is not None: y = y + bias.reshape(1, N)
+  return y.reshape(*lead, N) if lead else y.reshape(N)
