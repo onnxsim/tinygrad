@@ -57,9 +57,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
-  # HVX vectors are 128 bytes. The DSP path also handles byte tensors, so the lane cap must
-  # account for the reduction dtype (e.g. 32 f32 lanes or 128 byte lanes).
-  dsp_vector_lanes = 128 // k.reduceop.dtype.itemsize if is_dsp and k.reduceop is not None else 128
+  # a renderer can cap upcasts at one vector register: v65 HVX (128 bytes, no float vectors) sets upcast_max_bytes, so the
+  # lane cap follows the reduction dtype (32 f32 lanes, 128 byte lanes). qfloat DSPs keep several-vector float accumulators
+  max_bytes = getattr(k.ren, "upcast_max_bytes", None)
+  dsp_vector_lanes = max_bytes // k.reduceop.dtype.itemsize if is_dsp and max_bytes and k.reduceop is not None else 128
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:

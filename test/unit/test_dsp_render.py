@@ -56,7 +56,7 @@ class TestDSPRender(unittest.TestCase):
     x = Tensor.empty(1, 64, 64, 128)
     w = Tensor.empty(64, 1, 3, 3, dtype=dtypes.float16)
     b = Tensor.empty(64, dtype=dtypes.float16)
-    src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
+    with Context(DSP_V65_HW=1): src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
     self.assertNotIn("float64", src)
     self.assertIn("float32", src)
 
@@ -66,7 +66,7 @@ class TestDSPRender(unittest.TestCase):
     x = rng.normal(0, 2, (1, 64, 64, 128)).astype(np.float32)
     w = rng.normal(0, 0.15, (64, 1, 3, 3)).astype(np.float16)
     b = rng.normal(0, 0.15, (64,)).astype(np.float16)
-    with Context(PARALLEL=0):
+    with Context(PARALLEL=0, DSP_V65_HW=1):
       dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP"),
                                              stride=2, groups=64, padding=1).numpy()
       cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU"),
@@ -79,7 +79,7 @@ class TestDSPRender(unittest.TestCase):
     x = rng.normal(size=(1, 64, 32, 64)).astype(np.float32)
     w = rng.normal(size=(64, 64, 1, 1)).astype(np.float16)
     b = rng.normal(size=(64,)).astype(np.float16)
-    with Context(PARALLEL=0):
+    with Context(PARALLEL=0, DSP_V65_HW=1):
       dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP")).numpy()
       cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU")).numpy()
     np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
@@ -89,7 +89,7 @@ class TestDSPHalf(unittest.TestCase):
   # emulated: fp16 bits in memory, float32 math, no __fp16 anywhere in the kernel source
   def test_half_is_emulated(self):
     x = Tensor.empty(256, dtype=dtypes.half)
-    src = dsp_source((x.sigmoid() * x).cast(dtypes.half))
+    with Context(DSP_V65_HW=1): src = dsp_source((x.sigmoid() * x).cast(dtypes.half))
     self.assertNotIn("__fp16", src)
     self.assertIn("float", src)
 

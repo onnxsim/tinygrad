@@ -4,7 +4,7 @@ assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
-from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod
+from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod, ContextVar
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
 from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
@@ -24,6 +24,11 @@ HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 HVX_ARCH = getenv("HVX_ARCH", "v65")
 HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
 DSP_THREADS = getenv("DSP_THREADS", 0)
+# DSP_V65_HW=1 targets real v65 hardware (the SDM845 cDSP): HVX there is integer-only, so no float vectors, upcasts of at
+# most one 128-byte register, and half emulated in float32 (see supported_dtypes). Opt-in: the default v65 render keeps the
+# v68-style float vector forms the render tests check
+DSP_V65_HW = ContextVar("DSP_V65_HW", 0)
+def _v65_hw() -> bool: return not HVX_QFLOAT and bool(DSP_V65_HW.value)
 
 # ***** qfloat lowering (v68+) *****
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
@@ -340,7 +345,7 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if n < 2 or x.dtype == dtypes.void: return None
   # v65 has integer HVX only. Keeping float lanes in an ext_vector_type makes LLVM lower unsupported vector-float
   # arithmetic incorrectly (e.g. the openpilot stem 1x1 convolution); let it render scalar lane expressions instead.
-  if not HVX_QFLOAT and dtypes.is_float(x.dtype): return None
+  if _v65_hw() and dtypes.is_float(x.dtype): return None
   s0 = srcs[0]
   # STACK(v[0], v[1], ..., v[n-1]) of a length-n vector is v itself
   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
@@ -1982,6 +1987,9 @@ class DSPRenderer(ClangRenderer):
   # several hardware threads (4 on the SDM845's v65) but one caller thread runs every kernel, and v65's float math is
   # scalar, so this is where its parallelism is. Each output keeps its reduction order, so results are unchanged.
   has_threads = DSP_THREADS > 1
+  # v65: one 128-byte HVX register bounds a useful upcast (see hand_coded_optimizations)
+  @property
+  def upcast_max_bytes(self): return 128 if _v65_hw() else None
   @property
   def global_max(self): return (DSP_THREADS, 0, 0) if DSP_THREADS > 1 else None  # type: ignore[override]
   def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
@@ -2132,11 +2140,12 @@ class DSPRenderer(ClangRenderer):
     msrc += ["return 0; }"]
     return '\n'.join(msrc)
 
-  # half is emulated (stored as fp16 bits, computed in float32; codegen/decomp/dtype.py): __fp16 is storage-only on
+  # with DSP_V65_HW=1, half is emulated (stored as fp16 bits, computed in float32; codegen/decomp/dtype.py): __fp16 is storage-only on
   # Hexagon without _Float16 support (V65 HVX has no half float), and clang miscompiles it here -- vector conversions become
   # uitofp of the raw bits (1.5h -> 15872.0f), and the scalar __extendhfsf2/__truncsfhf2 libcalls resolve to the
   # toolchain libgcc.a's copies, which use a different calling convention. openpilot's fp16 ONNX graphs hit both.
-  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16, dtypes.half)}
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)+((dtypes.half,) if _v65_hw() else ())}
 
 def rpc_sc(method=0, ins=0, outs=0, fds=0): return (method << 24) | (ins << 16) | (outs << 8) | fds
 def rpc_prep_args(ins=None, outs=None, in_fds=None):
