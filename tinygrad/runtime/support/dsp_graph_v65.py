@@ -13,7 +13,7 @@ blob, uploaded once in chunks and read in place; the rest are allocated once and
 core_id) runs its slices on a qurt thread pool on the phone, serially under qemu.
 """
 from __future__ import annotations
-import os, re, pathlib, subprocess, shutil
+import os, re, pathlib, subprocess, shutil, threading
 
 FILES = pathlib.Path(__file__).parent / "dsp_graph_files" / "v65"
 ALIGN = 128
@@ -97,30 +97,52 @@ void _start(void) {
 }
 """
 
+def _kernel_flags(arch:str="v65") -> list[str]:
+  return [*_hvx_args(arch), "-O2", "-fPIC", "-ffreestanding", "-nostdlib", "-fno-stack-protector", "-Wno-deprecated-non-prototype"]
+
+def compile_kernels(outdir, arch:str="v65") -> list[str]:
+  """k<n>.c -> k<n>.o, once for both the qemu program and the skel (same flags). Objects are cached across compiles by source,
+  flags and compiler (DSP_GRAPH_OBJ_CACHE, default ~/.cache/tinygrad/dsp_graph_v65): a recompile after a small codegen change
+  rebuilds only the kernels whose source changed. The largest sources start first, since they set the wall time"""
+  import hashlib, shutil
+  from concurrent.futures import ThreadPoolExecutor
+  o = pathlib.Path(outdir)
+  cache = pathlib.Path(os.environ.get("DSP_GRAPH_OBJ_CACHE", pathlib.Path.home() / ".cache/tinygrad/dsp_graph_v65"))
+  cache.mkdir(parents=True, exist_ok=True)
+  flags = _kernel_flags(arch)
+  ver = subprocess.run([_cc(), "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+  ks = sorted((p for p in o.glob("k*.c")), key=lambda p: -p.stat().st_size)
+  def one(k:pathlib.Path):
+    obj = k.with_suffix(".o")
+    key = hashlib.sha256("\0".join([ver, *flags, k.read_text()]).encode()).hexdigest()
+    cached = cache / f"{key}.o"
+    if not cached.exists():
+      tmp = cache / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+      subprocess.run([_cc(), "-c", *flags, "-o", str(tmp), str(k)], check=True)
+      os.replace(tmp, cached)
+    shutil.copyfile(cached, obj)
+  with ThreadPoolExecutor(os.cpu_count()) as ex: list(ex.map(one, ks))
+  return sorted(k.with_suffix(".o").name for k in ks)
+
 def run_qemu(outdir, xs:list[bytes], timeout:int=3600) -> bytes:
   """the emitted program under qemu-hexagon-static (DSP_THREADS slices run in turn) -> the output bytes"""
   from tinygrad.runtime import ops_dsp
-  from concurrent.futures import ThreadPoolExecutor
   o = pathlib.Path(outdir)
   boiler = ops_dsp.mockdsp_boilerplate.replace("{{", "{").replace("}}", "}")
   (o / "qemu_main.c").write_text(boiler + "\n" + QEMU_MAIN)
-  flags = [*_hvx_args(), "-O2", "-fPIC", "-ffreestanding", "-nostdlib", "-fno-stack-protector", "-Wno-deprecated-non-prototype"]
-  ks = sorted(p.name for p in o.glob("k*.c"))
-  def run(cmd): subprocess.run(cmd, cwd=o, check=True)
-  with ThreadPoolExecutor(os.cpu_count()) as ex: list(ex.map(lambda k: run([_cc(), "-c", *flags, "-o", f"q_{k[:-2]}.o", k]), ks))
+  objs = compile_kernels(o)
   libgcc = ops_dsp._find_libgcc()
-  run([_cc(), "-static", "-fuse-ld=lld", *flags, "-o", "graph_qemu.elf", "qemu_main.c", *[f"q_{k[:-2]}.o" for k in ks],
-       *([libgcc] if libgcc else [])])
+  subprocess.run([_cc(), "-static", "-fuse-ld=lld", *_kernel_flags(), "-o", "graph_qemu.elf", "qemu_main.c", *objs,
+                  *([libgcc] if libgcc else [])], cwd=o, check=True)
   stdin = (o / "blob.bin").read_bytes() + _input_blob(xs)
   return subprocess.run(["qemu-hexagon-static", str(o / "graph_qemu.elf")], input=stdin, stdout=subprocess.PIPE, check=True,
                         timeout=timeout).stdout
 
-def build(outdir, skel_arch:str="v68", kernel_arch:str="v65", jobs:int=8) -> tuple[pathlib.Path, pathlib.Path]:
+def build(outdir, skel_arch:str="v68", kernel_arch:str="v65") -> tuple[pathlib.Path, pathlib.Path]:
   """the FastRPC skel (tg_graph.so) + Android client. The kernels are built for kernel_arch with $CC (a v65-capable clang; the
   Hexagon SDK 6.x compiler starts at v68); the skel for skel_arch with the SDK's. Needs HEXAGON_SDK_ROOT, HEXAGON_TOOLCHAIN and an
   NDK clang (NDK_CLANG). On the phone: client 'file:///tg_graph.so?tg_graph_skel_handle_invoke&_modver=1.0&_dom=cdsp' <dir with
   blob.bin input.bin ref.bin> [iters] [threads] [batch] [prof], ADSP_LIBRARY_PATH at the skel"""
-  from concurrent.futures import ThreadPoolExecutor
   o, sdk, tc = pathlib.Path(outdir), pathlib.Path(os.environ["HEXAGON_SDK_ROOT"]), pathlib.Path(os.environ["HEXAGON_TOOLCHAIN"])
   ndk = os.environ.get("NDK_CLANG", "/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang")
   for f in ("skel.c", "client.c", "tg_graph.idl"): shutil.copy(FILES / f, o / f)
@@ -131,9 +153,7 @@ def build(outdir, skel_arch:str="v68", kernel_arch:str="v65", jobs:int=8) -> tup
   hc = [str(tc / "bin/hexagon-clang"), "-c", "-O2", "-fPIC", f"-mcpu=hexagon{skel_arch}"]
   run([*hc, *inc, "-o", "skel_rpc.o", "tg_graph_skel.c"])
   run([*hc, f"-mhvx={skel_arch}", "-mhvx-length=128b", "-Wno-deprecated-non-prototype", *inc, *qurt, "-o", "impl.o", "skel.c"])
-  ks = sorted(p.name for p in o.glob("k*.c"))
-  kflags = [*_hvx_args(kernel_arch), "-O2", "-fPIC", "-ffreestanding", "-nostdlib", "-fno-stack-protector", "-Wno-deprecated-non-prototype"]
-  with ThreadPoolExecutor(jobs) as ex: list(ex.map(lambda k: run([_cc(), "-c", *kflags, "-o", k[:-2] + ".o", k]), ks))
+  ks = [k[:-2] + ".c" for k in compile_kernels(o, kernel_arch)]
   lib = tc / f"target/hexagon/lib/{skel_arch}/G0"
   run([str(tc / "bin/hexagon-link"), "-Bdynamic", "-shared", "-export-dynamic", "-o", "tg_graph.so", "skel_rpc.o", "impl.o",
        *[k[:-2] + ".o" for k in ks], str(lib / "pic/libgcc.a"), str(lib / "pic/libgcc.so")])

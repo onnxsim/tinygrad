@@ -63,18 +63,32 @@ if __name__ == "__main__":
   (out / "graph.json").write_text(json.dumps(info, indent=2) + "\n")
   print(f"emitted {info['calls']} calls ({info['threaded_calls']} threaded), {info['kernels']} kernels, {info['regions']} regions, "
         f"{info['blob']/1e6:.1f} MB weights, {info['scratch']/1e6:.2f} MB scratch -> {out}")
-  if args.qemu:
-    st = time.perf_counter()
-    y = dsp_graph_v65.run_qemu(out, xs)
-    same = y == ref.tobytes()
-    print(f"emitted program under qemu ({time.perf_counter()-st:.1f} s): {'bit-exact' if same else 'MISMATCH'} vs the JIT")
-    if not same:
-      yy = np.frombuffer(y, dtype=ref.dtype)[:ref.size]
-      print(f"  {np.sum(yy != ref.ravel())} of {ref.size} differ, max |diff| {np.nanmax(np.abs(yy - ref.ravel()))}")
-      sys.exit(1)
-  if args.build:
-    st = time.perf_counter()
-    print("built", *dsp_graph_v65.build(out), f"({time.perf_counter()-st:.1f} s)")
+  # the kernels are compiled once (dsp_graph_v65.compile_kernels, object-cached); then the qemu check and the skel build, which
+  # only link them, run side by side
+  from concurrent.futures import ThreadPoolExecutor
+  st = time.perf_counter()
+  if args.qemu or args.build: dsp_graph_v65.compile_kernels(out)
+  print(f"timing: kernels compiled {time.perf_counter()-st:.1f} s")
+  with ThreadPoolExecutor(2) as ex:
+    def check():
+      st = time.perf_counter()
+      return dsp_graph_v65.run_qemu(out, xs), time.perf_counter() - st
+    def build():
+      st = time.perf_counter()
+      return dsp_graph_v65.build(out), time.perf_counter() - st
+    qemu_f = ex.submit(check) if args.qemu else None
+    build_f = ex.submit(build) if args.build else None
+    if qemu_f is not None:
+      y, dt = qemu_f.result()
+      same = y == ref.tobytes()
+      print(f"emitted program under qemu ({dt:.1f} s): {'bit-exact' if same else 'MISMATCH'} vs the JIT")
+      if not same:
+        yy = np.frombuffer(y, dtype=ref.dtype)[:ref.size]
+        print(f"  {np.sum(yy != ref.ravel())} of {ref.size} differ, max |diff| {np.nanmax(np.abs(yy - ref.ravel()))}")
+        sys.exit(1)
+    if build_f is not None:
+      paths, dt = build_f.result()
+      print("built", *paths, f"({dt:.1f} s)")
   if args.artifact:
     import onnx
     from tinygrad.helpers import getenv

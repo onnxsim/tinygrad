@@ -2270,7 +2270,11 @@ class DSPCompiler(Compiler):
 
       self.args = f"-shared {compiler_args} -T{self.link_ld.name}"
 
-    super().__init__(None if mock else "compile_dsp")
+    # the mock (qemu) build is cached too, keyed on its flags and compiler: a recompile of a model after a small codegen change, or
+    # a second model sharing kernels, only builds the kernels whose source changed (the capture of a large model is mostly this)
+    import hashlib
+    mock_key = hashlib.sha256(f"{getenv('CC','clang')}|{self.args}|{self.libgcc}".encode()).hexdigest()[:16]
+    super().__init__(f"compile_mockdsp_{mock_key}" if mock else "compile_dsp")
 
   def __del__(self):
     if not self.mock: os.unlink(self.link_ld.name)

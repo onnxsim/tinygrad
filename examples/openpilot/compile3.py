@@ -199,6 +199,8 @@ if __name__ == "__main__":
 
     with open(OUTPUT, "rb") as f: pickle_loaded = load_pickle(f)
 
-    test_vs_compile(pickle_loaded, inputs, outputs)
+    # COMPILE3_SKIP_SELFTEST=1: the benchmark and doubled-input runs execute the whole model again (under qemu, a minute each for a
+    # float model); an exporter that replays the pickle against its own reference (dsp_graph_v65.py) doesn't need them
+    if not getenv("COMPILE3_SKIP_SELFTEST"): test_vs_compile(pickle_loaded, inputs, outputs)
     if getenv("SELFTEST"):
       test_vs_onnx(inputs, outputs, onnx_file, 1e-4)
