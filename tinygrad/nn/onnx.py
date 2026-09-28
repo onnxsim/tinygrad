@@ -1381,6 +1381,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     if out_dtype == dtypes.uchar:
       # this appears to work in practice, at least for uchar out_dtype. it folds with the quantize stuff
       ret = _clamp_cast((x / y_scale + 0.4999999 + y_zero_point).int(), out_dtype)
+    elif x.dtype == dtypes.float32 and getenv("ONNX_QUANT_MAGIC", 1) and dtypes.is_int(out_dtype) and out_dtype.itemsize <= 2:
+      # round half to even straight to an int: below 2**22, x + 1.5*2**23 has spacing 1, so the add rounds and the mantissa is
+      # round(x) + 2**22. Clipped to +-2**22 first (the result saturates to 8/16 bits anyway). ~4 ops against round()'s ~25
+      q = ((x / y_scale).clip(-4194304.0, 4194304.0) + 12582912.0).bitcast(dtypes.int32) - 0x4B400000
+      ret = _clamp_cast(q + y_zero_point, out_dtype)
     else:
       ret = _clamp_cast(((x / y_scale).round() + y_zero_point), out_dtype)
     return ret.contiguous()
