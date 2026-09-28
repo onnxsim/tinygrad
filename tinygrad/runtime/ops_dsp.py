@@ -257,6 +257,16 @@ def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
   step = int(d.arg) * itemsize
   return HVX_PREFETCH_STRIDES * step if step > 256 else HVX_PREFETCH
 
+# a sub-line load (scalar float code on v65: a float4 of 4 pixels) that walks a reduction at a large stride (a 1x1 conv over
+# NCHW channels) misses on every step, and the vector-load prefetch above skips it for being under a line. One dcfetch
+# HVX_PREFETCH_STRIDES steps ahead per load hides that. Read through a function: pattern functions snapshot module globals
+def _subline_prefetch_on() -> bool: return bool(getenv("HVX_PREFETCH_SUBLINE", 1))
+def _subline_prefetch(ctx, bidx:UOp, x:UOp) -> str|None:
+  nbytes = x.max_numel()*x.dtype.itemsize
+  if not _subline_prefetch_on() or HVX_PREFETCH_STRIDES <= 0 or nbytes >= 64 or bidx.addrspace is not AddrSpace.GLOBAL: return None
+  if (dist:=_prefetch_distance(ctx, bidx, x.dtype.itemsize)) == HVX_PREFETCH: return None  # not a strided reduction walk
+  return f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{dist}), {ctx.render_access(bidx)})"
+
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
@@ -296,6 +306,7 @@ dsp_string = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
    if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), _subline_prefetch),
 ])
 
 # ***** HVX re-vectorization *****
