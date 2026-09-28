@@ -26,12 +26,16 @@ if __name__ == "__main__":
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("pickle"); p.add_argument("outdir")
   p.add_argument("--seed", type=int, default=42)
+  p.add_argument("--inputs", help="an .npz of the inputs by name (default: seeded random ones)")
   p.add_argument("--qemu", action="store_true", help="run the emitted program under qemu and compare with the reference")
   p.add_argument("--build", action="store_true", help="build the FastRPC skel and Android client")
   args = p.parse_args()
   out = pathlib.Path(args.outdir)
   with open(args.pickle, "rb") as f: jit = compile3.load_pickle(f)
   inputs = seeded_inputs(jit, args.seed)
+  if args.inputs:
+    npz = np.load(args.inputs)
+    inputs = {k: Tensor(npz[k].astype(t.numpy().dtype), device=t.device).realize() for k, t in inputs.items()}
   st = time.perf_counter()
   ref = jit(**inputs).numpy().copy()
   print(f"reference: the JIT under qemu, output {ref.shape} {ref.dtype}, {time.perf_counter()-st:.1f} s")

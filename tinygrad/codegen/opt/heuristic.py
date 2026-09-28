@@ -230,8 +230,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   if k.ren.has_threads and k.ren.global_max is not None:
     for threads in [32,16,12,8,6,5,4,3,2]:
-      # Skip if too many threads. Heuristic: use about 128K ops per thread
-      if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // (128 << 10) < threads): continue
+      # Skip if too many threads. Heuristic: use about 128K ops per thread (a renderer whose per-element cost is far higher, like
+      # the DSP's scalar float, sets a lower thread_min_elems)
+      if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < threads): continue
       for axis in k.axes_of(AxisType.WEAK):
         if k.full_shape[axis] % threads == 0:
           try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))

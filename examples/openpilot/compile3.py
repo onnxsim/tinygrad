@@ -125,9 +125,9 @@ def compile(onnx_file):
 def test_vs_compile(run, inputs, test_val=None):
   if (log:=bool(getenv("BENCHMARK_LOG", ""))): from extra.bench_log import WallTimeEvent, BenchEvent
 
-  # run 20 times
+  # run BENCH_RUNS (20) times
   step_times = []
-  for _ in range(20):
+  for _ in range(getenv("BENCH_RUNS", 20)):
     st = time.perf_counter()
     if log:
       with WallTimeEvent(BenchEvent.STEP):

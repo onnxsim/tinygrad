@@ -1987,6 +1987,8 @@ class DSPRenderer(ClangRenderer):
   # several hardware threads (4 on the SDM845's v65) but one caller thread runs every kernel, and v65's float math is
   # scalar, so this is where its parallelism is. Each output keeps its reduction order, so results are unchanged.
   has_threads = DSP_THREADS > 1
+  # v65 float is scalar and each element costs tens to hundreds of cycles: a 64K-element kernel is worth four threads
+  thread_min_elems = 16 << 10
   # v65: one 128-byte HVX register bounds a useful upcast (see hand_coded_optimizations)
   @property
   def upcast_max_bytes(self): return 128 if _v65_hw() else None
