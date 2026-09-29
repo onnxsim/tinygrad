@@ -95,10 +95,14 @@ def qmatmul(a:Tensor, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None) -> Te
   M = int(np.prod(lead)) if lead else 1
   K4 = (K + 3) // 4 * 4
   a2 = a.reshape(M, K).float()
+  # (the scale and zero point as their own small kernel: left lazy, the min/max reductions fused into every element of the
+  # quantize and epilogue kernels, K reductions of K each)
   lo, hi = a2.min(), a2.max()
   s = ((hi - lo) / 65535.0).maximum(1e-30)
-  z = (-lo / s).round().clip(0, 65535)
-  aq = ((a2 / s).round() + z).clip(0, 65535).cast(dtypes.int32)
+  sz = Tensor.stack(s, (-lo / s).round().clip(0, 65535), 1.0 / s).contiguous()
+  s, z = sz[0], sz[1]
+  # quantized once (times the reciprocal: v65 float division is a software sequence), both byte planes cut from it with integer ops
+  aq = ((a2 * sz[2]).round() + z).clip(0, 65535).cast(dtypes.uint16).contiguous().cast(dtypes.int32)
   if K4 != K: aq = aq.pad(((0, 0), (0, K4 - K)))
   w = np.zeros((K4, N), dtype=np.int32)
   w[:K] = wq

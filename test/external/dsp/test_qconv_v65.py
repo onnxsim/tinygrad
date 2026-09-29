@@ -1,9 +1,9 @@
-"""qconv_v65 (integer QDQ conv for v65 HVX vrmpy) against a float64 reference, under MOCKDSP=1 (qemu)."""
+"""qconv_v65 (integer QDQ conv and matmul for v65 HVX vrmpy) against a float64 reference, under MOCKDSP=1 (qemu)."""
 import unittest, itertools
 import numpy as np
 from tinygrad import Tensor
 from tinygrad.helpers import Context, getenv
-from tinygrad.nn.qconv_v65 import qconv2d
+from tinygrad.nn.qconv_v65 import qconv2d, qmatmul
 
 def ref(xq, zx, sx, wq, sw, b, stride, pad, groups):
   x, w = (xq.astype(np.float64) - zx) * sx, wq.astype(np.float64) * sw.reshape(-1, 1, 1, 1)
@@ -29,5 +29,22 @@ class TestQConvV65(unittest.TestCase):
         self.assertEqual(y.shape, r.shape)
         # the int32 passes are exact; only their float32 combination rounds
         self.assertLess(np.abs(y - r).max() / np.abs(r).max(), 1e-6)
+
+  def test_qmatmul_gemv(self):
+    # a float head's GEMV: the activation is quantized to uint16 at run time (per tensor, over its [min, max]), the one
+    # approximation, so the error bound is that quantization's (half a step of the input range per element)
+    rng = np.random.default_rng(1)
+    for (K, N), wb in itertools.product([(1024, 512), (512, 1024), (200, 64)], [8, 16]):
+      with self.subTest(K=K, N=N, bits=f"W{wb}"):
+        qmax = 127 if wb == 8 else 32767
+        wq = rng.integers(-qmax, qmax + 1, (K, N)).astype(np.int8 if wb == 8 else np.int16)
+        sw, b = rng.uniform(1e-4, 1e-3, N).astype(np.float32), rng.normal(size=N).astype(np.float32)
+        a = np.maximum(rng.normal(size=(1, K)), 0).astype(np.float32)
+        with Context(TC_OPT=1):
+          y = qmatmul(Tensor(a, device="DSP"), wq, sw, Tensor(b, device="DSP")).numpy()
+        r = a.astype(np.float64) @ (wq.astype(np.float64) * sw) + b
+        self.assertEqual(y.shape, r.shape)
+        step = (a.max() - a.min()) / 65535
+        self.assertLess(np.abs(y - r).max(), 0.5 * step * np.abs(wq.astype(np.float64) * sw).sum(0).max() + 1e-4)
 
 if __name__ == "__main__": unittest.main()

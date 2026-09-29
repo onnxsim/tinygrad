@@ -553,7 +553,8 @@ class OnnxRunner:
 
   def _qdq_int_gemm(self, node, inps, opts) -> Tensor|None:
     """ONNX_QDQ_INT_GEMM=1: Gemm (alpha = beta = 1, transA = 0) / MatMul with B = DequantizeLinear(int8/int16 constant, per output
-    channel, zero point 0) and a float A (a head) as integer vrmpy passes, A quantized to uint16 at run time (nn/qconv_v65.qmatmul)"""
+    channel, zero point 0, at least ONNX_QDQ_INT_GEMM_MIN elements) and a float A (a head) as integer vrmpy passes, A quantized to
+    uint16 at run time (nn/qconv_v65.qmatmul)"""
     import numpy as np
     from tinygrad.nn.qconv_v65 import qmatmul
     if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
@@ -568,6 +569,9 @@ class OnnxRunner:
         return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
       wq = arr(wn.inputs[0])
       if wq.dtype not in (np.int8, np.int16) or wq.ndim != 2: return None
+      # only big weights: the integer path is ~7 small kernels (quantize the activation, cut its byte planes, a vrmpy pass per
+      # plane pair, the epilogue), which a 32x32 head layer's float GEMV beats; converting all ~90 driving heads was 891 ms
+      if wq.size < getenv("ONNX_QDQ_INT_GEMM_MIN", 65536): return None
       if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
       transB = node.op == "Gemm" and bool(opts.get("transB", 0))
       sw = arr(wn.inputs[1]).astype(np.float32).reshape(-1)
