@@ -8,10 +8,12 @@ from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 
-def _unit_stride(k:Scheduler, axis:int) -> bool:
-  # some buffer's index has this axis's range as a bare term (stride 1): upcasting it gives contiguous vector accesses
+def _unit_stride_bufs(k:Scheduler, axis:int) -> int:
+  # how many buffers' indices have this axis's range as a bare term (stride 1): upcasting it gives them contiguous vector accesses
   rng = k.rngs[axis]
-  return any(c is rng for b in k.bufs for c in b.src[1].get_idx().split_uop(Ops.ADD))
+  return sum(any(c is rng for c in b.src[1].get_idx().split_uop(Ops.ADD)) for b in k.bufs)
+
+def _unit_stride(k:Scheduler, axis:int) -> bool: return _unit_stride_bufs(k, axis) > 0
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
@@ -197,9 +199,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if is_dsp and HVX_UPCAST_CONTIG and not (v65_float and getenv("DSP_SCALAR_GEMV", 1)) and not k.axes_of(AxisType.UPCAST) and \
       k.axes_of(AxisType.REDUCE):
     # (on v65: the unit-stride axis, which needn't be the last -- a channel-blocked depthwise conv's is the 32 channels, its last
-    # the image width -- and at most one register of lanes)
+    # the image width -- and at most one register of lanes). The axis at unit stride in the most buffers first: a W16 depthwise conv
+    # writing NCHW has its width at unit stride in the output only, and upcasting it made the input and weight loads 32-lane gathers
     axes = [k.upcastable_dims[-1]] if k.upcastable_dims else []
-    if max_bytes is not None: axes = [a for a in k.upcastable_dims if _unit_stride(k, a)][::-1] + axes
+    if max_bytes is not None:
+      axes = sorted([a for a in k.upcastable_dims if _unit_stride(k, a)][::-1], key=lambda a: -_unit_stride_bufs(k, a)) + axes
     for axis, splits in itertools.product(axes, [s for s in [128,64,32] if max_bytes is None or s <= dsp_vector_lanes]):
       if k.full_shape[axis] % splits == 0:
         k.apply_opt(Opt(OptOps.UPCAST, axis, splits))
