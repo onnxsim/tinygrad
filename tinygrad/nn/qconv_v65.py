@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
+from tinygrad.helpers import getenv
 
 def _planes(q:np.ndarray|Tensor, bits:int) -> list[tuple[int, object]]:
   """(shift, plane) byte planes of an integer array/tensor, low plane unsigned, top plane keeps the sign"""
@@ -66,6 +67,35 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         part = a.cast(dtypes.int32).conv2d(wt.cast(dtypes.int32), stride=stride, dilation=dilation).realize()
         term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
         acc = term if acc is None else acc + term
+  elif groups == C and Cg == 1 and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
+      C % max(1, getenv("DSP_THREADS", 1)) == 0 and wq.dtype in (np.int8, np.int16):
+    # hand-written HVX kernel (nn/dw_v65.py): the padded image of a channel as one flat byte signal, vrmpy over 4 consecutive taps,
+    # no channel-blocked layout copy. Same integer sums as the plain convolution (int32, exact), so the float terms below are
+    # bit-identical to the tinygrad-conv path's
+    from tinygrad.nn.dw_v65 import pack_dw_weights, dw_flat_len, dw_hvx
+    H, W = xq.shape[2], xq.shape[3]
+    pl, pr, pt, pb = padding
+    Hp, Wp = H + pt + pb, W + pl + pr
+    Ho, Wo = Hp - kh + 1, Wp - kw + 1
+    nb, Lin = dw_flat_len(Ho, Wp, kh, kw)
+    nth = max(1, getenv("DSP_THREADS", 1))
+    sy, sx_ = (stride, stride) if isinstance(stride, int) else tuple(stride)
+    wpk = Tensor(pack_dw_weights(wq), device=xq.device)
+    Q = 1 if wq.dtype == np.int8 else 2
+    def plane(v, pv):  # (1, C, H, W) unsigned values < 256 -> padded flat u8 (C, Lin)
+      t = v.cast(dtypes.uint8).pad(((0, 0), (0, 0), (pt, pb), (pl, pr)), value=pv).reshape(C, Hp * Wp)
+      return t.pad(((0, 0), (0, Lin - Hp * Wp))).contiguous()
+    if xbits == 8: runs = [(0, [plane(xq, zx)])]
+    else:
+      lo, hi = plane(xq & 255, zx & 255), plane(xq >> 8, zx >> 8)
+      # u16 x s8 sums to < 2^31 as one int32; with int16 weights the planes stay separate, as in the conv path
+      runs = [(0, [lo, hi])] if Q == 1 else [(0, [lo]), (8, [hi])]
+    for ashift, planes in runs:
+      y = dw_hvx(planes, wpk, C, nb, Wp, kh, kw, Q, nth)
+      y = y[:, :Ho * Wp].reshape(C, Ho, Wp)[:, :, :Wo]
+      if (sy, sx_) != (1, 1): y = y[:, ::sy, ::sx_]
+      term = y.reshape(1, C, *y.shape[1:]).cast(dtypes.float32) * float(1 << ashift)
+      acc = term if acc is None else acc + term
   elif groups == C and Cg == 1:
     # 32 channels per vector: the padded input (kept at its own width) is stored [C/32][H][W][32] and the weights [kh][kw][C], so
     # one tap of 32 channels is one contiguous load of each. Both are views back to the logical NCHW / (C, 1, kh, kw) shapes.

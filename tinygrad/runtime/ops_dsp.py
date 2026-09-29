@@ -1598,6 +1598,52 @@ static void __hmx_qadd_chunk(unsigned char* y, const unsigned char* a, const uns
 #endif
 """
 
+
+# Depthwise conv on v65 HVX (nn/dw_v65.py): the padded image of a channel is one flat u8 signal (row stride Wp). A vrmpy lane owns 4
+# consecutive bytes, so with an unaligned 128-byte load at flat offset 128*b + s + ky*Wp + 4*g and a splat of the 4 weights
+# w[ky][4g..4g+3] it computes, in lane n, the 4-tap partial of output j = 128*b + 4*n + s; the four shifts s = 0..3 fill all
+# 128 outputs of block b. Accumulators are int32 and the sum is exact (the caller's combination of activation / weight byte planes
+# is shifted-added in int32: identical to the plain integer convolution). Output is the flat signal [Lout = nb*128] in true order.
+_DW_HVX_HELPERS = r"""#pragma clang diagnostic ignored "-Wunused-function"
+typedef int __dw_v __attribute__((__vector_size__(128)));
+typedef int __dw_vu __attribute__((__vector_size__(128), aligned(1)));
+typedef int __dw_vp __attribute__((__vector_size__(256)));
+static inline void __dw_hvx(int* restrict y, const unsigned char* restrict x0, const unsigned char* restrict x1, const int* restrict w,
+                            int nb, int Wp, int kh, int G, int P, int Q) {
+  for (int b = 0; b < nb; b++) {
+    __dw_v acc[4];
+    for (int s = 0; s < 4; s++) {
+      __dw_v tot = __builtin_HEXAGON_V6_vd0_128B();
+      for (int p = 0; p < P; p++) {
+        const unsigned char* xp = (p ? x1 : x0) + 128 * b + s;
+        __dw_v ap = __builtin_HEXAGON_V6_vd0_128B();
+        for (int q = 0; q < Q; q++) {
+          __dw_v aq = __builtin_HEXAGON_V6_vd0_128B();
+          for (int ky = 0; ky < kh; ky++)
+            for (int g = 0; g < G; g++) {
+              __dw_v a = *(const __dw_vu*)(xp + ky * Wp + 4 * g);
+              int wv = w[(q * kh + ky) * G + g];
+              if (Q == 2 && q == 0) aq = __builtin_HEXAGON_V6_vrmpyub_acc_128B(aq, a, wv);
+              else aq = __builtin_HEXAGON_V6_vrmpybusv_acc_128B(aq, a, __builtin_HEXAGON_V6_lvsplatw_128B(wv));
+            }
+          ap += q ? (aq << 8) : aq;
+        }
+        tot += p ? (ap << 8) : ap;
+      }
+      acc[s] = tot;
+    }
+    // acc[s] lane n is output 4n+s: interleave the words of the four vectors back into output order
+    __dw_vp p01 = __builtin_HEXAGON_V6_vshuffvdd_128B(acc[1], acc[0], -4);
+    __dw_vp p23 = __builtin_HEXAGON_V6_vshuffvdd_128B(acc[3], acc[2], -4);
+    __dw_vp q0 = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(p23), __builtin_HEXAGON_V6_lo_128B(p01), -8);
+    __dw_vp q1 = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_hi_128B(p23), __builtin_HEXAGON_V6_hi_128B(p01), -8);
+    __dw_v* o = (__dw_v*)(y + 128 * b);
+    o[0] = __builtin_HEXAGON_V6_lo_128B(q0); o[1] = __builtin_HEXAGON_V6_hi_128B(q0);
+    o[2] = __builtin_HEXAGON_V6_lo_128B(q1); o[3] = __builtin_HEXAGON_V6_hi_128B(q1);
+  }
+}
+"""
+
 def _hmx_qadd_consts(ra:float, rb:float, fixed:float) -> tuple:
   # the fixed-point form of ORT's add (onnxsim hmx_gemm/runner/rn_load.h): v * 2^F = a*ra*2^F + b*rb*2^F + fixed*2^F from
   # 24-bit mantissas in 12-bit halves, and the window: our truncations (< 3 units) + half an ulp of each of ORT's 4 fp32 roundings
@@ -2102,6 +2148,7 @@ class DSPRenderer(ClangRenderer):
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__dw_hvx(") for u in uops): prefix.append(_DW_HVX_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
