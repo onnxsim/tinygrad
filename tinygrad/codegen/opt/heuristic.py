@@ -48,10 +48,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # One WMMA per 32-lane accumulator slice keeps it a single HVX register.
         if tk.ren is not None and tk.ren.target.device == "DSP":
           # DSP_TC_MUPCAST pixels per weight load (after the TC's own lanes, so no strided accumulator): each 128-byte weight vector
-          # feeds that many vrmpys before it leaves the register file. 0 or 1 = off; 8 measured best on the V69 phone (2: 228 ms, 4: 204, 8: 203, 16: 218 for driving)
+          # feeds that many vrmpys before it leaves the register file. 0 or 1 = off; with DSP_TC_PUPCAST=2, N4xP2 143 ms vs N8xP2 144 ms (driving hmix); N8 alone 154
           if tc_dim == 0 and getattr(tk, "tensor_core", None) is not None and tk.tensor_core.dims == (32, 1, 4) and \
-              (mu:=getenv("DSP_TC_MUPCAST", 8)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
+              (mu:=getenv("DSP_TC_MUPCAST", 4)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
             try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[0]), mu))
+            except KernelOptError: pass
+          # DSP_TC_PUPCAST pixels per weight vector loaded (the M axis, upcast after the TC's lanes like the N block above): the weight
+          # vector is loaded once and feeds that many pixels' vrmpys. 1 = off; 2 measured best (4 stalls the compiler)
+          if tc_dim == 1 and getattr(tk, "tensor_core", None) is not None and tk.tensor_core.dims == (32, 1, 4) and \
+              (pu:=getenv("DSP_TC_PUPCAST", 2)) > 1 and rngs[1] is not None and rngs[1].src[0].divides(pu) is not None:
+            try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[1]), pu))
             except KernelOptError: pass
           continue
         szs = [sz for sz in [5,4,3,2] if rngs[tc_dim].src[0].divides(sz) is not None]
