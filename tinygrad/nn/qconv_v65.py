@@ -156,6 +156,7 @@ def merge_terms(terms):
 def requant_plan(terms, sx, sw, sy, zy, qmax, bias):
   terms = merge_terms(terms)
   N = len(sw)
+  if int(np.prod(terms[0][0].shape[2:])) < getenv("REQUANT_MIN_PIXELS", 32): return None  # a deep stage's 2-pixel map: nothing to vectorize
   G = np.float64(sx) * sw.astype(np.float64) / np.float64(sy)
   K = [G * float(1 << t[1]) for t in terms]
   c_real = (np.zeros(N) if bias is None else np.asarray(bias, np.float64).reshape(-1) / np.float64(sy)) + float(zy)
@@ -183,15 +184,16 @@ def requant_apply(terms, plan, device) -> Tensor:
   if getenv("REQUANT_LOG"): print(f"requant: {len(plan['g'])} terms, F={plan['F']}, error bound max {plan['bound'].max():.2f} mean {plan['bound'].mean():.2f} steps", flush=True)
   terms = merge_terms(terms)
   shape = terms[0][0].shape
-  flat = all(t[4] for t in terms)  # contiguous partial sums: one long pixel axis (a deep stage's 8x16 map would otherwise vectorize 16)
-  def ch(a): return Tensor(np.ascontiguousarray(a), device=device).reshape(1, -1, 1) if flat else Tensor(np.ascontiguousarray(a), device=device).reshape(1, -1, 1, 1)
+  def ch(a): return Tensor(np.ascontiguousarray(a), device=device).reshape(1, -1, 1)
   total = None
-  for (part, _, dc, _, _), g, l, r in zip(terms, plan["g"], plan["l"], plan["r"]):
-    p = (part.reshape(1, shape[1], -1) if flat else part) - ch(dc.astype(np.int32))
+  for (part, _, dc, _, flat), g, l, r in zip(terms, plan["g"], plan["l"], plan["r"]):
+    # one long unit-stride pixel axis: a strided partial sum (a depthwise conv's rows are wider than its output) is made contiguous
+    # first, else the scheduler upcasts the channel axis (the constants' unit stride) and leaves the pixels a scalar loop
+    p = (part if flat else part.contiguous()).reshape(1, shape[1], -1) - ch(dc.astype(np.int32))
     r_ = ((((p >> 14) * ch(g)) + (((p & 16383) * ch(g)) >> 14)) << ch(l)) >> ch(r)
     total = r_ if total is None else total + r_
   q = ((total + ch(plan["cq"])) >> plan["F"]).clip(0, plan["qmax"]).cast(dtypes.uint8 if plan["qmax"] == 255 else dtypes.uint16)
-  return q.reshape(shape) if flat else q
+  return q.reshape(shape)
 
 def qmatmul(a:Tensor, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None) -> Tensor:
   """a (..., K) float @ dequantized wq (K, N) int8/int16 (per output channel scale sw (N,), zero point 0) on the vrmpy passes.
