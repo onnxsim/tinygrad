@@ -112,8 +112,38 @@ static int pool_start(int n) {
 }
 
 /* ----- FastRPC methods ----- */
-int tg_graph_open(const char* uri, remote_handle64* h) { *h = (remote_handle64)(uintptr_t)malloc(1); return 0; }
-int tg_graph_close(remote_handle64 h) { G_VTCM_RELEASE(); free((void*)(uintptr_t)h); return 0; }
+#ifdef G_PERF_VOTE
+#include "HAP_power.h"
+/* G_PERF_VOTE (DSP_V65_PERF_VOTE): 1 = HVX power up + DCVS performance mode, 2 = also pin the TURBO corner, 3 = pin the MAX corner.
+ * A light FastRPC client otherwise runs at whatever DCVS picks: a PMU probe measured ~360 MHz effective and driving ranged from 144 to
+ * 192 ms between identical runs. Pinned (driving DSP ms / DM): none 144-192 / 72-96, TURBO 147-149 / 76.4, MAX 139.2-139.7 / 71.6.
+ * The vote is held while any program is open and released when the last one closes. */
+static int g_perf_refs;
+static char g_perf_ctx;
+static void perf_vote(void) {
+  if (g_perf_refs++) return;
+  HAP_power_request_t req = {0};
+  req.type = HAP_power_set_HVX, req.hvx.power_up = 1;
+  HAP_power_set(&g_perf_ctx, &req);
+  HAP_power_request_t d = {0};
+  d.type = HAP_power_set_DCVS_v2, d.dcvs_v2.dcvs_enable = 0, d.dcvs_v2.set_dcvs_params = 1, d.dcvs_v2.dcvs_option = HAP_DCVS_V2_PERFORMANCE_MODE;
+  if (G_PERF_VOTE >= 2) {
+    int c = G_PERF_VOTE >= 3 ? HAP_DCVS_VCORNER_MAX : HAP_DCVS_VCORNER_TURBO;
+    d.dcvs_v2.dcvs_params.target_corner = c;
+    d.dcvs_v2.dcvs_params.min_corner = c;
+    d.dcvs_v2.dcvs_params.max_corner = c;
+  }
+  HAP_power_set(&g_perf_ctx, &d);
+}
+static void perf_release(void) { if (g_perf_refs > 0 && --g_perf_refs == 0) HAP_power_destroy(&g_perf_ctx); }
+#define G_PERF() perf_vote()
+#define G_PERF_RELEASE() perf_release()
+#else
+#define G_PERF()
+#define G_PERF_RELEASE()
+#endif
+int tg_graph_open(const char* uri, remote_handle64* h) { G_PERF(); *h = (remote_handle64)(uintptr_t)malloc(1); return 0; }
+int tg_graph_close(remote_handle64 h) { G_VTCM_RELEASE(); G_PERF_RELEASE(); free((void*)(uintptr_t)h); return 0; }
 
 int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, int chunkLen) {
   if (total != G_BLOB_BYTES) return AEE_EBADPARM;

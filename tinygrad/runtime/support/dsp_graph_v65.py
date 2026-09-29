@@ -133,6 +133,7 @@ def emit(outdir, calls, bufs, inputs:list, output) -> dict:
           f"#define G_VTAB(s) (g_vtcm ? g_vtcm + (s) * {VTAB_BYTES} : 0)", f"#define G_VSLOT (g_vtcm ? g_vtcm + G_NVTAB * {VTAB_BYTES} : 0)"]
          if vtabs else []),
        *[f"void {k}();" for k in knames.values()],
+       *([f"#define G_PERF_VOTE {int(os.environ['DSP_V65_PERF_VOTE'])}"] if int(os.environ.get("DSP_V65_PERF_VOTE", "0")) else []),
        "#ifndef G_PARALLEL\n#define G_PARALLEL(f, R, n) for (int _c = 0; _c < (n); _c++) f(R, _c)\n#endif",
        *thunks,
        "static void g_call(int i, unsigned char** R) {", "  switch (i) {", *cases, "  }", "}"]
