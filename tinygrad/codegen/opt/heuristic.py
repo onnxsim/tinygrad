@@ -46,7 +46,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # Hexagon's vrmpy TC is one vector instruction per thread: an extra M/N upcast lands *inside* its 32 accumulator
         # lanes (later upcasts are the faster axes of the register accumulator), so every WMMA's C becomes a strided gather.
         # One WMMA per 32-lane accumulator slice keeps it a single HVX register.
-        if tk.ren is not None and tk.ren.target.device == "DSP": continue
+        if tk.ren is not None and tk.ren.target.device == "DSP":
+          # DSP_TC_MUPCAST pixels per weight load (after the TC's own lanes, so no strided accumulator): each 128-byte weight vector
+          # feeds that many vrmpys before it leaves the register file. 1 = off
+          if tc_dim == 0 and (mu:=getenv("DSP_TC_MUPCAST", 1)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
+            try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[0]), mu))
+            except KernelOptError: pass
+          continue
         szs = [sz for sz in [5,4,3,2] if rngs[tc_dim].src[0].divides(sz) is not None]
         if szs:
           # set it to the replaced range
