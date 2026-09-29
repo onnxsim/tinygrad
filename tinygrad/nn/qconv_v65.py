@@ -67,8 +67,8 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         part = a.cast(dtypes.int32).conv2d(wt.cast(dtypes.int32), stride=stride, dilation=dilation).realize()
         term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
         acc = term if acc is None else acc + term
-  elif groups == C and Cg == 1 and N == C and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
-      C % max(1, getenv("DSP_THREADS", 1)) == 0 and wq.dtype in (np.int8, np.int16):
+  elif groups == C and Cg == 1 and N % C == 0 and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
+      N % max(1, getenv("DSP_THREADS", 1)) == 0 and C % max(1, getenv("DSP_THREADS", 1)) == 0 and wq.dtype in (np.int8, np.int16):
     # hand-written HVX kernel (nn/dw_v65.py): the padded image of a channel as one flat byte signal, vrmpy over 4 consecutive taps,
     # no channel-blocked layout copy. Same integer sums as the plain convolution (int32, exact), so the float terms below are
     # bit-identical to the tinygrad-conv path's
@@ -90,10 +90,10 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
       # u16 x s8 sums to < 2^31 as one int32; with int16 weights the planes stay separate, as in the conv path
       runs = [(0, pl_)] if Q == 1 else [(0, [pl_[0]]), (8, [pl_[1]])]
     for ashift, planes in runs:
-      y = dw_hvx(planes, wpk, C, nb, Wp, kh, kw, Q, nth)
-      y = y[:, :Ho * Wp].reshape(C, Ho, Wp)[:, :, :Wo]
+      y = dw_hvx(planes, wpk, N, nb, Wp, kh, kw, Q, nth, N // C)
+      y = y[:, :Ho * Wp].reshape(N, Ho, Wp)[:, :, :Wo]
       if (sy, sx_) != (1, 1): y = y[:, ::sy, ::sx_]
-      term = y.reshape(1, C, *y.shape[1:]).cast(dtypes.float32) * float(1 << ashift)
+      term = y.reshape(1, N, *y.shape[1:]).cast(dtypes.float32) * float(1 << ashift)
       acc = term if acc is None else acc + term
   elif groups == C and Cg == 1:
     # 32 channels per vector: the padded input (kept at its own width) is stored [C/32][H][W][32] and the weights [kh][kw][C], so

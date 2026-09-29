@@ -16,7 +16,8 @@ class TestQConvV65(unittest.TestCase):
     rng = np.random.default_rng(0)
     cases = [("1x1", 192, 64, 1, 1, 0, 1, (16, 32)), ("3x3", 64, 64, 3, 1, 1, 1, (16, 32)), ("stem s2 C=6", 6, 16, 3, 2, 1, 1, (32, 64)),
              ("depthwise", 64, 64, 3, 1, 1, 64, (16, 32)), ("depthwise 7x7", 64, 64, 7, 1, 3, 64, (16, 32)),
-             ("depthwise 7x7 s2", 64, 64, 7, 2, 3, 64, (16, 32)), ("depthwise 3x3 s2 wide", 32, 32, 3, 2, 1, 32, (12, 150))]
+             ("depthwise 7x7 s2", 64, 64, 7, 2, 3, 64, (16, 32)), ("depthwise x2 7x7 s2", 32, 64, 7, 2, 3, 32, (16, 32)),
+             ("depthwise x2 3x3", 32, 64, 3, 1, 1, 32, (16, 32)), ("depthwise 3x3 s2 wide", 32, 32, 3, 2, 1, 32, (12, 150))]
     for (name, C, N, k, s, p, g, (H, W)), (xb, wb) in itertools.product(cases, [(8, 8), (16, 8), (16, 16)]):
       with self.subTest(name=name, bits=f"W{wb}A{xb}"):
         xdt, wdt = (np.uint8, 255) if xb == 8 else (np.uint16, 65535), (np.int8, 127) if wb == 8 else (np.int16, 32767)
