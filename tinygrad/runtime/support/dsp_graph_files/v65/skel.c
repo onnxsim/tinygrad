@@ -15,6 +15,39 @@ static void g_parallel(void (*f)(unsigned char**, int), unsigned char** R, int n
 #include "graph.h"
 
 static unsigned char* g_blob;
+#ifdef G_VTCM_BYTES
+/* a program with vgather kernels (DSP_V65_VGATHER): the constant 128 KB tables they look up are copied into VTCM once, after the
+ * weights are in, and the kernels read them there (G_VTAB(slot) is null without VTCM: they run their scalar loops). vgather reads
+ * only VTCM and a region must sit in one page, so the tables need a 128 KB-aligned base. */
+#include "HAP_compute_res.h"
+unsigned char* g_vtcm;
+static unsigned g_vtcm_ctx;
+static int g_vtab_ok;
+static void vtcm_release(void) { if (g_vtcm) { HAP_compute_res_release(g_vtcm_ctx); g_vtcm = 0; g_vtcm_ctx = 0; g_vtab_ok = 0; } }
+static void vtab_setup(void) {
+  if (!g_vtcm) {
+    compute_res_attr_t attr;
+    HAP_compute_res_attr_init(&attr);
+    HAP_compute_res_attr_set_vtcm_param_v2(&attr, (G_VTCM_BYTES + 0xFFFF) & ~0xFFFFu, 0, 0);
+    if (!(g_vtcm_ctx = HAP_compute_res_acquire(&attr, 100000))) return;
+    void* p = 0; unsigned n = 0;
+    HAP_compute_res_attr_get_vtcm_ptr_v2(&attr, &p, &n);
+    if (!p || n < G_VTCM_BYTES || ((uintptr_t)p & (G_VTAB_BYTES - 1))) { HAP_compute_res_release(g_vtcm_ctx); g_vtcm_ctx = 0; return; }
+    g_vtcm = (unsigned char*)p;
+  }
+  if (g_vtab_ok) return;
+  for (int s = 0; s < G_NVTAB; s++) memcpy(g_vtcm + (size_t)s * G_VTAB_BYTES, g_blob + G_VTAB_BLOB[s], G_VTAB_BYTES);
+  g_vtab_ok = 1;
+}
+#define G_VTCM_SETUP() vtab_setup()
+#define G_VTCM_RELEASE() vtcm_release()
+#define G_VTCM_RELOAD() (g_vtab_ok = 0)
+#else
+#define G_VTCM_SETUP()
+#define G_VTCM_RELEASE()
+#define G_VTCM_RELOAD()
+#endif
+
 static char* g_blob_raw;  /* no memalign in the DSP libc: aligned by hand */
 static int g_blob_total, g_blob_loaded;
 static unsigned char* g_R[G_NREG];
@@ -80,7 +113,7 @@ static int pool_start(int n) {
 
 /* ----- FastRPC methods ----- */
 int tg_graph_open(const char* uri, remote_handle64* h) { *h = (remote_handle64)(uintptr_t)malloc(1); return 0; }
-int tg_graph_close(remote_handle64 h) { free((void*)(uintptr_t)h); return 0; }
+int tg_graph_close(remote_handle64 h) { G_VTCM_RELEASE(); free((void*)(uintptr_t)h); return 0; }
 
 int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, int chunkLen) {
   if (total != G_BLOB_BYTES) return AEE_EBADPARM;
@@ -89,6 +122,7 @@ int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, 
     if (!g_blob && (g_blob_raw = malloc(total + 128))) g_blob = (unsigned char*)(((uintptr_t)g_blob_raw + 127) & ~(uintptr_t)127);
     if (!g_blob) return AEE_ENOMEMORY;
     g_blob_total = total, g_blob_loaded = 0;
+    G_VTCM_RELOAD();
   }
   if (offset != g_blob_loaded || offset + chunkLen > total) return AEE_EBADPARM;
   memcpy(g_blob + offset, chunk, chunkLen);
@@ -135,6 +169,7 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, const uin
   if (!g_blob || g_blob_loaded != G_BLOB_BYTES) return AEE_EBADSTATE;
   if (start < 0 || count < 0 || start + count > G_NCALLS || tLen < 1) return AEE_EBADPARM;
   if (regions()) return AEE_ENOMEMORY;
+  G_VTCM_SETUP();
   memset(t, 0, tLen * sizeof(uint64));
   if (start == 0 && inLen > 0) {
     int off = 0;
