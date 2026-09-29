@@ -236,6 +236,18 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             break
   except KernelOptError: pass
 
+  # v65 elementwise (a copy, a plane split, a layout change): the rules above only upcast an axis some buffer broadcasts along, and
+  # a small masked/slot upcast (a queue's 5 slots) stops the fallback below, so a byte copy ran one byte at a time. Vectorize a
+  # unit-stride axis: up to 128 lanes, and at most 8 registers live across the slots already upcast
+  if is_dsp and max_bytes is not None and not k.axes_of(AxisType.REDUCE) and getenv("DSP_V65_COPY_VECTORIZE", 1) and \
+      not any(_unit_stride(k, a) for a in k.axes_of(AxisType.UPCAST)):
+    itemsize = max(b.src[0].dtype.itemsize for b in k.bufs)
+    for axis in k.upcastable_dims[::-1]:
+      if not _unit_stride(k, axis): continue
+      if (s:=next((s for s in (128, 64, 32, 16) if k.full_shape[axis] % s == 0 and s * k.upcast_size() * itemsize <= 1024), None)):
+        k.apply_opt(Opt(OptOps.UPCAST, axis, s))
+        break
+
   # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
   for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not (v65_float and getenv("DSP_SCALAR_GEMV", 1))
                  else [4]):
