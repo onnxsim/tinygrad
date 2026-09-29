@@ -465,9 +465,32 @@ class OnnxRunner:
     sx_f, zx, wq, sw = cached
     pads = opts.get("pads", 0)
     p = [pads] * 4 if isinstance(pads, int) else list(pads)
-    return qconv2d(xq, zx, sx_f, wq, sw, inps[2] if len(inps) > 2 else None,
-                   stride=opts.get("strides", 1), dilation=opts.get("dilations", 1), padding=(p[1], p[3], p[0], p[2]),
-                   groups=opts.get("group", 1))
+    # ONNX_QDQ_REQUANT=1 (lossy by the plan's bounded number of output steps): a Conv whose only consumer is a QuantizeLinear with
+    # per-tensor u8/u16 parameters returns the quantized tensor itself, from integer fixed-point arithmetic (qconv_v65.requant_plan)
+    out_q = None
+    if getenv("ONNX_QDQ_REQUANT"):
+      rkey = ("r", node.outputs[0])
+      if rkey not in self._qconv_w:
+        self._qconv_w[rkey] = None
+        if not hasattr(self, "_consumers"):
+          self._consumers = {}
+          for n in self.graph_nodes:
+            for i in n.inputs: self._consumers.setdefault(i, []).append(n)
+        cons = self._consumers.get(node.outputs[0], [])
+        if len(cons) == 1 and cons[0].op == "QuantizeLinear" and node.outputs[0] not in self.graph_outputs and len(cons[0].inputs) >= 3 and \
+            all(nm in self.graph_values and not isinstance(self.graph_values[nm], type(None)) for nm in cons[0].inputs[1:3]):
+          sy, zy = arr(cons[0].inputs[1]).reshape(-1), arr(cons[0].inputs[2]).reshape(-1)
+          bias = arr(node.inputs[2]).reshape(-1) if len(node.inputs) > 2 and node.inputs[2] else None
+          if sy.size == 1 and zy.size == 1 and zy.dtype in (np.uint8, np.uint16):
+            self._qconv_w[rkey] = (float(sy[0]), int(zy[0]), 255 if zy.dtype == np.uint8 else 65535, bias)
+      out_q = self._qconv_w[rkey]
+    ret = qconv2d(xq, zx, sx_f, wq, sw, inps[2] if len(inps) > 2 else None,
+                  stride=opts.get("strides", 1), dilation=opts.get("dilations", 1), padding=(p[1], p[3], p[0], p[2]),
+                  groups=opts.get("group", 1), out_q=out_q)
+    if out_q is not None and ret.dtype in (dtypes.uint8, dtypes.uint16):
+      if not hasattr(self, "_conv_q"): self._conv_q = set()
+      self._conv_q.add(node.outputs[0])
+    return ret
 
   _QDQ_MOVES = ("Reshape", "Transpose", "Squeeze", "Unsqueeze", "Flatten", "Identity", "Slice")
   _QDQ_VALUE = ("Gelu", "Relu", "Sigmoid", "Tanh", "Div", "Mul", "Add", "Sub", "Cast")
@@ -670,6 +693,7 @@ class OnnxRunner:
         if debug >= 1: print((f"[{self.graph_name}] " if self.graph_name else "") + f"{num}: op '{node.op}' opt {opts}")
         if debug >= 2 and node.inputs: print("\tinputs:\n" + "\n".join(f"\t\t{x} - {i!r}" for x,i in zip(node.inputs, inps)))
         if node.op == "Conv" and getenv("ONNX_QDQ_INT_CONV") and (qc:=self._qdq_int_conv(node, inps, opts)) is not None: ret = qc
+        elif node.op == "QuantizeLinear" and node.inputs[0] in getattr(self, "_conv_q", ()): ret = self.graph_values[node.inputs[0]]
         elif node.op == "QuantizeLinear" and getenv("ONNX_QDQ_LUT") and (qc:=self._qdq_lut(node)) is not None: ret = qc
         elif node.op in ("Gelu", "Sigmoid", "Tanh") and getenv("ONNX_QDQ_LUT") and (qc:=self._dq_unary_lut(node)) is not None: ret = qc
         elif node.op in ("Gemm", "MatMul") and getenv("ONNX_QDQ_INT_GEMM") and (qc:=self._qdq_int_gemm(node, inps, opts)) is not None: ret = qc

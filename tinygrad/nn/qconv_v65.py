@@ -41,9 +41,12 @@ def pack_weight_planes(wq:np.ndarray) -> list[tuple[int, np.ndarray, bool]]:
   return out
 
 def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None, stride=1, dilation=1,
-            padding:tuple[int, int, int, int]=(0, 0, 0, 0), groups:int=1) -> Tensor:
+            padding:tuple[int, int, int, int]=(0, 0, 0, 0), groups:int=1, out_q:tuple|None=None) -> Tensor:
   """xq: (1, C, H, W) uint8/uint16, wq: (N, C/groups, kh, kw) int8/int16 (zero point 0), sw: (N,) float, bias: float (N,) or None.
-  padding is tinygrad's (left, right, top, bottom). Returns float32 (1, N, OH, OW)"""
+  padding is tinygrad's (left, right, top, bottom). Returns float32 (1, N, OH, OW).
+  out_q=(sy, zy, qmax, bias_np) (the QuantizeLinear that consumes the result: its scale, zero point, largest value, and the bias as
+  numpy): returns the quantized uint16/uint8 tensor from an integer fixed-point requantization instead (see requant_plan), or the
+  float tensor when the plan does not fit int32"""
   N, Cg, kh, kw = wq.shape
   C = xq.shape[1]
   xbits = 8 if xq.dtype == dtypes.uint8 else 16
@@ -53,6 +56,12 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
   corr = Tensor((-float(zx) * wq.reshape(N, -1).astype(np.float64).sum(1)).astype(np.float32), device=xq.device).reshape(1, N, 1, 1)
   xp = xq.cast(dtypes.int32).pad(((0, 0), (0, 0), (padding[2], padding[3]), (padding[0], padding[1])), value=zx)
   acc: Tensor|None = None
+  terms: list = []  # (int32 partial sum, shift, per-channel zero-point term zp*sum(w) of this term, per-channel max|part - dc|)
+  def add_term(part, shift, zpa, top, wsel, flat=False):
+    # wsel: the (N, ...) integer weights this term multiplies; the term's zero-point part is zpa * sum(wsel), exact in integers.
+    # flat: the partial sum is one contiguous (1, N, OH, OW) buffer, so its pixels may be flattened into one long axis
+    w2 = wsel.reshape(N, -1).astype(np.int64)
+    terms.append((part, shift, zpa * w2.sum(1), max(zpa, top - zpa) * np.abs(w2).sum(1), flat))
   if groups == 1:
     C4 = (C + 3) // 4
     if C4 * 4 != C: xp = xp.pad(((0, 0), (0, C4 * 4 - C), (0, 0), (0, 0)), value=zx)  # extra channels meet zero weights
@@ -67,6 +76,10 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         part = a.cast(dtypes.int32).conv2d(wt.cast(dtypes.int32), stride=stride, dilation=dilation).realize()
         term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
         acc = term if acc is None else acc + term
+        # (the padding and the extra channels are the zero point / zero weights, so the term is centered on zpa; the weight plane's
+        # sums are over everything but the output channel of the packed [C/4][kh][kw][N][4] layout)
+        add_term(part, ashift + wshift, (zx & 255) if xbits == 16 and ashift == 0 else (zx >> 8) if xbits == 16 else zx,
+                 255 if xbits == 16 or xbits == 8 else 65535, np.moveaxis(wpacked, 3, 0), flat=True)
   elif groups == C and Cg == 1 and N % C == 0 and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
       N % max(1, getenv("DSP_THREADS", 1)) == 0 and C % max(1, getenv("DSP_THREADS", 1)) == 0 and wq.dtype in (np.int8, np.int16):
     # hand-written HVX kernel (nn/dw_v65.py): the padded image of a channel as one flat byte signal, vrmpy over 4 consecutive taps,
@@ -95,6 +108,8 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
       if (sy, sx_) != (1, 1): y = y[:, ::sy, ::sx_]
       term = y.reshape(1, N, *y.shape[1:]).cast(dtypes.float32) * float(1 << ashift)
       acc = term if acc is None else acc + term
+      if xbits == 8 or Q == 1: add_term(y.reshape(1, N, *y.shape[1:]), ashift, zx, 255 if xbits == 8 else 65535, wq)
+      else: add_term(y.reshape(1, N, *y.shape[1:]), ashift, (zx & 255) if ashift == 0 else (zx >> 8), 255, wq)
   elif groups == C and Cg == 1:
     # 32 channels per vector: the padded input (kept at its own width) is stored [C/32][H][W][32] and the weights [kh][kw][C], so
     # one tap of 32 channels is one contiguous load of each. Both are views back to the logical NCHW / (C, 1, kh, kw) shapes.
@@ -108,12 +123,75 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
     wt = Tensor(np.ascontiguousarray(wq[:, 0].astype(np.int32).transpose(1, 2, 0)), device=xq.device).permute(2, 0, 1).reshape(N, 1, kh, kw)
     # u16 x s16 x taps can pass 2^31: split the activation into byte planes then (each pass stays under 2^27 for 3x3)
     for ashift, aplane in (_planes(xp, xbits) if xbits == 16 and wq.dtype == np.int16 else [(0, xp)]):
-      term = aplane.conv2d(wt, stride=stride, dilation=dilation, groups=groups).cast(dtypes.float32) * float(1 << ashift)
+      part = aplane.conv2d(wt, stride=stride, dilation=dilation, groups=groups)
+      term = part.cast(dtypes.float32) * float(1 << ashift)
       acc = term if acc is None else acc + term
+      split = xbits == 16 and wq.dtype == np.int16
+      add_term(part, ashift, ((zx & 255) if ashift == 0 else (zx >> 8)) if split else zx, 255 if split or xbits == 8 else 65535, wq)
   else: raise NotImplementedError(f"qconv2d: groups={groups} with {Cg} channels per group")
   assert acc is not None
+  if out_q is not None:
+    if (plan:=requant_plan(terms, sx, sw, *out_q)) is not None: return requant_apply(terms, plan, xq.device)
+    if getenv("REQUANT_LOG"): print("requant: plan does not fit int32, float epilogue", flush=True)
   y = (acc + corr) * scale
   return y if bias is None else y + bias.reshape(1, N, 1, 1)
+
+# ---- integer fixed-point requantization of the conv accumulators (ONNX_QDQ_REQUANT=1, lossy by a bounded number of output steps) ----
+# q = clip(round(sum_t (part_t - dc_t) * K_t + bias/sy + zy)), K_t = sx*sw/sy * 2^shift_t, in int32 only (HVX has no float on v65 and
+# no 64-bit multiply): part_t - dc_t (the term centered on its zero point, exact) is split into a high and a low part,
+#   p = th * 2^14 + tl,   R = (((th*g + ((tl*g) >> 14)) << l) >> r)   with g a 15-bit integer, K_t*2^F ~ g / 2^e, l = max(14-e, 0),
+#   r = max(e-14, 0)
+# so th*g < 2^31 and tl*g < 2^29 (terms with the same shift are added first) and no 64-bit product is needed. F fractional bits are kept in the sum, chosen per conv so that the
+# worst case of every partial sum (from the weights' L1 norms, so it is a bound, not an estimate) stays under 2^30.
+# Error in output steps: each term's multiplier is rounded to 15 bits (relative 2^-15 of that term's magnitude), each truncation loses
+# under one 2^-F, and the final rounding is half a step: bound_c = sum_t Pb_tc*K_tc*2^-15 + (2*nterms + 1) * 2^-F + 0.5.
+def merge_terms(terms):
+  """terms with the same shift share a multiplier: add them first (one multiply pair instead of two)"""
+  by: dict = {}
+  for part, sh, dc, pb, flat in terms:
+    if sh in by: by[sh] = (by[sh][0] + part, sh, by[sh][2] + dc, by[sh][3] + pb, by[sh][4] and flat)
+    else: by[sh] = (part, sh, dc, pb, flat)
+  return list(by.values())
+
+def requant_plan(terms, sx, sw, sy, zy, qmax, bias):
+  terms = merge_terms(terms)
+  N = len(sw)
+  G = np.float64(sx) * sw.astype(np.float64) / np.float64(sy)
+  K = [G * float(1 << t[1]) for t in terms]
+  c_real = (np.zeros(N) if bias is None else np.asarray(bias, np.float64).reshape(-1) / np.float64(sy)) + float(zy)
+  pbs = [t[3] for t in terms]
+  # th = p >> 14 with |p| < 2^29.7 and g < 2^15 keeps th*g under 2^31; the dc must fit int32
+  if any(np.abs(t[2]).max() >= 2**31 for t in terms) or any(pb.max() >= 2**29.7 for pb in pbs): return None
+  tb = sum(pb * k for pb, k in zip(pbs, K)) + np.abs(c_real)
+  F = min(getenv("REQUANT_MAX_F", 12), int(np.floor(30 - np.log2(max(tb.max(), 1.0)))))
+  if F < getenv("REQUANT_MIN_F", 3): return None
+  gs, ls, rs = [], [], []
+  for k in K:
+    k2 = k * 2.0 ** F
+    with np.errstate(divide="ignore"): e = np.where(k2 > 0, 14 - np.floor(np.log2(np.where(k2 > 0, k2, 1.0))), 0).astype(np.int64)
+    g = np.where(k2 > 0, np.rint(k2 * 2.0 ** e), 0).astype(np.int64)
+    if e.max() - 14 > 31 or 14 - e.min() > 31: return None
+    gs.append(g.astype(np.int32)); ls.append(np.maximum(14 - e, 0).astype(np.int32)); rs.append(np.maximum(e - 14, 0).astype(np.int32))
+  cq = (np.rint(c_real * 2.0 ** F) + 0.5 * len(terms) + 2.0 ** (F - 1)).astype(np.int64)
+  bound = sum(pb * k for pb, k in zip(pbs, K)) * 2.0 ** -15 + (2 * len(terms) + 1) * 2.0 ** -F + 0.5
+  return {"F": F, "g": gs, "l": ls, "r": rs, "cq": cq.astype(np.int32), "qmax": qmax, "bound": bound}
+
+LAST_REQUANT: dict = {}  # the last plan built (its error bound in output steps, per channel): for tests and reports
+
+def requant_apply(terms, plan, device) -> Tensor:
+  LAST_REQUANT.update(plan)
+  if getenv("REQUANT_LOG"): print(f"requant: {len(plan['g'])} terms, F={plan['F']}, error bound max {plan['bound'].max():.2f} mean {plan['bound'].mean():.2f} steps", flush=True)
+  terms = merge_terms(terms)
+  shape = terms[0][0].shape
+  flat = all(t[4] for t in terms)  # contiguous partial sums: one long pixel axis (a deep stage's 8x16 map would otherwise vectorize 16)
+  def ch(a): return Tensor(np.ascontiguousarray(a), device=device).reshape(1, -1, 1) if flat else Tensor(np.ascontiguousarray(a), device=device).reshape(1, -1, 1, 1)
+  total = None
+  for (part, _, dc, _, _), g, l, r in zip(terms, plan["g"], plan["l"], plan["r"]):
+    p = (part.reshape(1, shape[1], -1) if flat else part) - ch(dc.astype(np.int32))
+    r_ = ((((p >> 14) * ch(g)) + (((p & 16383) * ch(g)) >> 14)) << ch(l)) >> ch(r)
+    total = r_ if total is None else total + r_
+  q = ((total + ch(plan["cq"])) >> plan["F"]).clip(0, plan["qmax"]).cast(dtypes.uint8 if plan["qmax"] == 255 else dtypes.uint16)
+  return q.reshape(shape) if flat else q
 
 def qmatmul(a:Tensor, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None) -> Tensor:
   """a (..., K) float @ dequantized wq (K, N) int8/int16 (per output channel scale sw (N,), zero point 0) on the vrmpy passes.
