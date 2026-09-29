@@ -17,6 +17,8 @@ def _narrow_int(u:UOp) -> UOp:
       (dtypes.is_unsigned(s) or not dtypes.is_unsigned(u.dtype)): u = u.src[0]
   return u
 
+def _narrow_tc(tc) -> bool: return tc.dtype_in_b is not None or dtypes.is_int(tc.dtype_in)
+
 def _unit_stride_rank(u:UOp, r:UOp) -> int:
   # 0 when r steps u's (first) load index by exactly one element, 1 otherwise
   idx = next((x for x in u.toposort() if x.op is Ops.INDEX and len(x.src) >= 2), None)
@@ -241,7 +243,8 @@ class Scheduler:
         if self.ren.target.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
         # a mixed-dtype TC (u8 x s8) sees its inputs through the value-preserving widening casts dtype promotion adds
         # to the MUL (u8,s8 -> short), and computes the exact product itself
-        a, b = (_narrow_int(in0), _narrow_int(in1)) if tc.dtype_in_b is not None else (in0, in1)
+        # an int TC (Hexagon's u8 x s8, and same-dtype u8 x u8 / s8 x s8) sees its inputs through the widening casts
+        a, b = (_narrow_int(in0), _narrow_int(in1)) if _narrow_tc(tc) else (in0, in1)
         if tc.dtype_in == a.dtype and tc.dtype_b == b.dtype and tc.dtype_out == reduceop.dtype:
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg[0], reverse=True)
@@ -303,7 +306,7 @@ class Scheduler:
             tne = [x.replace(tag=1) for x in ne]
             ret = reduceop.substitute(dict(zip(ne, tne)))
             srcs = list((ret.src[0] if ret.src[0].op is not Ops.CAST else ret.src[0].src[0]).src)
-            if tc.dtype_in_b is not None: srcs = [_narrow_int(x) for x in srcs]
+            if _narrow_tc(tc): srcs = [_narrow_int(x) for x in srcs]
             srcs = [x.substitute(dict(zip(tne, [ne[i] for i in argsort(p)]))) for x,p in zip(srcs, tc.permutes_for_shape_str(tc.base_shape_str()))]
 
             # get reduce/upcast axes for the tensor cores
