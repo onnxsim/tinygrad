@@ -96,7 +96,8 @@ if __name__ == "__main__":
     slot = {name: i for i, name in enumerate(inputs)}  # the program's input order (compile3 sorts by name)
     # program.txt, one record per line. The runner receives ONNX inputs in graph order (the transport's tensors are positional):
     #   input <onnx index> <onnx dtype> <bytes> <program slot, or -1 when no kernel reads it>
-    #   output <onnx dtype of the returned tensor, always FLOAT> <elements> <dims...>   (compile3 ALL_OUTPUTS: float32, concatenated)
+    #   output <onnx dtype of the returned tensor> <elements> <dims...>   the program's output is the ONNX outputs back to back:
+    #     compile3 ALL_OUTPUTS=1 casts every one to FLOAT; ALL_OUTPUTS=2 (a uint8 program output) keeps UINT8/INT8 ones as they are
     #   name <call index> <kernel name>
     lines = [f"ncalls {info['calls']}", f"threads {max(1, getenv('DSP_THREADS', 1))}", f"output_bytes {info['output_bytes']}"]
     for i, vi in enumerate(model.graph.input):
@@ -104,11 +105,12 @@ if __name__ == "__main__":
       lines.append(f"input {i} {vi.type.tensor_type.elem_type} {nbytes} {slot.get(vi.name, -1)}")
     # one line per call: its kernel name, for the runner's per-call profile events
     lines += [f"name {i} {c[0]}" for i, c in enumerate(calls)]
-    total = 0
+    total, packed = 0, ref.dtype == np.uint8
     for vo in model.graph.output:
       dims = [d.dim_value or 1 for d in vo.type.tensor_type.shape.dim]
-      total += int(np.prod(dims)); lines.append(f"output 1 {int(np.prod(dims))} " + " ".join(map(str, dims)))
-    if total * 4 != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} floats) don't match the program output ({info['output_bytes']} bytes)")
+      dt = vo.type.tensor_type.elem_type if packed and vo.type.tensor_type.elem_type in (2, 3) else 1  # UINT8 / INT8, else FLOAT
+      total += int(np.prod(dims)) * (1 if dt != 1 else 4); lines.append(f"output {dt} {int(np.prod(dims))} " + " ".join(map(str, dims)))
+    if total != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} bytes) don't match the program output ({info['output_bytes']} bytes)")
     size = dsp_graph_v65.pack(out, args.artifact, lines)
     manifest = {"schema_version": 1,
                 "compiler": {"name": "tinygrad-dsp_graph_v65", "version": "1", "id": "tinygrad-hexagon-v65"},

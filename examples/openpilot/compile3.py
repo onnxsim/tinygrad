@@ -77,6 +77,11 @@ def compile(onnx_file):
     outs = run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()})
     # ALL_OUTPUTS=1 keeps recurrent-state outputs (e.g. next_state_*_q) as part of the graph: they are
     # concatenated, flattened, in ONNX output order, so the capture still has exactly one output buffer
+    # ALL_OUTPUTS=2 packs them as bytes instead: 1-byte integer outputs (an image queue) stay as they are, the rest are float32 --
+    # casting a 2 MB uint8 frame queue to float was a 15 ms scalar kernel on the v65 DSP
+    if getenv("ALL_OUTPUTS") == 2:
+      return Tensor.cat(*[(v if v.dtype in (dtypes.uint8, dtypes.int8) else v.cast('float32')).flatten().bitcast(dtypes.uint8)
+                          for v in outs.values()])
     if getenv("ALL_OUTPUTS"): return Tensor.cat(*[v.cast('float32').flatten() for v in outs.values()])
     return next(iter(outs.values())).cast('float32')
   for i in range(3):
