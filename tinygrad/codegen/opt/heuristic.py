@@ -48,8 +48,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # One WMMA per 32-lane accumulator slice keeps it a single HVX register.
         if tk.ren is not None and tk.ren.target.device == "DSP":
           # DSP_TC_MUPCAST pixels per weight load (after the TC's own lanes, so no strided accumulator): each 128-byte weight vector
-          # feeds that many vrmpys before it leaves the register file. 1 = off
-          if tc_dim == 0 and (mu:=getenv("DSP_TC_MUPCAST", 1)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
+          # feeds that many vrmpys before it leaves the register file. 0 or 1 = off; 8 measured best on the V69 phone (2: 228 ms, 4: 204, 8: 203, 16: 218 for driving)
+          if tc_dim == 0 and getattr(tk, "tensor_core", None) is not None and tk.tensor_core.dims == (32, 1, 4) and \
+              (mu:=getenv("DSP_TC_MUPCAST", 8)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
             try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[0]), mu))
             except KernelOptError: pass
           continue
