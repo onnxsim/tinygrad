@@ -1642,6 +1642,25 @@ static inline void __dw_hvx(int* restrict y, const unsigned char* restrict x0, c
     o[2] = __builtin_HEXAGON_V6_lo_128B(q1); o[3] = __builtin_HEXAGON_V6_hi_128B(q1);
   }
 }
+// (C, H, W) unsigned values -> flat padded byte planes [C][Lin]: every plane pre-filled with its pad value, the image rows copied to
+// rows pt.. / columns pl.. of the Hp x Wp image; the low byte and (for 16-bit values) the high byte as separate planes
+static inline void __dw_prep8(unsigned char* restrict lo, const unsigned char* restrict src, int H, int W, int Lin, int Wp, int pt, int pl, int pv) {
+  __dw_v fill = __builtin_HEXAGON_V6_lvsplatw_128B(pv * 0x01010101);
+  for (int i = 0; i < Lin; i += 128) *(__dw_vu*)(lo + i) = fill;
+  for (int y = 0; y < H; y++) {
+    unsigned char* d = lo + (pt + y) * Wp + pl; const unsigned char* r = src + y * W;
+    for (int x = 0; x < W; x++) d[x] = r[x];
+  }
+}
+static inline void __dw_prep16(unsigned char* restrict lo, unsigned char* restrict hi, const unsigned short* restrict src, int H, int W, int Lin, int Wp,
+                               int pt, int pl, int pv) {
+  __dw_v fl = __builtin_HEXAGON_V6_lvsplatw_128B((pv & 255) * 0x01010101), fh = __builtin_HEXAGON_V6_lvsplatw_128B((pv >> 8) * 0x01010101);
+  for (int i = 0; i < Lin; i += 128) { *(__dw_vu*)(lo + i) = fl; *(__dw_vu*)(hi + i) = fh; }
+  for (int y = 0; y < H; y++) {
+    unsigned char* dl = lo + (pt + y) * Wp + pl; unsigned char* dh = hi + (pt + y) * Wp + pl; const unsigned short* r = src + y * W;
+    for (int x = 0; x < W; x++) { unsigned v = r[x]; dl[x] = v; dh[x] = v >> 8; }
+  }
+}
 """
 
 def _hmx_qadd_consts(ra:float, rb:float, fixed:float) -> tuple:
@@ -2148,7 +2167,7 @@ class DSPRenderer(ClangRenderer):
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
-    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__dw_hvx(") for u in uops): prefix.append(_DW_HVX_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

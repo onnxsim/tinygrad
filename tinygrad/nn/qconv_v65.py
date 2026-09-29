@@ -72,7 +72,7 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
     # hand-written HVX kernel (nn/dw_v65.py): the padded image of a channel as one flat byte signal, vrmpy over 4 consecutive taps,
     # no channel-blocked layout copy. Same integer sums as the plain convolution (int32, exact), so the float terms below are
     # bit-identical to the tinygrad-conv path's
-    from tinygrad.nn.dw_v65 import pack_dw_weights, dw_flat_len, dw_hvx
+    from tinygrad.nn.dw_v65 import pack_dw_weights, dw_flat_len, dw_hvx, dw_prep
     H, W = xq.shape[2], xq.shape[3]
     pl, pr, pt, pb = padding
     Hp, Wp = H + pt + pb, W + pl + pr
@@ -82,14 +82,13 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
     sy, sx_ = (stride, stride) if isinstance(stride, int) else tuple(stride)
     wpk = Tensor(pack_dw_weights(wq), device=xq.device)
     Q = 1 if wq.dtype == np.int8 else 2
-    def plane(v, pv):  # (1, C, H, W) unsigned values < 256 -> padded flat u8 (C, Lin)
-      t = v.cast(dtypes.uint8).pad(((0, 0), (0, 0), (pt, pb), (pl, pr)), value=pv).reshape(C, Hp * Wp)
-      return t.pad(((0, 0), (0, Lin - Hp * Wp))).contiguous()
-    if xbits == 8: runs = [(0, [plane(xq, zx)])]
+    Lin += -Lin % 128
+    # padded flat byte planes from one custom kernel (a tinygrad pad + reshape + plane split ran at ~50 cycles per element)
+    pl_ = dw_prep(xq, Hp, Wp, pt, pl, Lin, zx, nth)
+    if xbits == 8: runs = [(0, pl_)]
     else:
-      lo, hi = plane(xq & 255, zx & 255), plane(xq >> 8, zx >> 8)
       # u16 x s8 sums to < 2^31 as one int32; with int16 weights the planes stay separate, as in the conv path
-      runs = [(0, [lo, hi])] if Q == 1 else [(0, [lo]), (8, [hi])]
+      runs = [(0, pl_)] if Q == 1 else [(0, [pl_[0]]), (8, [pl_[1]])]
     for ashift, planes in runs:
       y = dw_hvx(planes, wpk, C, nb, Wp, kh, kw, Q, nth)
       y = y[:, :Ho * Wp].reshape(C, Ho, Wp)[:, :, :Wo]
