@@ -84,9 +84,11 @@ def compile(onnx_file):
     if getenv("ALL_OUTPUTS") == 2:
       segs = [(v if v.dtype in (dtypes.uint8, dtypes.int8) else v.cast('float32')).flatten().bitcast(dtypes.uint8) for v in outs.values()]
       segs = [x.pad((0, -x.shape[0] % 128)) for x in segs]
-      # (realized one by one: lazy slice assigns into one buffer fuse back into a single kernel)
-      out, at = Tensor.empty(sum(x.shape[0] for x in segs), dtype=dtypes.uint8).realize(), 0
-      for x in segs: out[at:at+x.shape[0]].assign(x).realize(); at += x.shape[0]
+      # (assigns into slices of a realized buffer, realized together: a lazy setitem chain fused back into one kernel, and
+      # realizing the slices one by one recomputed the intermediates they share)
+      out, at, writes = Tensor.empty(sum(x.shape[0] for x in segs), dtype=dtypes.uint8).realize(), 0, []
+      for x in segs: writes.append(out[at:at+x.shape[0]].assign(x)); at += x.shape[0]
+      Tensor.realize(*writes)
       return out
     if getenv("ALL_OUTPUTS"): return Tensor.cat(*[v.cast('float32').flatten() for v in outs.values()])
     return next(iter(outs.values())).cast('float32')
