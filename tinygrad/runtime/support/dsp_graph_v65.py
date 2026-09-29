@@ -19,6 +19,49 @@ FILES = pathlib.Path(__file__).parent / "dsp_graph_files" / "v65"
 ALIGN = 128
 def _rnd(n:int) -> int: return (n + ALIGN - 1) // ALIGN * ALIGN + ALIGN  # + ALIGN: a final HVX load may run past the end
 
+VTAB_BYTES = 65536 * 2
+_VG_HEADER = re.compile(r"void (\w+)\(unsigned short\* restrict [^,]*?data0_(\d+), unsigned short\* restrict [^,]*?data1_(\d+), "
+                        r"unsigned short\* restrict [^,]*?data2_65536(, const int data3_)?\)")
+_VG_LOOP = re.compile(r"for \(int Lidx1 = 0; Lidx1 < (\d+); Lidx1\+\+\) \{\n\s+int alu0 = "
+                      r"(?:\(\(data3_(?:\*(\d+)|<<(\d+))\)\+\(Lidx1<<7\)\)|\(Lidx1<<7\));")
+
+def vgather_kernel(kn:str, body:str, nthreads:int) -> str|None:
+  """The DSP_V65_VGATHER rewrite of a table-lookup kernel: out[i] = tab[idx[i]] over u16 with a 65536-entry table (ONNX_QDQ_LUT's
+  gathers), 128 lanes per step and the core_id slices contiguous. It becomes kn(out, idx, tab, [core,] vtab, vslot): with vtab (the
+  table resident in VTCM, set by the skel when VTCM was granted) the HVX vgather path, else the original scalar loop (kept as
+  kn_scalar, which is also all the qemu check ever runs). None when the kernel is not that shape. vgather takes 64 halfwords per
+  instruction from word offsets (a 16-bit offset would reach only 32K entries), one VMEM store of its result, and only reads VTCM."""
+  m, l = _VG_HEADER.search(body), _VG_LOOP.search(body)
+  if not m or not l or bool(m.group(4)) != bool(nthreads) or m.group(2) != m.group(3): return None
+  n, loops = int(m.group(2)), int(l.group(1))
+  stride = int(l.group(2)) if l.group(2) else (1 << int(l.group(3))) if l.group(3) else n  # elements per core (all of them unthreaded)
+  # one loop of 128-lane steps over a core's contiguous slice, the same offsets for the index load and the result store
+  if n % max(nthreads, 1) or stride != n // max(nthreads, 1) or loops * 128 != stride or stride % 256: return None
+  if body.count("(data2_65536+(((unsigned short*)(data1_") != 128 or "*((unsigned_short128*)((data0_" not in body: return None
+  scalar = re.sub(rf"\bvoid {re.escape(kn)}\(", f"static void {kn}_scalar(", body, count=1)
+  core_p, core_a, core_s = (", const int core", ", core", "core") if nthreads else ("", "", "0")
+  return f"""#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+{scalar}
+/* {stride} elements per core in {stride // 64} vectors of 64: four gathers in flight, each into its own 128-byte VTCM slot (the skel
+ * keeps 512 bytes per core after the tables) */
+void {kn}(unsigned char* out, unsigned char* idx, unsigned char* tab{core_p}, unsigned char* vtab, unsigned char* vslot) {{
+  if (!vtab) {{ {kn}_scalar((unsigned short*)out, (unsigned short*)idx, (unsigned short*)tab{core_a}); return; }}
+  const HVX_Vector* ip = (const HVX_Vector*)(idx + {core_s} * {stride * 2});
+  HVX_Vector* op = (HVX_Vector*)(out + {core_s} * {stride * 2});
+  HVX_Vector* t = (HVX_Vector*)(vslot + {core_s} * 512);
+  unsigned rt = (unsigned)(unsigned long)vtab;
+  for (int i = 0; i < {stride // 64}; i += 4) {{
+    for (int j = 0; j < 4; j++) {{
+      HVX_VectorPair w = Q6_Wuw_vzxt_Vuh(ip[i + j]);
+      HVX_Vector lo = Q6_V_lo_W(w), hi = Q6_V_hi_W(w);
+      Q6_vgather_ARMWw(t + j, rt, {VTAB_BYTES - 1}, Q6_W_vcombine_VV(Q6_Vw_vadd_VwVw(hi, hi), Q6_Vw_vadd_VwVw(lo, lo)));
+    }}
+    for (int j = 0; j < 4; j++) op[i + j] = t[j];
+  }}
+}}
+"""
+
 def emit(outdir, calls, bufs, inputs:list, output) -> dict:
   """calls/bufs from dsp_graph.capture; inputs: the graph's input Buffers in order, output: its output Buffer"""
   o = pathlib.Path(outdir)
@@ -34,6 +77,7 @@ def emit(outdir, calls, bufs, inputs:list, output) -> dict:
     if x.offset != 0 or x.nbytes != x.base.nbytes: raise ValueError("a graph input must be a whole buffer")
   missing = [n for n in [*in_ids, out_id] if n not in rid]
   if missing: raise ValueError(f"{len(missing)} graph input/output buffers are not used by any captured kernel")
+  r_id_to_reg = {n: id(r) for n, r in enumerate(regions)}
   blob, blob_off = bytearray(), {}
   for r in regions:
     if id(r) in written or id(r) in in_ids: continue
@@ -42,15 +86,35 @@ def emit(outdir, calls, bufs, inputs:list, output) -> dict:
 
   knames: dict[str, str] = {}
   thunks, cases = [], []
+  vg: dict[str, str|None] = {}  # src -> the vgather rewrite of its kernel, when every call of it looks its table up in a constant
+  vtabs: dict[tuple[int, int], int] = {}  # (region, byte offset) of a resident table -> its VTCM slot
+  if os.environ.get("DSP_V65_VGATHER", "0") != "0":
+    for name, src, ids, _, nthreads in calls:
+      if src in vg: continue
+      body = src.split("/* DSP boilerplate */")[0]
+      m = re.search(r"noinline\)\) void\s+(\w+)\(", body)
+      alt = vgather_kernel("kK", re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", "void kK(", body, count=1), nthreads) if m else None
+      same = [c for c in calls if c[1] == src]
+      const_table = all(len(c[2]) == 3 and id(base[c[2][2]]) in blob_off and c[4] == nthreads for c in same)
+      vg[src] = alt if alt and const_table else None
   for n, (name, src, ids, _, nthreads) in enumerate(calls):
     if src not in knames:
       kn = knames[src] = f"k{len(knames)}"
       body = src.split("/* DSP boilerplate */")[0]
       m = re.search(r"noinline\)\) void\s+(\w+)\(", body)
       if m is None: raise ValueError(f"no kernel function in {name}")
-      (o / f"{kn}.c").write_text(re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1))
+      text = re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1)
+      if vg.get(src): text = vg[src].replace("kK", kn)
+      (o / f"{kn}.c").write_text(text)
     args = ", ".join(f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids)
-    if nthreads:
+    if vg.get(src):
+      tb = ids[2]
+      slot = vtabs.setdefault((rid[id(base[tb])], views[tb].offset), len(vtabs))
+      if nthreads:
+        thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({args}, core, G_VTAB({slot}), G_VSLOT); }}")
+        cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} (vgather) */")
+      else: cases.append(f"  case {n}: {knames[src]}({args}, G_VTAB({slot}), G_VSLOT); break;  /* {name} (vgather) */")
+    elif nthreads:
       thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({args}, core); }}")
       cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
     else: cases.append(f"  case {n}: {knames[src]}({args}); break;  /* {name} */")
@@ -63,6 +127,11 @@ def emit(outdir, calls, bufs, inputs:list, output) -> dict:
        "static const int G_REG_BLOB[G_NREG] = {" + ", ".join(str(blob_off.get(id(r), -1)) for r in regions) + "};",
        "static const int G_IN_REG[G_NIN] = {" + ", ".join(str(rid[i]) for i in in_ids) + "};",
        "static const unsigned G_IN_BYTES[G_NIN] = {" + ", ".join(str(x.nbytes) for x in inputs) + "};",
+       *([f"#define G_NVTAB {len(vtabs)}", f"#define G_VTCM_BYTES ({len(vtabs)} * {VTAB_BYTES} + 4096)",
+          "static const int G_VTAB_BLOB[G_NVTAB] = {" + ", ".join(str(blob_off[r_id_to_reg[k[0]]] + k[1]) for k in vtabs) + "};",
+          "extern unsigned char* g_vtcm;", f"#define G_VTAB_BYTES {VTAB_BYTES}",
+          f"#define G_VTAB(s) (g_vtcm ? g_vtcm + (s) * {VTAB_BYTES} : 0)", f"#define G_VSLOT (g_vtcm ? g_vtcm + G_NVTAB * {VTAB_BYTES} : 0)"]
+         if vtabs else []),
        *[f"void {k}();" for k in knames.values()],
        "#ifndef G_PARALLEL\n#define G_PARALLEL(f, R, n) for (int _c = 0; _c < (n); _c++) f(R, _c)\n#endif",
        *thunks,
@@ -129,7 +198,7 @@ def run_qemu(outdir, xs:list[bytes], timeout:int=3600) -> bytes:
   from tinygrad.runtime import ops_dsp
   o = pathlib.Path(outdir)
   boiler = ops_dsp.mockdsp_boilerplate.replace("{{", "{").replace("}}", "}")
-  (o / "qemu_main.c").write_text(boiler + "\n" + QEMU_MAIN)
+  (o / "qemu_main.c").write_text(boiler + "\nunsigned char* g_vtcm = 0;  /* the vgather kernels take their scalar path here */\n" + QEMU_MAIN)
   objs = compile_kernels(o)
   libgcc = ops_dsp._find_libgcc()
   subprocess.run([_cc(), "-static", "-fuse-ld=lld", *_kernel_flags(), "-o", "graph_qemu.elf", "qemu_main.c", *objs,
