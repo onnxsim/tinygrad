@@ -477,7 +477,7 @@ class OnnxRunner:
     - Q(move(DQ(q))) with the same scale and zero point (the full-QDQ quantizer wraps even Reshape/Transpose) is move(q) on the
       integer tensor, and Q(DQ(q)) is q;
     - otherwise Q(f(src)), for a chain f of single-input value ops (Gelu, Relu, Sigmoid, Tanh, Div/Mul/Add/Sub by a scalar
-      constant, Cast) from a <= 16-bit integer source (DequantizeLinear of u8/u16, or a u8/u16 tensor itself, like the camera
+      or uniform constant, Cast) from a <= 16-bit integer source (DequantizeLinear of u8/u16, or a u8/u16 tensor itself, like the camera
       frame), is a table of f over all 256/65536 source values: computed once on the host (float32 dequantize, f in float64,
       round half to even, saturate), then one gather per element"""
     import numpy as np, math
@@ -509,7 +509,14 @@ class OnnxRunner:
         chain, t = [], node.inputs[0]
         while (n:=self._producers.get(t)) is not None and n.op in self._QDQ_VALUE:
           var = [x for x in n.inputs if x and not const(x)]
-          if len(var) != 1 or any(arr(x).size != 1 for x in n.inputs if x and const(x)): return None
+          if len(var) != 1: return None
+          # a constant operand is a scalar, or one value broadcast over the variable's shape (a per-channel mean constant whose
+          # channels all hold the same value) -- it must not widen the result
+          vshape = self.graph_values[var[0]].shape if isinstance(self.graph_values.get(var[0]), Tensor) else None
+          for x in (x for x in n.inputs if x and const(x)):
+            cv = arr(x)
+            if cv.size != 1 and (vshape is None or np.any(cv != cv.reshape(-1)[0]) or cv.ndim > len(vshape) or
+                                 any(d not in (1, v) for d, v in zip(cv.shape[::-1], vshape[::-1]))): return None
           if n.op in ("Div", "Sub") and n.inputs[0] != var[0]: return None  # c / x, c - x: keep it simple
           chain.append(n)
           t = var[0]
