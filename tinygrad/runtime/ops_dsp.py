@@ -224,6 +224,29 @@ def _lane_window(ctx, x:UOp) -> str|None:
   if (sl:=_lane_slice(x)) is None or not _loaded_unchanged(ctx, v:=sl[0], x): return None
   return f"(*(({ctx.render_type(x)}*)(({ctx.render_dtype(x.src[0].dtype)}*){ctx[v.src[0]]}+{sl[1][0]})))"
 
+def _lane_join(ctx, x:UOp) -> str|None:
+  # STACK of consecutive elements of memory that came in as several narrower loads of one buffer (a 128-lane u16 load split into two
+  # 64-lane halves, say), each element a lane of one of them: as a per-lane constructor of scalar reloads, clang builds the wide
+  # vector one word at a time (vinsert; 256 scalar loads for 128 u16 lanes). One unaligned wide load of the same memory instead
+  # (only if nothing stores to that buffer in between). DSP_V65_LANE_JOIN=0 turns it off
+  if not _v65_hw() or not getenv("DSP_V65_LANE_JOIN", 1) or len(x.src) < 2: return None
+  if not all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0].op is Ops.LOAD and len(s.src[0].src) == 1 for s in x.src): return None
+  loads = list(dict.fromkeys(s.src[0] for s in x.src))
+  # each load's address is SHRINK(buffer, start, size): the same buffer, starts a constant apart
+  if len(loads) < 2 or any(v.src[0].op is not Ops.SHRINK or len(v.src[0].src) != 3 or v.src[0].src[0] is not loads[0].src[0].src[0]
+                           for v in loads): return None
+  offs = {}
+  for v in loads:
+    d = (v.src[0].src[1] - loads[0].src[0].src[1]).simplify()
+    if d.op is not Ops.CONST: return None
+    offs[v] = int(d.arg)
+  lanes = [_lane(s.src[1]) for s in x.src]
+  if any(l is None for l in lanes): return None
+  pos = [offs[s.src[0]] + l for s, l in zip(x.src, lanes)]
+  if pos != list(range(pos[0], pos[0] + len(pos))) or not all(_loaded_unchanged(ctx, v, x) for v in loads): return None
+  first = x.src[0].src[0]
+  return f"(*(({ctx.render_type(x)}_u*)(({ctx.render_dtype(x.src[0].dtype)}*){ctx[first.src[0]]}+{lanes[0]})))"
+
 def _inline_vector_load(ctx, u:UOp) -> bool:
   # a vector load used once, later in the same loop body, with no store to its buffer in between: render it at the use. Loads
   # come out of the linearizer early (an HMX epilogue loads all 32 residual rows before the first store), and clang then
@@ -289,6 +312,7 @@ dsp_string = PatternMatcher([
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
   # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_join(ctx, x)),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
