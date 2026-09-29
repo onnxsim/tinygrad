@@ -79,9 +79,15 @@ def compile(onnx_file):
     # concatenated, flattened, in ONNX output order, so the capture still has exactly one output buffer
     # ALL_OUTPUTS=2 packs them as bytes instead: 1-byte integer outputs (an image queue) stay as they are, the rest are float32 --
     # casting a 2 MB uint8 frame queue to float was a 15 ms scalar kernel on the v65 DSP
+    # Each output goes to its own 128-byte aligned slice, one kernel per output: a single cat of them all was one per-byte gated
+    # kernel with div/mod indexing (still 14 ms), a slice write is a plain vectorized copy
     if getenv("ALL_OUTPUTS") == 2:
-      return Tensor.cat(*[(v if v.dtype in (dtypes.uint8, dtypes.int8) else v.cast('float32')).flatten().bitcast(dtypes.uint8)
-                          for v in outs.values()])
+      segs = [(v if v.dtype in (dtypes.uint8, dtypes.int8) else v.cast('float32')).flatten().bitcast(dtypes.uint8) for v in outs.values()]
+      segs = [x.pad((0, -x.shape[0] % 128)) for x in segs]
+      # (realized one by one: lazy slice assigns into one buffer fuse back into a single kernel)
+      out, at = Tensor.empty(sum(x.shape[0] for x in segs), dtype=dtypes.uint8).realize(), 0
+      for x in segs: out[at:at+x.shape[0]].assign(x).realize(); at += x.shape[0]
+      return out
     if getenv("ALL_OUTPUTS"): return Tensor.cat(*[v.cast('float32').flatten() for v in outs.values()])
     return next(iter(outs.values())).cast('float32')
   for i in range(3):

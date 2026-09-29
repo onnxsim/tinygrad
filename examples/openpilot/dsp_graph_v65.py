@@ -98,6 +98,7 @@ if __name__ == "__main__":
     #   input <onnx index> <onnx dtype> <bytes> <program slot, or -1 when no kernel reads it>
     #   output <onnx dtype of the returned tensor> <elements> <dims...>   the program's output is the ONNX outputs back to back:
     #     compile3 ALL_OUTPUTS=1 casts every one to FLOAT; ALL_OUTPUTS=2 (a uint8 program output) keeps UINT8/INT8 ones as they are
+    #     and starts each at a 128-byte aligned offset (then an `output_align 128` record comes first)
     #   name <call index> <kernel name>
     lines = [f"ncalls {info['calls']}", f"threads {max(1, getenv('DSP_THREADS', 1))}", f"output_bytes {info['output_bytes']}"]
     for i, vi in enumerate(model.graph.input):
@@ -106,10 +107,12 @@ if __name__ == "__main__":
     # one line per call: its kernel name, for the runner's per-call profile events
     lines += [f"name {i} {c[0]}" for i, c in enumerate(calls)]
     total, packed = 0, ref.dtype == np.uint8
+    if packed: lines.append("output_align 128")
     for vo in model.graph.output:
       dims = [d.dim_value or 1 for d in vo.type.tensor_type.shape.dim]
       dt = vo.type.tensor_type.elem_type if packed and vo.type.tensor_type.elem_type in (2, 3) else 1  # UINT8 / INT8, else FLOAT
       total += int(np.prod(dims)) * (1 if dt != 1 else 4); lines.append(f"output {dt} {int(np.prod(dims))} " + " ".join(map(str, dims)))
+      if packed: total += -total % 128
     if total != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} bytes) don't match the program output ({info['output_bytes']} bytes)")
     size = dsp_graph_v65.pack(out, args.artifact, lines)
     manifest = {"schema_version": 1,
