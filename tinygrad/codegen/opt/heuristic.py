@@ -179,7 +179,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # elsewhere, so ordering is unchanged)
         # v65 (upcast_max_bytes set): an upcast that makes a load a gather only costs -- float code there is scalar, and integer
         # vectors need unit stride. Such a kernel (a conv epilogue over 1350 pixels: only the channel axis divides) stays scalar
-        if is_dsp and max_bytes is not None and k.reduceop is None and gathers and getenv("DSP_V65_NO_GATHER_UPCAST", 1): continue
+        # (integer reductions too: they are HVX vector code; only the scalar float register blocking gains from such upcasts)
+        if is_dsp and max_bytes is not None and not dsp_scalar_float and gathers and getenv("DSP_V65_NO_GATHER_UPCAST", 1): continue
         xb_choices.append((gathers if vector_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if vector_dsp else 0,
                            axis, upcast_amount))
     if xb_choices:
