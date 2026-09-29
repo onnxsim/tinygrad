@@ -192,7 +192,10 @@ def requant_apply(terms, plan, device) -> Tensor:
     p = (part if flat else part.contiguous()).reshape(1, shape[1], -1) - ch(dc.astype(np.int32))
     r_ = ((((p >> 14) * ch(g)) + (((p & 16383) * ch(g)) >> 14)) << ch(l)) >> ch(r)
     total = r_ if total is None else total + r_
-  q = ((total + ch(plan["cq"])) >> plan["F"]).clip(0, plan["qmax"]).cast(dtypes.uint8 if plan["qmax"] == 255 else dtypes.uint16)
+  # saturate with SUB and MAX only, which HVX vectors natively (clip's upper bound is a compare + select, which the re-vectorizer leaves
+  # scalar): min(x, qmax) = qmax - max(qmax - x, 0)
+  x = ((total + ch(plan["cq"])) >> plan["F"]).maximum(0)
+  q = (plan["qmax"] - (plan["qmax"] - x).maximum(0)).cast(dtypes.uint8 if plan["qmax"] == 255 else dtypes.uint16)
   return q.reshape(shape)
 
 def qmatmul(a:Tensor, wq:np.ndarray, sw:np.ndarray, bias:Tensor|None=None) -> Tensor:
