@@ -67,7 +67,7 @@ def qconv2d(xq:Tensor, zx:int, sx:float, wq:np.ndarray, sw:np.ndarray, bias:Tens
         part = a.cast(dtypes.int32).conv2d(wt.cast(dtypes.int32), stride=stride, dilation=dilation).realize()
         term = part.cast(dtypes.float32) * float(1 << (ashift + wshift))
         acc = term if acc is None else acc + term
-  elif groups == C and Cg == 1 and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
+  elif groups == C and Cg == 1 and N == C and getenv("QDW_HVX", 1) and all(d == 1 for d in ((dilation,) if isinstance(dilation, int) else dilation)) and str(xq.device).startswith("DSP") and \
       C % max(1, getenv("DSP_THREADS", 1)) == 0 and wq.dtype in (np.int8, np.int16):
     # hand-written HVX kernel (nn/dw_v65.py): the padded image of a channel as one flat byte signal, vrmpy over 4 consecutive taps,
     # no channel-blocked layout copy. Same integer sums as the plain convolution (int32, exact), so the float terms below are
