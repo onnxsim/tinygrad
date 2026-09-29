@@ -243,7 +243,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       not any(_unit_stride(k, a) for a in k.axes_of(AxisType.UPCAST)):
     itemsize = max(b.src[0].dtype.itemsize for b in k.bufs)
     for axis in k.upcastable_dims[::-1]:
-      if not _unit_stride(k, axis): continue
+      # unit stride in every buffer that uses the axis (one strided buffer makes the vector a gather: DM's 345x3x64 kernels got slower)
+      rng = k.rngs[axis]
+      if not _unit_stride(k, axis) or any(rng in b.src[1].get_idx().backward_slice and
+                                          not any(c is rng for c in b.src[1].get_idx().split_uop(Ops.ADD)) for b in k.bufs): continue
       if (s:=next((s for s in (128, 64, 32, 16) if k.full_shape[axis] % s == 0 and s * k.upcast_size() * itemsize <= 1024), None)):
         k.apply_opt(Opt(OptOps.UPCAST, axis, s))
         break
