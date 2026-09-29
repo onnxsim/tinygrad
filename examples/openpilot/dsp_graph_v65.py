@@ -106,14 +106,24 @@ if __name__ == "__main__":
       lines.append(f"input {i} {vi.type.tensor_type.elem_type} {nbytes} {slot.get(vi.name, -1)}")
     # one line per call: its kernel name, for the runner's per-call profile events
     lines += [f"name {i} {c[0]}" for i, c in enumerate(calls)]
-    total, packed = 0, ref.dtype == np.uint8
+    total, packed, out_dtypes, out_bytes = 0, ref.dtype == np.uint8, [], []
     if packed: lines.append("output_align 128")
     for vo in model.graph.output:
       dims = [d.dim_value or 1 for d in vo.type.tensor_type.shape.dim]
       dt = vo.type.tensor_type.elem_type if packed and vo.type.tensor_type.elem_type in (2, 3) else 1  # UINT8 / INT8, else FLOAT
-      total += int(np.prod(dims)) * (1 if dt != 1 else 4); lines.append(f"output {dt} {int(np.prod(dims))} " + " ".join(map(str, dims)))
+      out_dtypes.append(dt); out_bytes.append(int(np.prod(dims)) * (1 if dt != 1 else 4))
+      total += out_bytes[-1]; lines.append(f"output {dt} {int(np.prod(dims))} " + " ".join(map(str, dims)))
       if packed: total += -total % 128
     if total != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} bytes) don't match the program output ({info['output_bytes']} bytes)")
+    # openpilot's recurrent state: output next_X is input X's next value. The runner keeps it resident between runs (a client
+    # sends X empty to use it), so the state queues -- 2 MB of frames for driving -- don't cross the transport every call
+    in_idx = {vi.name: i for i, vi in enumerate(model.graph.input)}
+    for k, vo in enumerate(model.graph.output):
+      if not vo.name.startswith("next_") or (i := in_idx.get(x := vo.name[5:])) is None or x not in inputs: continue
+      ti, to = model.graph.input[i].type.tensor_type, vo.type.tensor_type
+      # same shape, and same bytes as the runner receives them: the input's dtype must be the output's program dtype
+      if [d.dim_value for d in ti.shape.dim] == [d.dim_value for d in to.shape.dim] and inputs[x].nbytes() == out_bytes[k] and \
+          ti.elem_type == out_dtypes[k]: lines.append(f"state {k} {i}")
     size = dsp_graph_v65.pack(out, args.artifact, lines)
     manifest = {"schema_version": 1,
                 "compiler": {"name": "tinygrad-dsp_graph_v65", "version": "1", "id": "tinygrad-hexagon-v65"},
