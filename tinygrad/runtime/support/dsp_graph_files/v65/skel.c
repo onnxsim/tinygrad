@@ -194,7 +194,11 @@ static void graph_thread(void* p) {
   qurt_thread_exit(0);
 }
 
-int tg_graph_run(remote_handle64 h, int start, int count, int threads, const uint8* in, int inLen, uint8* out, int outLen,
+#ifndef G_NSTATE
+#define G_NSTATE 0
+static const int G_ST_IN[1] = {0}, G_ST_OFF[1] = {0}, G_ST_LEN[1] = {0};
+#endif
+int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags, const uint8* in, int inLen, uint8* out, int outLen,
                  uint64* t, int tLen) {
   if (!g_blob || g_blob_loaded != G_BLOB_BYTES) return AEE_EBADSTATE;
   if (start < 0 || count < 0 || start + count > G_NCALLS || tLen < 1) return AEE_EBADPARM;
@@ -204,6 +208,9 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, const uin
   if (start == 0 && inLen > 0) {
     int off = 0;
     for (int i = 0; i < G_NIN; i++) {
+      int skip = 0;
+      for (int k = 0; k < G_NSTATE; k++) if (G_ST_IN[k] == i && (flags >> k & 1)) skip = 1;
+      if (skip) continue;  /* on the DSP since the last run */
       if (off + (int)G_IN_BYTES[i] > inLen) return AEE_EBADPARM;
       memcpy(g_R[G_IN_REG[i]], in + off, G_IN_BYTES[i]);
       off += (G_IN_BYTES[i] + 127) & ~127u;
@@ -217,6 +224,20 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, const uin
   if (qurt_thread_create(&tid, &ta, graph_thread, &j)) return AEE_EFAILED;
   qurt_thread_join(tid, &st);
   if (j.rc) return AEE_EFAILED;
-  if (start + count == G_NCALLS && outLen > 0) memcpy(out, g_R[G_OUT_REG] + G_OUT_OFF, outLen < G_OUT_BYTES ? outLen : G_OUT_BYTES);
+  if (start + count == G_NCALLS) {
+    const unsigned char* o = g_R[G_OUT_REG] + G_OUT_OFF;
+    if (outLen > 0) {
+      /* the output without the state slices the caller left out; G_ST_OFF is ascending */
+      int at = 0, cur = 0;
+#define G_OUT_COPY(from, len) do { int n_ = (len); if (at + n_ > outLen) n_ = outLen - at; if (n_ > 0) { memcpy(out + at, o + (from), n_); at += n_; } } while (0)
+      for (int k = 0; k < G_NSTATE; k++) {
+        G_OUT_COPY(cur, G_ST_OFF[k] - cur);
+        if (!(flags >> (16 + k) & 1)) G_OUT_COPY(G_ST_OFF[k], G_ST_LEN[k]);
+        cur = G_ST_OFF[k] + G_ST_LEN[k];
+      }
+      G_OUT_COPY(cur, G_OUT_BYTES - cur);
+    }
+    for (int k = 0; k < G_NSTATE; k++) memcpy(g_R[G_IN_REG[G_ST_IN[k]]], o + G_ST_OFF[k], G_IN_BYTES[G_ST_IN[k]]);  /* loop the state back */
+  }
   return 0;
 }

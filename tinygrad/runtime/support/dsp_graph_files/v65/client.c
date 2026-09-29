@@ -26,7 +26,7 @@ static int run_graph(remote_handle64 h, int ncalls, int threads, int batch, cons
   if (batch <= 0) batch = ncalls;
   for (int s = 0; s < ncalls; s += batch) {
     int n = s + batch > ncalls ? ncalls - s : batch;
-    int rc = tg_graph_run(h, s, n, threads, s == 0 ? in : NULL, s == 0 ? nin : 0, s + n == ncalls ? out : NULL,
+    int rc = tg_graph_run(h, s, n, threads, 0, s == 0 ? in : NULL, s == 0 ? nin : 0, s + n == ncalls ? out : NULL,
                           s + n == ncalls ? nout : 0, t, prof ? 1 + n : 1);
     if (rc) { printf("run [%d, %d) failed %d (0x%x)\n", s, s + n, rc, rc); return rc; }
     if (prof) for (int i = 0; i < n && s + i < MAXCALLS; i++) g_call_us[s + i] += t[1 + i];
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
   int ncalls = 0;
   for (int lo = 1, hi = MAXCALLS; lo <= hi; ) {
     int mid = (lo + hi) / 2; unsigned long long t;
-    if (tg_graph_run(h, mid, 0, threads, NULL, 0, NULL, 0, &t, 1) == 0) ncalls = mid, lo = mid + 1; else hi = mid - 1;
+    if (tg_graph_run(h, mid, 0, threads, 0, NULL, 0, NULL, 0, &t, 1) == 0) ncalls = mid, lo = mid + 1; else hi = mid - 1;
   }
   printf("graph has %d calls\n", ncalls);
   memset(g_call_us, 0, sizeof g_call_us);

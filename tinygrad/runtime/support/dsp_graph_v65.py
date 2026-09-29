@@ -62,7 +62,7 @@ void {kn}(unsigned char* out, unsigned char* idx, unsigned char* tab{core_p}, un
 }}
 """
 
-def emit(outdir, calls, bufs, inputs:list, output) -> dict:
+def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict:
   """calls/bufs from dsp_graph.capture; inputs: the graph's input Buffers in order, output: its output Buffer"""
   o = pathlib.Path(outdir)
   o.mkdir(parents=True, exist_ok=True)
@@ -132,6 +132,12 @@ def emit(outdir, calls, bufs, inputs:list, output) -> dict:
           "extern unsigned char* g_vtcm;", f"#define G_VTAB_BYTES {VTAB_BYTES}",
           f"#define G_VTAB(s) (g_vtcm ? g_vtcm + (s) * {VTAB_BYTES} : 0)", f"#define G_VSLOT (g_vtcm ? g_vtcm + G_NVTAB * {VTAB_BYTES} : 0)"]
          if vtabs else []),
+       # recurrent state kept on the DSP: (input index, offset of the output slice that feeds it, the slice's padded length), ascending
+       # by offset; tg_graph_run loops each slice back into its input region after every run (see tg_graph.idl `flags`)
+       *([f"#define G_NSTATE {len(state)}",
+          "static const int G_ST_IN[G_NSTATE] = {" + ", ".join(str(x[0]) for x in state) + "};",
+          "static const int G_ST_OFF[G_NSTATE] = {" + ", ".join(str(x[1]) for x in state) + "};",
+          "static const int G_ST_LEN[G_NSTATE] = {" + ", ".join(str(x[2]) for x in state) + "};"] if state else []),
        *[f"void {k}();" for k in knames.values()],
        *([f"#define G_PERF_VOTE {int(os.environ['DSP_V65_PERF_VOTE'])}"] if int(os.environ.get("DSP_V65_PERF_VOTE", "0")) else []),
        "#ifndef G_PARALLEL\n#define G_PARALLEL(f, R, n) for (int _c = 0; _c < (n); _c++) f(R, _c)\n#endif",

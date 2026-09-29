@@ -56,7 +56,30 @@ if __name__ == "__main__":
   unused = [k for k, t in inputs.items() if id(t.uop.buffer.base) not in used]
   if unused: print(f"inputs no kernel reads (left out of the program): {unused}")
   inputs = {k: t for k, t in inputs.items() if k not in unused}
-  info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for t in inputs.values()], res[0].uop.buffer)
+  # openpilot's recurrent state: output next_X is input X's next value. The program keeps it on the DSP (each run loops the slice back
+  # into X's region), so the caller sends it once and leaves it out of the transfer after that. (output index, ONNX input index, slot,
+  # byte offset in the program's output, padded length); ascending by offset, which is the order of the ONNX outputs
+  state_pairs: list[tuple[int, int, int, int, int]] = []
+  if args.onnx:
+    import onnx
+    onnx_model = onnx.load(args.onnx, load_external_data=False)
+    packed_out, at = ref.dtype == np.uint8, 0
+    in_idx = {vi.name: i for i, vi in enumerate(onnx_model.graph.input)}
+    slot_of = {name: i for i, name in enumerate(inputs)}
+    for k, vo in enumerate(onnx_model.graph.output):
+      to = vo.type.tensor_type
+      dt = to.elem_type if packed_out and to.elem_type in (2, 3) else 1  # UINT8 / INT8 as they are, the rest FLOAT
+      nbytes = int(np.prod([d.dim_value or 1 for d in to.shape.dim])) * (1 if dt != 1 else 4)
+      padded = nbytes + (-nbytes % 128 if packed_out else 0)
+      x = vo.name[5:]
+      if vo.name.startswith("next_") and x in in_idx and x in slot_of:
+        ti = onnx_model.graph.input[in_idx[x]].type.tensor_type
+        if [d.dim_value for d in ti.shape.dim] == [d.dim_value for d in to.shape.dim] and inputs[x].nbytes() == nbytes and \
+            ti.elem_type == dt:
+          state_pairs.append((k, in_idx[x], slot_of[x], at, padded))
+      at += padded
+  info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for t in inputs.values()], res[0].uop.buffer,
+                            state=[(sl, off, ln) for _, _, sl, off, ln in state_pairs])
   xs = [t.numpy().tobytes() for t in inputs.values()]
   dsp_graph_v65.write_case(out, xs, ref.tobytes())
   info |= {"inputs": list(inputs), "output_shape": list(ref.shape), "seed": args.seed, "pickle": str(pathlib.Path(args.pickle).resolve())}
@@ -115,15 +138,8 @@ if __name__ == "__main__":
       total += out_bytes[-1]; lines.append(f"output {dt} {int(np.prod(dims))} " + " ".join(map(str, dims)))
       if packed: total += -total % 128
     if total != info["output_bytes"]: raise ValueError(f"ONNX outputs ({total} bytes) don't match the program output ({info['output_bytes']} bytes)")
-    # openpilot's recurrent state: output next_X is input X's next value. The runner keeps it resident between runs (a client
-    # sends X empty to use it), so the state queues -- 2 MB of frames for driving -- don't cross the transport every call
-    in_idx = {vi.name: i for i, vi in enumerate(model.graph.input)}
-    for k, vo in enumerate(model.graph.output):
-      if not vo.name.startswith("next_") or (i := in_idx.get(x := vo.name[5:])) is None or x not in inputs: continue
-      ti, to = model.graph.input[i].type.tensor_type, vo.type.tensor_type
-      # same shape, and same bytes as the runner receives them: the input's dtype must be the output's program dtype
-      if [d.dim_value for d in ti.shape.dim] == [d.dim_value for d in to.shape.dim] and inputs[x].nbytes() == out_bytes[k] and \
-          ti.elem_type == out_dtypes[k]: lines.append(f"state {k} {i}")
+    # recurrent state (see state_pairs above): the runner passes flags telling the skel which state is already on the DSP
+    lines += [f"state {k} {i}" for k, i, _, _, _ in state_pairs]
     size = dsp_graph_v65.pack(out, args.artifact, lines)
     manifest = {"schema_version": 1,
                 "compiler": {"name": "tinygrad-dsp_graph_v65", "version": "1", "id": "tinygrad-hexagon-v65"},
