@@ -216,6 +216,28 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   if not all(isinstance(l, int) for l in lanes) or lanes != list(range(lanes[0], lanes[0]+len(lanes))): return None
   return v, lanes
 
+def _lane_concat(x:UOp) -> list[UOp]|None:
+  # STACK(a[0..n-1], b[0..n-1], ...) of whole equal-width vectors one after another (memory_coalescing loads a 128-lane int32 row as
+  # two 64-lane vectors) -> [a, b, ...]
+  n = len(x.src)
+  if n < 4 or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in x.src): return None
+  vs, w = [], x.src[0].src[0]._shape
+  if w is None or len(w) != 1 or n % w[0] != 0 or (n // w[0]) & (n // w[0] - 1) or n // w[0] < 2: return None
+  for i in range(n // w[0]):
+    chunk = x.src[i*w[0]:(i+1)*w[0]]
+    if any(s.src[0] is not chunk[0].src[0] for s in chunk) or chunk[0].src[0]._shape != w: return None
+    if [_lane(s.src[1]) for s in chunk] != list(range(w[0])): return None
+    vs.append(chunk[0].src[0])
+  return vs
+
+def _render_lane_concat(ctx, x:UOp) -> str|None:
+  if (vs:=_lane_concat(x)) is None: return None
+  parts, w = [ctx[v] for v in vs], vs[0]._shape[0]
+  while len(parts) > 1:  # pairwise: shufflevector takes two vectors of the same width
+    parts = [f"__builtin_shufflevector({parts[i]}, {parts[i+1]}, {','.join(str(l) for l in range(2*w))})" for i in range(0, len(parts), 2)]
+    w *= 2
+  return f"(({ctx.render_type(x)}){parts[0]})"
+
 # NOTE: this just increases readability of the generated code
 def _lane_window(ctx, x:UOp) -> str|None:
   # a window of a loaded vector (an HMX epilogue's 32-lane rows of the 128-lane accumulator-array vectors): read it again from
@@ -313,6 +335,7 @@ dsp_string = PatternMatcher([
   # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_join(ctx, x)),
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _render_lane_concat(ctx, x) if getenv("DSP_LANE_CONCAT", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one

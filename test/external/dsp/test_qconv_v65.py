@@ -3,7 +3,7 @@ import os, unittest, itertools
 import numpy as np
 from tinygrad import Tensor
 from tinygrad.helpers import Context, getenv
-from tinygrad.nn.qconv_v65 import qconv2d, qmatmul
+from tinygrad.nn.qconv_v65 import qconv2d, qmatmul, LAST_REQUANT
 
 def ref(xq, zx, sx, wq, sw, b, stride, pad, groups):
   x, w = (xq.astype(np.float64) - zx) * sx, wq.astype(np.float64) * sw.reshape(-1, 1, 1, 1)
@@ -52,6 +52,31 @@ class TestQConvV65(unittest.TestCase):
         # (under these default settings the float epilogue is HVX qfloat code whose rounding depends on what is fused with it: a few
         # ulps of the largest output; the v65 settings, DSP_V65_HW=1, give the same bits -- checked on the models)
         np.testing.assert_allclose(outs[0], outs[1], rtol=0, atol=4e-7 * np.abs(outs[0]).max())
+
+  def test_requant_fixed_point_within_bound(self):
+    # the conv followed by QuantizeLinear as int32 fixed point (ONNX_QDQ_REQUANT): |q - (conv/sy + zy)| stays within the plan's bound
+    # (multiplier rounding, truncations, final rounding), and the saturated ends stay saturated
+    rng = np.random.default_rng(3)
+    cases = [("1x1", 192, 64, 1, 1, 0, 1, (16, 32)), ("3x3", 64, 64, 3, 1, 1, 1, (16, 32)), ("stem s2 C=6", 6, 16, 3, 2, 1, 1, (32, 64)),
+             ("depthwise 7x7", 64, 64, 7, 1, 3, 64, (16, 32)), ("depthwise 3x3", 64, 64, 3, 1, 1, 64, (16, 32))]
+    for (name, C, N, k, s, p, g, (H, W)), (xb, wb) in itertools.product(cases, [(8, 8), (16, 8), (16, 16)]):
+      with self.subTest(name=name, bits=f"W{wb}A{xb}"):
+        xdt, wdt = (np.uint8, 255) if xb == 8 else (np.uint16, 65535), (np.int8, 127) if wb == 8 else (np.int16, 32767)
+        xq = rng.integers(0, xdt[1] + 1, (1, C, H, W)).astype(xdt[0])
+        zx = int(rng.integers(0, xdt[1]))
+        wq = rng.integers(-wdt[1], wdt[1] + 1, (N, C // g, k, k)).astype(wdt[0])
+        sx, sw, b = 0.01, rng.uniform(1e-4, 1e-3, N).astype(np.float32), rng.normal(size=N).astype(np.float32)
+        r = ref(xq, zx, sx, wq, sw, b, s, p, g)
+        qmax = 255 if xb == 8 else 65535
+        sy, zy = float(r.std() * 8 / (qmax / 2)), qmax // 2  # the outputs spread over most of the range, a few saturate
+        with Context(TC_OPT=1):
+          y = qconv2d(Tensor(xq, device="DSP"), zx, sx, wq, sw, Tensor(b, device="DSP"), stride=s, padding=(p, p, p, p), groups=g,
+                      out_q=(sy, zy, qmax, b)).numpy()
+        self.assertEqual(y.dtype, np.uint8 if xb == 8 else np.uint16)
+        real = np.clip(r / sy + zy, 0, qmax)
+        bound = LAST_REQUANT["bound"].reshape(1, -1, 1, 1)
+        err = np.abs(y.astype(np.float64) - real)
+        self.assertTrue((err <= bound + 1e-9).all(), f"max error {err.max():.3f} vs bound {bound.max():.3f}")
 
   def test_qmatmul_gemv(self):
     # a float head's GEMV: the activation is quantized to uint16 at run time (per tensor, over its [min, max]), the one
