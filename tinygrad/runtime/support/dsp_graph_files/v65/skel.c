@@ -13,6 +13,10 @@ extern unsigned long long HAP_perf_get_time_us(void);
 static void g_parallel(void (*f)(unsigned char**, int), unsigned char** R, int n);
 #define G_PARALLEL(f, R, n) g_parallel(f, R, n)
 #include "graph.h"
+#ifndef G_NSTATE
+#define G_NSTATE 0
+static const int G_ST_IN[1] = {0}, G_ST_OFF[1] = {0}, G_ST_LEN[1] = {0};
+#endif
 
 static unsigned char* g_blob;
 #ifdef G_VTCM_BYTES
@@ -174,7 +178,27 @@ static int regions(void) {
   return 0;
 }
 
-typedef struct { int start, count, threads, rc; uint64* t; int tLen; } job_t;
+/* Copy on the graph thread (it holds the HVX lock): 128-byte vector loads and stores with a prefetch ahead. The libc memcpy ran at
+ * about 1 GB/s here (the 2.2 MB state loop-back took 2.45 ms). Sources may be unaligned, destinations are region bases. */
+typedef unsigned char g_v128 __attribute__((vector_size(128), aligned(128)));
+typedef unsigned char g_v128u __attribute__((vector_size(128), aligned(1)));
+static void g_copy(unsigned char* d, const unsigned char* s, size_t n) {
+  size_t i = 0;
+  if (((uintptr_t)d & 127) == 0) {
+    for (; i + 512 <= n; i += 512) {
+      __builtin_HEXAGON_Y2_dcfetch((char*)s + i + 1024);
+      __builtin_HEXAGON_Y2_dcfetch((char*)s + i + 1152);
+      __builtin_HEXAGON_Y2_dcfetch((char*)s + i + 1280);
+      __builtin_HEXAGON_Y2_dcfetch((char*)s + i + 1408);
+      g_v128 a = *(const g_v128u*)(s + i), b = *(const g_v128u*)(s + i + 128), c = *(const g_v128u*)(s + i + 256), e = *(const g_v128u*)(s + i + 384);
+      *(g_v128*)(d + i) = a, *(g_v128*)(d + i + 128) = b, *(g_v128*)(d + i + 256) = c, *(g_v128*)(d + i + 384) = e;
+    }
+    for (; i + 128 <= n; i += 128) *(g_v128*)(d + i) = *(const g_v128u*)(s + i);
+  }
+  if (i < n) memcpy(d + i, s + i, n - i);
+}
+
+typedef struct { int start, count, threads, rc; uint64* t; int tLen; int flags; const uint8* in; int inLen; } job_t;
 #define GRAPH_STACK (256 * 1024)
 static char g_gstack[GRAPH_STACK] __attribute__((aligned(128)));
 
@@ -182,6 +206,17 @@ static void graph_thread(void* p) {
   job_t* j = (job_t*)p;
   qurt_hvx_lock(QURT_HVX_MODE_128B);
   j->rc = pool_start(j->threads);
+  if (j->rc == 0 && j->start == 0 && j->inLen > 0) {
+    int off = 0;
+    for (int i = 0; i < G_NIN; i++) {
+      int skip = 0;
+      for (int k = 0; k < G_NSTATE; k++) if (G_ST_IN[k] == i && (j->flags >> k & 1)) skip = 1;
+      if (skip) continue;  /* on the DSP since the last run */
+      if (off + (int)G_IN_BYTES[i] > j->inLen) { j->rc = AEE_EBADPARM; break; }
+      g_copy(g_R[G_IN_REG[i]], j->in + off, G_IN_BYTES[i]);
+      off += (G_IN_BYTES[i] + 127) & ~127u;
+    }
+  }
   if (j->rc == 0) {
     unsigned long long t0 = HAP_perf_get_time_us(), last = t0;
     for (int i = 0; i < j->count; i++) {
@@ -189,15 +224,13 @@ static void graph_thread(void* p) {
       if (1 + i < j->tLen) { unsigned long long now = HAP_perf_get_time_us(); j->t[1 + i] = now - last; last = now; }
     }
     j->t[0] = HAP_perf_get_time_us() - t0;
+    if (j->start + j->count == G_NCALLS)
+      for (int k = 0; k < G_NSTATE; k++) g_copy(g_R[G_IN_REG[G_ST_IN[k]]], g_R[G_OUT_REG] + G_OUT_OFF + G_ST_OFF[k], G_IN_BYTES[G_ST_IN[k]]);  /* state loop-back */
   }
   qurt_hvx_unlock();
   qurt_thread_exit(0);
 }
 
-#ifndef G_NSTATE
-#define G_NSTATE 0
-static const int G_ST_IN[1] = {0}, G_ST_OFF[1] = {0}, G_ST_LEN[1] = {0};
-#endif
 int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags, const uint8* in, int inLen, uint8* out, int outLen,
                  uint64* t, int tLen) {
   if (!g_blob || g_blob_loaded != G_BLOB_BYTES) return AEE_EBADSTATE;
@@ -205,18 +238,7 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags
   if (regions()) return AEE_ENOMEMORY;
   G_VTCM_SETUP();
   memset(t, 0, tLen * sizeof(uint64));
-  if (start == 0 && inLen > 0) {
-    int off = 0;
-    for (int i = 0; i < G_NIN; i++) {
-      int skip = 0;
-      for (int k = 0; k < G_NSTATE; k++) if (G_ST_IN[k] == i && (flags >> k & 1)) skip = 1;
-      if (skip) continue;  /* on the DSP since the last run */
-      if (off + (int)G_IN_BYTES[i] > inLen) return AEE_EBADPARM;
-      memcpy(g_R[G_IN_REG[i]], in + off, G_IN_BYTES[i]);
-      off += (G_IN_BYTES[i] + 127) & ~127u;
-    }
-  }
-  job_t j = {start, count, threads, 0, t, tLen};
+  job_t j = {start, count, threads, 0, t, tLen, flags, in, inLen};
   qurt_thread_attr_t ta; qurt_thread_attr_init(&ta);
   qurt_thread_attr_set_stack_addr(&ta, g_gstack); qurt_thread_attr_set_stack_size(&ta, GRAPH_STACK);
   qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
@@ -237,7 +259,6 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags
       }
       G_OUT_COPY(cur, G_OUT_BYTES - cur);
     }
-    for (int k = 0; k < G_NSTATE; k++) memcpy(g_R[G_IN_REG[G_ST_IN[k]]], o + G_ST_OFF[k], G_IN_BYTES[G_ST_IN[k]]);  /* loop the state back */
   }
   return 0;
 }
