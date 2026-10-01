@@ -4,6 +4,7 @@ if "JIT_BATCH_SIZE" not in os.environ: os.environ["JIT_BATCH_SIZE"] = "0"
 
 from tinygrad import fetch, Tensor, TinyJit, Context, GlobalCounters, Device, dtypes
 from tinygrad.helpers import DEBUG, getenv
+from tinygrad.dtype import _to_np_dtype
 from tinygrad.uop.ops import Ops
 from tinygrad.nn.onnx import OnnxRunner
 
@@ -56,20 +57,50 @@ def compile(onnx_file):
   Tensor.manual_seed(100)
   # replace symbolic dimensions (e.g. 'b' for dynamic batch) with 1
   input_shapes = {k:tuple(s if isinstance(s, int) else 1 for s in shp) for k,shp in input_shapes.items()}
-  inputs = {k:Tensor(Tensor.randn(*shp, dtype=input_types[k]).mul(8).realize().numpy(), device='NPY') for k,shp in sorted(input_shapes.items())}
-  if not getenv("NPY_IMG"):
+  rng = np.random.default_rng(100)
+  def make_input(shp, dt):
+    # generate on the host: uint8 camera frames (newer openpilot models) take random bytes, and on DEV=DSP the
+    # threefry kernel behind Tensor.randn needs libgcc's 64-bit division
+    if dtypes.is_int(dt): return rng.integers(0, 256, shp).astype(_to_np_dtype(dt))
+    return (rng.standard_normal(shp) * 8).astype(_to_np_dtype(dt))
+  inputs = {k:Tensor(make_input(shp, input_types[k]), device='NPY') for k,shp in sorted(input_shapes.items())}
+  if getenv("DSP_ALL_INPUTS"):
+    # Capture every ONNX input as a runtime DSP parameter. Without this, the non-image NPY
+    # tensors are treated as capture-time constants and cannot be supplied by a phone runner.
+    inputs = {k:Tensor(v.numpy(), device=Device.DEFAULT).realize() for k,v in inputs.items()}
+  elif not getenv("NPY_IMG"):
     inputs = {k:Tensor(v.numpy(), device=Device.DEFAULT).realize() if 'img' in k else v for k,v in inputs.items()}
   print("created tensors")
 
   @TinyJit(prune=True)
-  def run_onnx_jit(**kwargs): return next(iter(run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()}).values())).cast('float32')
+  def run_onnx_jit(**kwargs):
+    outs = run_onnx({k:v.to(Device.DEFAULT) for k,v in kwargs.items()})
+    # ALL_OUTPUTS=1 keeps recurrent-state outputs (e.g. next_state_*_q) as part of the graph: they are
+    # concatenated, flattened, in ONNX output order, so the capture still has exactly one output buffer
+    # ALL_OUTPUTS=2 packs them as bytes instead: 1-byte integer outputs (an image queue) stay as they are, the rest are float32 --
+    # casting a 2 MB uint8 frame queue to float was a 15 ms scalar kernel on the v65 DSP
+    # Each output goes to its own 128-byte aligned slice, one kernel per output: a single cat of them all was one per-byte gated
+    # kernel with div/mod indexing (still 14 ms), a slice write is a plain vectorized copy
+    if getenv("ALL_OUTPUTS") == 2:
+      segs = [(v if v.dtype in (dtypes.uint8, dtypes.int8) else v.cast('float32')).flatten().bitcast(dtypes.uint8) for v in outs.values()]
+      segs = [x.pad((0, -x.shape[0] % 128)) for x in segs]
+      # (assigns into slices of a realized buffer, realized together: a lazy setitem chain fused back into one kernel, and
+      # realizing the slices one by one recomputed the intermediates they share)
+      out, at, writes = Tensor.empty(sum(x.shape[0] for x in segs), dtype=dtypes.uint8).realize(), 0, []
+      for x in segs: writes.append(out[at:at+x.shape[0]].assign(x)); at += x.shape[0]
+      Tensor.realize(*writes)
+      return out
+    if getenv("ALL_OUTPUTS"): return Tensor.cat(*[v.cast('float32').flatten() for v in outs.values()])
+    return next(iter(outs.values())).cast('float32')
   for i in range(3):
     GlobalCounters.reset()
     print(f"run {i}")
+    st = time.perf_counter()
     with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1), OPENPILOT_HACKS=1):
       ret = run_onnx_jit(**inputs).numpy()
     # copy i == 1 so use of JITBEAM is okay
     if i == 1: test_val = np.copy(ret)
+    print(f"timing: run {i} {time.perf_counter()-st:.1f} s")
   # iterate kernel CALLs in the captured LINEAR UOp; toposort descends into batched graph CUSTOM_FUNCTIONs
   kernel_asts = {Ops.PROGRAM}
   kernel_calls = [u for u in run_onnx_jit.captured.linear.toposort(gate=lambda x: x.op not in kernel_asts)
@@ -99,6 +130,8 @@ def compile(onnx_file):
     assert gated_read_image_count == allowed_gated_read_image, f"different gated read_image! {gated_read_image_count=}, {allowed_gated_read_image=}"
 
   with open(OUTPUT, "wb") as f: dump_pickle(run_onnx_jit, f)
+  # the inputs by name: a 1-D input's size is not recorded in the capture, so exporters (dsp_graph_v65.py) read them from here
+  np.savez(OUTPUT.rsplit(".", 1)[0] + "_inputs.npz", **{k: v.numpy() for k, v in inputs.items()})
   mdl_sz = os.path.getsize(onnx_file)
   pkl_sz = os.path.getsize(OUTPUT)
   print(f"mdl size is {mdl_sz/1e6:.2f}M")
@@ -109,9 +142,9 @@ def compile(onnx_file):
 def test_vs_compile(run, inputs, test_val=None):
   if (log:=bool(getenv("BENCHMARK_LOG", ""))): from extra.bench_log import WallTimeEvent, BenchEvent
 
-  # run 20 times
+  # run BENCH_RUNS (20) times
   step_times = []
-  for _ in range(20):
+  for _ in range(getenv("BENCH_RUNS", 20)):
     st = time.perf_counter()
     if log:
       with WallTimeEvent(BenchEvent.STEP):
@@ -179,6 +212,8 @@ if __name__ == "__main__":
 
     with open(OUTPUT, "rb") as f: pickle_loaded = load_pickle(f)
 
-    test_vs_compile(pickle_loaded, inputs, outputs)
+    # COMPILE3_SKIP_SELFTEST=1: the benchmark and doubled-input runs execute the whole model again (under qemu, a minute each for a
+    # float model); an exporter that replays the pickle against its own reference (dsp_graph_v65.py) doesn't need them
+    if not getenv("COMPILE3_SKIP_SELFTEST"): test_vs_compile(pickle_loaded, inputs, outputs)
     if getenv("SELFTEST"):
       test_vs_onnx(inputs, outputs, onnx_file, 1e-4)

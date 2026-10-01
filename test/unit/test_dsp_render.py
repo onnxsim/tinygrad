@@ -1,6 +1,7 @@
 import unittest
+import numpy as np
 from tinygrad import Tensor, dtypes
-from tinygrad.helpers import Target, Context
+from tinygrad.helpers import Target, Context, getenv
 from tinygrad.codegen import to_program
 from tinygrad.runtime import ops_dsp
 from tinygrad.runtime.ops_dsp import MockDSPRenderer
@@ -48,6 +49,49 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source(Tensor.empty(4096, dtype=dtypes.int32) + Tensor.empty(4096, dtype=dtypes.int32))
     self.assertRegex(src, r"\*\(\(int128\*\)\(\(data1_4096\+alu0\)\)\)\)\+\(")  # one int128 + int128 (loads rendered inline)
     self.assertNotIn("val0[1]", src)  # no per-lane constructor
+
+  def test_float_depthwise_conv_upcast_fits_hvx_vector(self):
+    # v65 has 128-byte HVX vectors. A 64-lane f32 upcast creates an invalid 256-byte vector and
+    # miscomputes depthwise Conv; the heuristic must cap this reduction at 32 f32 lanes.
+    x = Tensor.empty(1, 64, 64, 128)
+    w = Tensor.empty(64, 1, 3, 3, dtype=dtypes.float16)
+    b = Tensor.empty(64, dtype=dtypes.float16)
+    with Context(DSP_V65_HW=1): src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
+    self.assertNotIn("float64", src)
+    self.assertNotIn("float128", src)
+
+  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
+  def test_float_depthwise_conv_matches_cpu(self):
+    rng = np.random.default_rng(7)
+    x = rng.normal(0, 2, (1, 64, 64, 128)).astype(np.float32)
+    w = rng.normal(0, 0.15, (64, 1, 3, 3)).astype(np.float16)
+    b = rng.normal(0, 0.15, (64,)).astype(np.float16)
+    with Context(PARALLEL=0, DSP_V65_HW=1):
+      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP"),
+                                             stride=2, groups=64, padding=1).numpy()
+      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU"),
+                                             stride=2, groups=64, padding=1).numpy()
+    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
+
+  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
+  def test_float_1x1_conv_matches_cpu(self):
+    rng = np.random.default_rng(123)
+    x = rng.normal(size=(1, 64, 32, 64)).astype(np.float32)
+    w = rng.normal(size=(64, 64, 1, 1)).astype(np.float16)
+    b = rng.normal(size=(64,)).astype(np.float16)
+    with Context(PARALLEL=0, DSP_V65_HW=1):
+      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP")).numpy()
+      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU")).numpy()
+    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
+
+class TestDSPHalf(unittest.TestCase):
+  # __fp16 is storage-only on Hexagon and clang miscompiles it (vector converts become uitofp of the bits), so half is
+  # emulated: fp16 bits in memory, float32 math, no __fp16 anywhere in the kernel source
+  def test_half_is_emulated(self):
+    x = Tensor.empty(256, dtype=dtypes.half)
+    with Context(DSP_V65_HW=1): src = dsp_source((x.sigmoid() * x).cast(dtypes.half))
+    self.assertNotIn("__fp16", src)
+    self.assertIn("float", src)
 
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
