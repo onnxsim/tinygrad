@@ -70,6 +70,8 @@ def data_srcs(op:Ops, src:tuple[UOp, ...]) -> tuple[UOp, ...]:
   if op in {Ops.PARAM, Ops.BUFFER, Ops.RANGE, Ops.SPECIAL}: return ()
   # the store of a bound Variable only carries the input value, it has no data srcs
   if op is Ops.STORE and src[0].is_variable: return ()
+  # INDEX(buffer, idx...): the buffer is addressed, not computed per output element; the index args are the data
+  if op is Ops.INDEX: return src[1:]
   if op in GroupOp.Movement|{Ops.INDEX, Ops.STAGE, Ops.REDUCE, Ops.AFTER, Ops.END}: return src[:1]
   return src
 
@@ -80,8 +82,9 @@ def create_bufferize_and_index_srcs(ctx:IndexingContext, x:UOp) -> list[UOp]:
   for i, s in enumerate(x.src):
     new_src = s
     src_rngs = broadcast_rngs(x, s, ctx.range_map[x][0]) if x in ctx.range_map else ()
+    if x.op is Ops.INDEX and i == 0: continue   # the addressed buffer is used as is
     if s.op in {Ops.PARAM, Ops.BUFFER, Ops.MSTACK, Ops.MSELECT, Ops.AFTER}:
-      if x in ctx.range_map and i < data_src_count: new_src = new_src.index(*src_rngs)
+      if x in ctx.range_map and (i >= 1 if x.op is Ops.INDEX else i < data_src_count): new_src = new_src.index(*src_rngs)
     elif s in ctx.realize_map:
       realized_ranges = ctx.realize_map[s]
       assert isinstance(realized_ranges, list), "realize map must contain range list"
