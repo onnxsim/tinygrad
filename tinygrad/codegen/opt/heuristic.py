@@ -2,6 +2,7 @@ import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.dtype import dtypes
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
@@ -31,6 +32,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
     2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
   """
+  # under MOCKDSP (v65, no fp16 vector hardware), half-precision vector arithmetic is miscompiled by clang's v65 backend:
+  # keep half kernels scalar (no upcast, no tensor core) so the mock only ever sees scalar fp16 ops, which the
+  # fp16 helpers cover. The device path (real v69 codegen) is unchanged.
+  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and \
+     any(b.dtype == dtypes.half for b in k.bufs):
+    return k
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
   if USE_TC > 0 and (len(k.axes_of(AxisType.GROUP_REDUCE, AxisType.REDUCE)) == 1 or (TC_OPT.value >= 1)):
     for axis in range(3):
