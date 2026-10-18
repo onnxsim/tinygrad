@@ -2265,7 +2265,7 @@ class DSPCompiler(Compiler):
     with tempfile.NamedTemporaryFile(delete=True) as f:
       # -Wno-unused-variable: _splat_of_loaded_lane re-reads a splatted lane as a scalar, which can leave the vector load it
       # replaced declared but unused (dead at -O2, but -Werror rejects the kernel)
-      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -Wno-unused-variable -fno-stack-protector -x c -fPIC " +
+      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -Wno-unused-variable -Wno-unused-function -fno-stack-protector -x c -fPIC " +
              f"-ffreestanding -nostdlib - -o {f.name}" + (f" -x none {self.libgcc}" if self.libgcc else ""), input=src.encode())
       return pathlib.Path(f.name).read_bytes()
 
