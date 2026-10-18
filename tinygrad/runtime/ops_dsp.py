@@ -275,6 +275,11 @@ dsp_string = PatternMatcher([
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})({ctx[x.src[0]]}))"
    if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
   # vector casts must convert per lane; a C cast between ext_vector_types is a bitcast
+  # under MOCKDSP, fp16 vector casts convert lane by lane through the scalar casts (the v65 backend miscompiles the vector
+  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: (lambda src, dst, n: f"({{ {ctx.render_type(x)} _r; __typeof__({ctx[x.src[0]]}) _s = {ctx[x.src[0]]}; "
+     f"for (int _i = 0; _i < {n}; _i++) _r[_i] = ({ctx.render_dtype(x.dtype)})(_s[_i]); _r; }})")(None, None, x.max_numel())
+   if getenv("MOCKDSP") and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})"
    if x.max_numel() > 1 else None),
   # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a
@@ -2199,6 +2204,38 @@ def _find_libgcc() -> str:
     if candidate.exists(): return str(candidate)
   return ""
 
+# fp16 conversions for the MOCKDSP link: v65 has no fp16 instructions, so clang lowers _Float16 casts to libgcc calls that the
+# freestanding link (-nostdlib) doesn't have. The helpers are compiled into the kernel only when it uses them, and only under
+# the mock (the device links libgcc, which has them on the real arch). Round to nearest even, like the hardware conversions.
+_FP16_HELPERS = r"""
+float __extendhfsf2(unsigned short h) {
+  unsigned int s = (h >> 15) & 1u, e = (h >> 10) & 31u, f = h & 1023u, u;
+  if (e == 0) {
+    if (f == 0) u = s << 31;
+    else { int k = 0; while (!(f & 0x400u)) { f <<= 1; k++; } f &= 0x3ffu; u = (s << 31) | ((unsigned)(113 - k) << 23) | (f << 13); }
+  } else if (e == 31) u = (s << 31) | 0x7f800000u | (f << 13);
+  else u = (s << 31) | ((e + 112u) << 23) | (f << 13);
+  union { unsigned int u; float f; } v; v.u = u; return v.f;
+}
+unsigned short __truncsfhf2(float x) {
+  union { unsigned int u; float f; } v; v.f = x; unsigned int u = v.u;
+  unsigned int s = (u >> 16) & 0x8000u, be = (u >> 23) & 0xffu, m = u & 0x7fffffu;
+  if (be == 0xffu) return (unsigned short)(s | 0x7c00u | (m ? 0x200u : 0u));
+  int e = (int)be - 127 + 15;
+  if (e >= 31) return (unsigned short)(s | 0x7c00u);
+  if (e <= 0) {
+    if (e < -10) return (unsigned short)s;
+    m |= 0x800000u; int sh = 14 - e;
+    unsigned int half = m >> sh, rem = m & ((1u << sh) - 1u), mid = 1u << (sh - 1);
+    if (rem > mid || (rem == mid && (half & 1u))) half++;
+    return (unsigned short)(s | half);
+  }
+  unsigned int h = ((unsigned)e << 10) | (m >> 13), rem = m & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+  return (unsigned short)(s | h);
+}
+"""
+
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
     self.mock, compiler_args = mock, f"--target=hexagon -mcpu=hexagon{HVX_ARCH} -fuse-ld=lld -nostdlib -mhvx={HVX_ARCH} -mhvx-length=128b"
@@ -2222,6 +2259,8 @@ class DSPCompiler(Compiler):
     if not self.mock: os.unlink(self.link_ld.name)
 
   def compile(self, src:str) -> bytes:
+    if self.mock and any(t in src for t in ("__fp16", "_Float16", "__extendhfsf2", "__truncsfhf2")) and "float __extendhfsf2(" not in src:
+      src = _FP16_HELPERS + src
     # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
     with tempfile.NamedTemporaryFile(delete=True) as f:
       # -Wno-unused-variable: _splat_of_loaded_lane re-reads a splatted lane as a scalar, which can leave the vector load it
