@@ -23,6 +23,9 @@ HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
 HVX_ARCH = getenv("HVX_ARCH", "v65")
 HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
+# HMX_RQ_FAST=1: the int8 requant keeps only the fast fixed-point path and drops the exact redo of flagged tiles (|acc| > 2^24,
+# where the fast path is not ORT-exact). Approximate, like the hand/QNN requant; faster on layers whose accumulators are large.
+HMX_RQ_FAST = int(getenv("HMX_RQ_FAST", 0))
 
 # ***** qfloat lowering (v68+) *****
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
@@ -1434,8 +1437,9 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
       ga = re.sub(r"\{(\d+)\}", lambda mt: f"({{{mt.group(1)}}}+_g*{dd})" if int(mt.group(1)) >= len(g0) - 4 else mt.group(0), args)
       ga = ga.replace("(const int*){0}", f"(const int*)({{0}}+_g*{da})")
       code = (f"__hmx_u32x32 _rqf = (__hmx_u32x32)(0), _rqg[{len(run)}]; for (int _g = 0; _g < {len(run)}; _g++) {{{{ _rqg[_g] = "
-              f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}} if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
-              f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});")
+              f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}}" +
+              (" (void)_rqf;" if HMX_RQ_FAST else f" if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
+               f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});"))
       replace[st_last] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st_last)
       continue
@@ -1449,7 +1453,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
           a2 = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base}}}", a2)
           redo.append(f"if (__hmx_rq_any(_rqg[{j}])) __hmx_rq4x({a2});"); allsrc += s2; base += len(s2)
         code = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base - len(srcs)}}}", code)
-        code += " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
+        code += " (void)_rqf;" if HMX_RQ_FAST else " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
         srcs = allsrc
       replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st)
