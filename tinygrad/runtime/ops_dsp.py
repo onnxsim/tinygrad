@@ -258,6 +258,10 @@ def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
 dsp_string = PatternMatcher([
+  # a bool vector that is one scalar bool broadcast: an i1 splat sign-extends to 0xFF on HVX (`sub(#0,r)` then `vsplatb`),
+  # so every lane reads 255 instead of 1; the unsigned char form splats 0/1
+  (UPat(Ops.STACK, name="c"), lambda ctx,c: (f"(({ctx.render_type(c)})((unsigned char)({ctx[c.src[0]]})))"
+    if c.dtype == dtypes.bool and all(x is c.src[0] for x in c.src) and c.src[0].dtype == dtypes.bool else None)),
   (UPat(Ops.CAST, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_exp2_render(ctx, x)),
   (UPat(Ops.FDIV, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_div_render(ctx, x)),
   # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
