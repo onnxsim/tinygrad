@@ -22,7 +22,7 @@ HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 # qfloat (qf32): v68/v69 HVX has no IEEE fp32 (the Snapdragon 8+ Gen 1 test phone is v69), and LLVM lowers plain float
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
 HVX_ARCH = getenv("HVX_ARCH", "v65")
-HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
+HVX_QFLOAT = int(getenv("HVX_QFLOAT", int(int(HVX_ARCH.lstrip("v")) >= 68)))  # HVX_QFLOAT=0 forces IEEE-style float code on any arch
 # HMX_RQ_FAST=1: the int8 requant keeps only the fast fixed-point path and drops the exact redo of flagged tiles (|acc| > 2^24,
 # where the fast path is not ORT-exact). Approximate, like the hand/QNN requant; faster on layers whose accumulators are large.
 HMX_RQ_FAST = int(getenv("HMX_RQ_FAST", 0))
