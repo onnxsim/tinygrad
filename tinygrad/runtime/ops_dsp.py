@@ -257,6 +257,24 @@ def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
+def _interleave4_stack(ctx, x:UOp) -> str|None:
+  # a 128-lane int8 STACK whose lane 4k+j is element k of the j-th of four 32-lane vectors (the int8 conv's dot-product
+  # operand, built from four loaded vectors): two __builtin_shufflevector interleaves instead of 128 scalar lane inserts.
+  # t01 = (v0[k], v1[k]) pairs, t23 = (v2[k], v3[k]) pairs; the result takes two bytes from each, per k
+  if x.max_numel() != 128 or len(x.src) != 128 or x.dtype not in (dtypes.int8, dtypes.uint8): return None
+  vecs: list[UOp] = []
+  for j in range(4):
+    s = x.src[j]
+    if s.op is not Ops.INDEX or len(s.src) != 2 or _lane(s.src[1]) != 0 or s.src[0]._shape != (32,): return None
+    vecs.append(s.src[0])
+  for i, s in enumerate(x.src):
+    if s.op is not Ops.INDEX or len(s.src) != 2 or s.src[0] is not vecs[i % 4] or _lane(s.src[1]) != i // 4: return None
+  t01 = ", ".join(str(v) for k in range(32) for v in (k, 32 + k))
+  idx = ", ".join(str(2 * (i // 4) + i % 4) if i % 4 < 2 else str(64 + 2 * (i // 4) + (i % 4 - 2)) for i in range(128))
+  a, b, c, d = (ctx[v] for v in vecs)
+  return (f"__builtin_shufflevector(__builtin_shufflevector({a}, {b}, {t01}), "
+          f"__builtin_shufflevector({c}, {d}, {t01}), {idx})")
+
 dsp_string = PatternMatcher([
   # a bool vector that is one scalar bool broadcast: an i1 splat sign-extends to 0xFF on HVX (`sub(#0,r)` then `vsplatb`),
   # so every lane reads 255 instead of 1; the unsigned char form splats 0/1
@@ -272,6 +290,7 @@ dsp_string = PatternMatcher([
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
   # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _interleave4_stack(ctx, x) if getenv("DSP_INTERLEAVE", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
