@@ -1034,6 +1034,15 @@ __attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __
  * flags (window lanes, |acc| > 2^24) ORed into *fl -- checked once per output tile (__hmx_rq_any: moving a vector to a scalar
  * stalls ~250 cycles, per group it cost 3x the whole requantization) -- then two word -> halfword packs, one halfword -> byte
  * pack, the rows at bytes 0, 32, 64, 96 */
+static inline __hmx_i32x32 __hmx_fp24(__hmx_i32x32 x) {
+  /* x rounded to fp32 precision (RNE to 24 significant bits): exact for the fast path, so the accumulators above 2^24 need no
+     exact redo (the redo was 15% of the backbone's HMX time) */
+  __hmx_i32x32 neg = x >> 31;
+  __hmx_u32x32 u = (__hmx_u32x32)((x ^ neg) - neg);
+  __hmx_u32x32 na = __hmx_bitlen(u), sa = (__hmx_u32x32)__builtin_elementwise_max((__hmx_i32x32)na - 24, (__hmx_i32x32)0);
+  __hmx_u32x32 r = __hmx_rne_shr(u, sa) << sa, ng = (__hmx_u32x32)neg;
+  return (__hmx_i32x32)((r ^ ng) - ng);
+}
 __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
     const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo, __hmx_u32x32* fl) {
   const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
@@ -1051,11 +1060,12 @@ __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, 
 #else
   __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7;
   __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
+  x0 = __hmx_fp24(x0); x1 = __hmx_fp24(x1); x2 = __hmx_fp24(x2); x3 = __hmx_fp24(x3);
   __hmx_v y0 = __hmx_rqwf(x0, mm7, emf, zy, lo, fl), y1 = __hmx_rqwf(x1, mm7, emf, zy, lo, fl);
   __hmx_v y2 = __hmx_rqwf(x2, mm7, emf, zy, lo, fl), y3 = __hmx_rqwf(x3, mm7, emf, zy, lo, fl);
 #endif
   (void)m; (void)zy; (void)lo;
-  *fl |= (__hmx_u32x32)(((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))) & (int)0xff000000);
+  /* no |acc| > 2^24 flag: __hmx_fp24 rounds those in-lane, so only the window flags (near-ties) send a group to the redo */
   __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
   __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
 }
