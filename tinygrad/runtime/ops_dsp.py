@@ -22,7 +22,10 @@ HVX_PREFETCH_STRIDES = getenv("HVX_PREFETCH_STRIDES", 4)
 # qfloat (qf32): v68/v69 HVX has no IEEE fp32 (the Snapdragon 8+ Gen 1 test phone is v69), and LLVM lowers plain float
 # vector arithmetic to qf32 on its own. Note vector int<->float conversion only exists from v73 (vconv_sf_w/w_sf).
 HVX_ARCH = getenv("HVX_ARCH", "v65")
-HVX_QFLOAT = int(HVX_ARCH.lstrip("v")) >= 68
+HVX_QFLOAT = int(getenv("HVX_QFLOAT", int(int(HVX_ARCH.lstrip("v")) >= 68)))  # HVX_QFLOAT=0 forces IEEE-style float code on any arch
+# HMX_RQ_FAST=1: the int8 requant keeps only the fast fixed-point path and drops the exact redo of flagged tiles (|acc| > 2^24,
+# where the fast path is not ORT-exact). Approximate, like the hand/QNN requant; faster on layers whose accumulators are large.
+HMX_RQ_FAST = int(getenv("HMX_RQ_FAST", 0))
 
 # ***** qfloat lowering (v68+) *****
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
@@ -254,7 +257,29 @@ def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
+def _interleave4_stack(ctx, x:UOp) -> str|None:
+  # a 128-lane int8 STACK whose lane 4k+j is element k of the j-th of four 32-lane vectors (the int8 conv's dot-product
+  # operand, built from four loaded vectors): two __builtin_shufflevector interleaves instead of 128 scalar lane inserts.
+  # t01 = (v0[k], v1[k]) pairs, t23 = (v2[k], v3[k]) pairs; the result takes two bytes from each, per k
+  if x.max_numel() != 128 or len(x.src) != 128 or x.dtype not in (dtypes.int8, dtypes.uint8): return None
+  vecs: list[UOp] = []
+  for j in range(4):
+    s = x.src[j]
+    if s.op is not Ops.INDEX or len(s.src) != 2 or _lane(s.src[1]) != 0 or s.src[0]._shape != (32,): return None
+    vecs.append(s.src[0])
+  for i, s in enumerate(x.src):
+    if s.op is not Ops.INDEX or len(s.src) != 2 or s.src[0] is not vecs[i % 4] or _lane(s.src[1]) != i // 4: return None
+  t01 = ", ".join(str(v) for k in range(32) for v in (k, 32 + k))
+  idx = ", ".join(str(2 * (i // 4) + i % 4) if i % 4 < 2 else str(64 + 2 * (i // 4) + (i % 4 - 2)) for i in range(128))
+  a, b, c, d = (ctx[v] for v in vecs)
+  return (f"__builtin_shufflevector(__builtin_shufflevector({a}, {b}, {t01}), "
+          f"__builtin_shufflevector({c}, {d}, {t01}), {idx})")
+
 dsp_string = PatternMatcher([
+  # a bool vector that is one scalar bool broadcast: an i1 splat sign-extends to 0xFF on HVX (`sub(#0,r)` then `vsplatb`),
+  # so every lane reads 255 instead of 1; the unsigned char form splats 0/1
+  (UPat(Ops.STACK, name="c"), lambda ctx,c: (f"(({ctx.render_type(c)})((unsigned char)({ctx[c.src[0]]})))"
+    if c.dtype == dtypes.bool and all(x is c.src[0] for x in c.src) and c.src[0].dtype == dtypes.bool else None)),
   (UPat(Ops.CAST, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_exp2_render(ctx, x)),
   (UPat(Ops.FDIV, dtype=dtypes.half, name="x"), lambda ctx,x: _hf_div_render(ctx, x)),
   # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
@@ -265,6 +290,7 @@ dsp_string = PatternMatcher([
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
   # a STACK of consecutive lanes of one wider vector (memory_coalescing merged two adjacent loads) is a lane slice: one
   # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _interleave4_stack(ctx, x) if getenv("DSP_INTERLEAVE", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
@@ -275,6 +301,11 @@ dsp_string = PatternMatcher([
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})({ctx[x.src[0]]}))"
    if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
   # vector casts must convert per lane; a C cast between ext_vector_types is a bitcast
+  # under MOCKDSP, fp16 vector casts convert lane by lane through the scalar casts (the v65 backend miscompiles the vector
+  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: (lambda src, dst, n: f"({{ {ctx.render_type(x)} _r; __typeof__({ctx[x.src[0]]}) _s = {ctx[x.src[0]]}; "
+     f"for (int _i = 0; _i < {n}; _i++) _r[_i] = ({ctx.render_dtype(x.dtype)})(_s[_i]); _r; }})")(None, None, x.max_numel())
+   if getenv("MOCKDSP") and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})"
    if x.max_numel() > 1 else None),
   # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a
@@ -1003,6 +1034,15 @@ __attribute__((always_inline)) static inline void __hmx_rq1(unsigned char* d, __
  * flags (window lanes, |acc| > 2^24) ORed into *fl -- checked once per output tile (__hmx_rq_any: moving a vector to a scalar
  * stalls ~250 cycles, per group it cost 3x the whole requantization) -- then two word -> halfword packs, one halfword -> byte
  * pack, the rows at bytes 0, 32, 64, 96 */
+static inline __hmx_i32x32 __hmx_fp24(__hmx_i32x32 x) {
+  /* x rounded to fp32 precision (RNE to 24 significant bits): exact for the fast path, so the accumulators above 2^24 need no
+     exact redo (the redo was 15% of the backbone's HMX time) */
+  __hmx_i32x32 neg = x >> 31;
+  __hmx_u32x32 u = (__hmx_u32x32)((x ^ neg) - neg);
+  __hmx_u32x32 na = __hmx_bitlen(u), sa = (__hmx_u32x32)__builtin_elementwise_max((__hmx_i32x32)na - 24, (__hmx_i32x32)0);
+  __hmx_u32x32 r = __hmx_rne_shr(u, sa) << sa, ng = (__hmx_u32x32)neg;
+  return (__hmx_i32x32)((r ^ ng) - ng);
+}
 __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, unsigned char* d1, unsigned char* d2, unsigned char* d3,
     const int* acc, __hmx_i32x32 b, __hmx_f32x32 m, int zy, int lo, __hmx_u32x32* fl) {
   const __hmx_i32x32* a = (const __hmx_i32x32*)acc;
@@ -1020,11 +1060,12 @@ __attribute__((always_inline)) static inline void __hmx_rq4f(unsigned char* d0, 
 #else
   __hmx_u32x32 mb = (__hmx_u32x32)m, mm7 = ((mb & 0x7fffff) | 0x800000) << 7;
   __hmx_i32x32 emf = 125 - (__hmx_i32x32)((mb >> 23) & 255);  /* -em - 25, em = exp - 150 */
+  x0 = __hmx_fp24(x0); x1 = __hmx_fp24(x1); x2 = __hmx_fp24(x2); x3 = __hmx_fp24(x3);
   __hmx_v y0 = __hmx_rqwf(x0, mm7, emf, zy, lo, fl), y1 = __hmx_rqwf(x1, mm7, emf, zy, lo, fl);
   __hmx_v y2 = __hmx_rqwf(x2, mm7, emf, zy, lo, fl), y3 = __hmx_rqwf(x3, mm7, emf, zy, lo, fl);
 #endif
   (void)m; (void)zy; (void)lo;
-  *fl |= (__hmx_u32x32)(((x0 ^ (x0 >> 31)) | (x1 ^ (x1 >> 31)) | (x2 ^ (x2 >> 31)) | (x3 ^ (x3 >> 31))) & (int)0xff000000);
+  /* no |acc| > 2^24 flag: __hmx_fp24 rounds those in-lane, so only the window flags (near-ties) send a group to the redo */
   __hmx_v p = __builtin_HEXAGON_V6_vpackhub_sat_128B(__builtin_HEXAGON_V6_vpackwh_sat_128B(y3, y2), __builtin_HEXAGON_V6_vpackwh_sat_128B(y1, y0));
   __hmx_st32(d0, p, 0); __hmx_st32(d1, p, 1); __hmx_st32(d2, p, 2); __hmx_st32(d3, p, 3);
 }
@@ -1429,8 +1470,9 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
       ga = re.sub(r"\{(\d+)\}", lambda mt: f"({{{mt.group(1)}}}+_g*{dd})" if int(mt.group(1)) >= len(g0) - 4 else mt.group(0), args)
       ga = ga.replace("(const int*){0}", f"(const int*)({{0}}+_g*{da})")
       code = (f"__hmx_u32x32 _rqf = (__hmx_u32x32)(0), _rqg[{len(run)}]; for (int _g = 0; _g < {len(run)}; _g++) {{{{ _rqg[_g] = "
-              f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}} if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
-              f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});")
+              f"(__hmx_u32x32)(0); __hmx_rq4f({ga}, &_rqg[_g]); _rqf |= _rqg[_g]; }}}}" +
+              (" (void)_rqf;" if HMX_RQ_FAST else f" if (__builtin_expect(__hmx_rq_any(_rqf), 0)) "
+               f"for (int _g = 0; _g < {len(run)}; _g++) if (__hmx_rq_any(_rqg[_g])) __hmx_rq4x({ga});"))
       replace[st_last] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st_last)
       continue
@@ -1444,7 +1486,7 @@ def _hmx_rq_rows(uops, users, drop:set, before:dict, replace:dict, pos) -> int:
           a2 = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base}}}", a2)
           redo.append(f"if (__hmx_rq_any(_rqg[{j}])) __hmx_rq4x({a2});"); allsrc += s2; base += len(s2)
         code = re.sub(r"\{(\d+)\}", lambda mt: f"{{{int(mt.group(1)) + base - len(srcs)}}}", code)
-        code += " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
+        code += " (void)_rqf;" if HMX_RQ_FAST else " if (__builtin_expect(__hmx_rq_any(_rqf), 0)) {{ " + " ".join(redo) + " }}"
         srcs = allsrc
       replace[st] = UOp(Ops.CUSTOM, dtypes.void, srcs, code)
       drop.discard(st)
@@ -2199,6 +2241,38 @@ def _find_libgcc() -> str:
     if candidate.exists(): return str(candidate)
   return ""
 
+# fp16 conversions for the MOCKDSP link: v65 has no fp16 instructions, so clang lowers _Float16 casts to libgcc calls that the
+# freestanding link (-nostdlib) doesn't have. The helpers are compiled into the kernel only when it uses them, and only under
+# the mock (the device links libgcc, which has them on the real arch). Round to nearest even, like the hardware conversions.
+_FP16_HELPERS = r"""
+float __extendhfsf2(unsigned short h) {
+  unsigned int s = (h >> 15) & 1u, e = (h >> 10) & 31u, f = h & 1023u, u;
+  if (e == 0) {
+    if (f == 0) u = s << 31;
+    else { int k = 0; while (!(f & 0x400u)) { f <<= 1; k++; } f &= 0x3ffu; u = (s << 31) | ((unsigned)(113 - k) << 23) | (f << 13); }
+  } else if (e == 31) u = (s << 31) | 0x7f800000u | (f << 13);
+  else u = (s << 31) | ((e + 112u) << 23) | (f << 13);
+  union { unsigned int u; float f; } v; v.u = u; return v.f;
+}
+unsigned short __truncsfhf2(float x) {
+  union { unsigned int u; float f; } v; v.f = x; unsigned int u = v.u;
+  unsigned int s = (u >> 16) & 0x8000u, be = (u >> 23) & 0xffu, m = u & 0x7fffffu;
+  if (be == 0xffu) return (unsigned short)(s | 0x7c00u | (m ? 0x200u : 0u));
+  int e = (int)be - 127 + 15;
+  if (e >= 31) return (unsigned short)(s | 0x7c00u);
+  if (e <= 0) {
+    if (e < -10) return (unsigned short)s;
+    m |= 0x800000u; int sh = 14 - e;
+    unsigned int half = m >> sh, rem = m & ((1u << sh) - 1u), mid = 1u << (sh - 1);
+    if (rem > mid || (rem == mid && (half & 1u))) half++;
+    return (unsigned short)(s | half);
+  }
+  unsigned int h = ((unsigned)e << 10) | (m >> 13), rem = m & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+  return (unsigned short)(s | h);
+}
+"""
+
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
     self.mock, compiler_args = mock, f"--target=hexagon -mcpu=hexagon{HVX_ARCH} -fuse-ld=lld -nostdlib -mhvx={HVX_ARCH} -mhvx-length=128b"
@@ -2222,11 +2296,13 @@ class DSPCompiler(Compiler):
     if not self.mock: os.unlink(self.link_ld.name)
 
   def compile(self, src:str) -> bytes:
+    if self.mock and any(t in src for t in ("__fp16", "_Float16", "__extendhfsf2", "__truncsfhf2")) and "float __extendhfsf2(" not in src:
+      src = _FP16_HELPERS + src
     # TODO: remove file write. sadly clang doesn't like the use of /dev/stdout here
     with tempfile.NamedTemporaryFile(delete=True) as f:
       # -Wno-unused-variable: _splat_of_loaded_lane re-reads a splatted lane as a scalar, which can leave the vector load it
       # replaced declared but unused (dead at -O2, but -Werror rejects the kernel)
-      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -Wno-unused-variable -fno-stack-protector -x c -fPIC " +
+      system(f"{getenv('CC','clang')} {self.args} -O2 -Wall -Werror -Wno-unused-variable -Wno-unused-function -fno-stack-protector -x c -fPIC " +
              f"-ffreestanding -nostdlib - -o {f.name}" + (f" -x none {self.libgcc}" if self.libgcc else ""), input=src.encode())
       return pathlib.Path(f.name).read_bytes()
 
