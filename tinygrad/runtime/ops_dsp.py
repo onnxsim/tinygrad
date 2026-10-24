@@ -275,7 +275,89 @@ def _interleave4_stack(ctx, x:UOp) -> str|None:
   return (f"__builtin_shufflevector(__builtin_shufflevector({a}, {b}, {t01}), "
           f"__builtin_shufflevector({c}, {d}, {t01}), {idx})")
 
+# HVX_REVEC_CMP: compares, bool logic, WHERE and float TRUNC re-vectorize too, at whole-HVX-register lane counts (a multiple
+# of 32) over 32-bit operands. Kept scalar, a gather's bounds test / bilinear weight / floor ran as one scalar statement per
+# lane (BEVFormer's sampler: ~40 per sample). Rendering (dsp_string, _cmp_helpers): a compare is an int mask (-1 / 0, what a
+# C vector compare yields), narrowed to tinygrad's 0/1 byte-per-lane bool vector only where one is materialized; WHERE is a
+# bit select on that mask, a bool -> float cast an AND with 1.0f's bits, and TRUNC / float -> int32 are exact integer-only
+# helpers (v68/v69 have no vector float <-> int convert, so LLVM scalarizes __builtin_convertvector / truncf per lane).
+# Small bool vectors stay scalar: LLVM's Hexagon backend can't select some of those ("v2i32 = bitcast (V2Q ...)").
+HVX_REVEC_CMP = getenv("HVX_REVEC_CMP", 0)
+_CMP = {Ops.CMPLT: "<", Ops.CMPNE: "!=", Ops.CMPEQ: "=="}
+def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP)
+def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and n % 32 == 0
+def _is32(dt) -> bool: return dt in (dtypes.float32, dtypes.int32, dtypes.uint32)
+def _cmp_vec_op(u:UOp, n:int) -> bool:
+  if not _bool_lanes_ok(n): return False
+  if u.op is Ops.TRUNC: return u.dtype == dtypes.float32
+  if u.op in _CMP: return u.dtype == dtypes.bool and (_is32(u.src[0].dtype) or u.src[0].dtype == dtypes.bool)
+  if u.op in (Ops.AND, Ops.OR, Ops.XOR): return u.dtype == dtypes.bool
+  if u.op is Ops.WHERE: return _is32(u.dtype)
+  return False
+
+def _vec_n(u:UOp) -> int|None:
+  n = u.max_numel() if u._shape is not None else 1
+  return n if n > 1 and n % 32 == 0 and _revec_cmp() else None
+
+def _mask(ctx, u:UOp, n:int) -> str:
+  # u (a bool vector of n lanes) as an int mask expression: -1 where true, 0 where false
+  m = f"__hvx_m{n}"
+  if u.op in _CMP and u.src[0].dtype != dtypes.bool: return f"({ctx[u.src[0]]}{_CMP[u.op]}{ctx[u.src[1]]})"
+  if u.op in _CMP:
+    a, b = _mask(ctx, u.src[0], n), _mask(ctx, u.src[1], n)
+    return {Ops.CMPNE: f"({a}^{b})", Ops.CMPEQ: f"(~({a}^{b}))", Ops.CMPLT: f"(~{a}&{b})"}[u.op]
+  if u.op in (Ops.AND, Ops.OR, Ops.XOR) and u.dtype == dtypes.bool:
+    return f"({_mask(ctx, u.src[0], n)}{ {Ops.AND: '&', Ops.OR: '|', Ops.XOR: '^'}[u.op] }{_mask(ctx, u.src[1], n)})"
+  if u.op is Ops.CONST: return f"(({m})({-1 if u.arg else 0}))"
+  if u.op is Ops.STACK and all(s is u.src[0] for s in u.src) and u.src[0]._shape == ():
+    s0 = u.src[0]
+    return f"(({m})({-1 if s0.arg else 0}))" if s0.op is Ops.CONST else f"(({m})(-(int)({ctx[s0]})))"
+  return f"(-__builtin_convertvector({ctx[u]}, {m}))"
+
+def _cmp_where(ctx, x:UOp) -> str|None:
+  if (n:=_vec_n(x)) is None or x.src[0].dtype != dtypes.bool or not _is32(x.dtype): return None
+  m, t = f"__hvx_m{n}", ctx.render_type(x)
+  return (f"({{ {m} _m = {_mask(ctx, x.src[0], n)}; ({t})((_m & ({m})({ctx[x.src[1]]})) | (~_m & ({m})({ctx[x.src[2]]}))); }})")
+
+def _cmp_helpers(uops:list[UOp]) -> list[str]:
+  mw, fw = set(), set()
+  for u in uops:
+    if (n:=_vec_n(u)) is None: continue
+    if (u.op in _CMP or u.op is Ops.WHERE or u.op is Ops.CAST) and any(s.dtype == dtypes.bool for s in u.src) or u.op in _CMP: mw.add(n)
+    if u.op is Ops.TRUNC and u.dtype == dtypes.float32 or u.op is Ops.CAST and u.dtype == dtypes.int32 and u.src[0].dtype == dtypes.float32:
+      fw.add(n)
+  out = []
+  for n in sorted(mw | fw):
+    out += [f"typedef int __hvx_m{n} __attribute__((ext_vector_type({n})));",
+            f"typedef unsigned int __hvx_um{n} __attribute__((ext_vector_type({n})));"]
+  for n in sorted(fw):
+    m, um, f = f"__hvx_m{n}", f"__hvx_um{n}", f"__hvx_fv{n}"
+    out += [f"typedef float {f} __attribute__((ext_vector_type({n})));",
+            # trunc: clear the fraction bits (150 - biased exponent of them; above 23, |x| < 1 keeps only the sign);
+            # exact for every input, including +-0, inf and NaN
+            f"static inline {f} __hvx_trunc{n}({f} x) {{ {um} u = ({um})x; {m} d = 150 - ({m})((u >> 23) & 255u);"
+            f" {m} sh = __builtin_elementwise_min(__builtin_elementwise_max(d, ({m})0), ({m})23) | ((d > 23) & 31);"
+            f" return ({f})(u & ~((({um})1 << ({um})sh) - 1u)); }}",
+            # C's (int)x for |x| < 2^31: the mantissa shifted by the exponent, then the sign
+            f"static inline {m} __hvx_f2i{n}({f} x) {{ {um} u = ({um})x; {m} e = ({m})((u >> 23) & 255u) - 150;"
+            f" {m} r = ({m})((u & 0x7fffffu) | 0x800000u);"
+            f" r = (r >> __builtin_elementwise_min(__builtin_elementwise_max(-e, ({m})0), ({m})31))"
+            f" << __builtin_elementwise_min(__builtin_elementwise_max(e, ({m})0), ({m})31);"
+            f" {m} s = ({m})u >> 31; return (r ^ s) - s; }}"]
+  return out
+
 dsp_string = PatternMatcher([
+  # HVX_REVEC_CMP (see _cmp_vec_op): vector compares as int masks narrowed to 0/1 bytes, WHERE as a mask bit select, bool ->
+  # float as the mask AND 1.0f's bits, TRUNC / float -> int32 through the exact integer helpers
+  (UPat(tuple(_CMP), dtype=dtypes.bool, name="x"), lambda ctx,x: f"__builtin_convertvector({_mask(ctx, x, n)} & 1, {ctx.render_type(x)})"
+   if (n:=_vec_n(x)) is not None else None),
+  (UPat(Ops.WHERE, name="x"), _cmp_where),
+  (UPat(Ops.CAST, dtype=dtypes.float32, src=(UPat(dtype=dtypes.bool, name="b"),), name="x"), lambda ctx,x,b:
+   f"(({ctx.render_type(x)})({_mask(ctx, b, n)} & ((__hvx_m{n})0x3f800000)))" if (n:=_vec_n(x)) is not None else None),
+  (UPat(Ops.CAST, dtype=dtypes.int32, src=(UPat(dtype=dtypes.float32, name="f"),), name="x"), lambda ctx,x,f:
+   f"(({ctx.render_type(x)})__hvx_f2i{n}({ctx[f]}))" if (n:=_vec_n(x)) is not None else None),
+  (UPat(Ops.TRUNC, dtype=dtypes.float32, name="x"), lambda ctx,x:
+   f"(({ctx.render_type(x)})__hvx_trunc{n}({ctx[x.src[0]]}))" if (n:=_vec_n(x)) is not None else None),
   # a bool vector that is one scalar bool broadcast: an i1 splat sign-extends to 0xFF on HVX (`sub(#0,r)` then `vsplatb`),
   # so every lane reads 255 instead of 1; the unsigned char form splats 0/1
   (UPat(Ops.STACK, name="c"), lambda ctx,c: (f"(({ctx.render_type(c)})((unsigned char)({ctx[c.src[0]]})))"
@@ -347,7 +429,7 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
   # compare/cast/mul -- stays a scalar constructor: LLVM's Hexagon backend crashes selecting some of those once they're
   # wrapped in a vector op ("Cannot select v2i32 = bitcast (V2Q ...)"), and there's nothing to gain vectorizing them.
   c0 = col[0]
-  if c0._shape != () or c0.dtype == dtypes.bool or depth > 32: return False
+  if c0._shape != () or depth > 32 or (c0.dtype == dtypes.bool and not _bool_lanes_ok(len(col))): return False
   if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
   if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
     # consecutive lanes of one vector, or of several vectors one after another (a row loaded as two 64-byte halves):
@@ -357,7 +439,8 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     if None in lanes: return False
     return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
                                                                        ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
-  if c0.op in _vec_ops() and all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
+  if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col))) and \
+     all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
     return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
   return False
 
@@ -373,7 +456,10 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
-  if s0.op not in _vec_ops() or s0.dtype == dtypes.bool or s0._shape != (): return None
+  if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n)): return None
+  # a splat of one scalar op (a per-sample weight broadcast over the channel lanes) stays that scalar op and one vsplat: as a
+  # vector op it does the same work on splatted operands, and pulls the scalar compares / selects under it into vectors too
+  if _revec_cmp() and all(s is s0 for s in srcs): return None
   # a scalar float max renders as a statement expression; a vector one (qfloat targets) as HVX's native max (dsp_string)
   if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not _hvx_qfloat(): return None
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
@@ -2104,6 +2190,7 @@ class DSPRenderer(ClangRenderer):
     if qm and not any("typedef float __hvx_f " in p for p in prefix): prefix += qm
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
+    prefix += _cmp_helpers(uops)
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
