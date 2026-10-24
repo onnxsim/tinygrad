@@ -9,6 +9,9 @@ from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
+# HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
+# between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
+HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
 
 def _unit_stride_bufs(k:Scheduler, axis:int) -> int:
   # how many buffers' indices have this axis's range as a bare term (stride 1): upcasting it gives them contiguous vector accesses
@@ -26,6 +29,12 @@ def _every_unit_stride(k:Scheduler, axis:int) -> bool:
     if not any(c is rng for c in idx.split_uop(Ops.ADD)): return False
     hit = True
   return hit
+
+def _odd_upcasts(k, axis:int, cap:int) -> list[int]:
+  # only on an axis every buffer reads at unit stride: an odd width on a strided axis is that many scalar gathers per step
+  n = int(k.full_shape[axis])
+  if not HVX_UPCAST_ODD or any(n % w == 0 for w in (32, 64, 128) if w <= cap) or not _every_unit_stride(k, axis): return []
+  return [d for d in range(min(cap, n), 32, -1) if n % d == 0][:1]
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
@@ -194,8 +203,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     # aren't multiples of 128 and would otherwise fall back to a 4-wide upcast for byte-sized reductions
     dsp_upcast_sizes = [s for s in [128,64,32,16,8,4] if s * k.upcast_size() <= dsp_vector_lanes]
     vector_dsp = is_dsp and not dsp_scalar_float
-    for axis, upcast_amount in itertools.product(k.upcastable_dims,
-        (dsp_upcast_sizes if not len(upcasted_axis) else []) if vector_dsp else [3,4]):
+    for axis, upcast_amount in [(a, u) for a in k.upcastable_dims for u in
+        ((dsp_upcast_sizes + _odd_upcasts(k, a, dsp_vector_lanes // k.upcast_size()) if not len(upcasted_axis) else [])
+         if vector_dsp else [3,4])]:
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -293,7 +303,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not (v65_float and getenv("DSP_SCALAR_GEMV", 1))
                  else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+      # an odd-width HVX upcast first, where it beats the power-of-two split this would take (900: 100 lanes, not 4)
+      odd = _odd_upcasts(k, k.upcastable_dims[-1], dsp_vector_lanes) if is_dsp else []
+      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], odd[0] if odd and odd[0] > splits else splits))
       break
 
   # **** local groups ****

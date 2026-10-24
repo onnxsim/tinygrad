@@ -39,6 +39,23 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((a.float() * b.float()).sum(axis=0))
     self.assertIn("float128", src)
 
+  def test_upcast_odd_width(self):
+    # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 keys) takes its largest divisor up to the lane
+    # budget (100: three HVX vectors and a 4-lane tail), not a 4-lane upcast -- only where every buffer reads it at unit stride
+    from tinygrad.codegen.opt import heuristic
+    old = heuristic.HVX_UPCAST_ODD
+    try:
+      heuristic.HVX_UPCAST_ODD = 1
+      src = dsp_source(Tensor.empty(1800, 900).softmax(-1))     # the row reduction keeps the 900 axis apart
+    finally: heuristic.HVX_UPCAST_ODD = old
+    self.assertIn("E_1800_9_100", src)
+
+  def test_odd_width_qf_helpers_are_vector(self):
+    # an odd-width (100-lane) qfloat exp is the 32-lane vector helper on padded registers, not 100 scalar calls
+    out = ops_dsp._hvx_chunked(100, lambda c: f"__tg_exp2_v({c})", ["x"])
+    self.assertEqual(out.count("__tg_exp2_v("), 4)
+    self.assertIn(",".join(map(str, range(100))) + ")", out)
+
   def test_gathered_row_loads_whole(self):
     # a row gather (a loaded row index * 256 + lane) whose rows are split into two 128-lane chunks: lane 0's index renders
     # as row + chunk and the other lanes' as (chunk + row) + k, the same sum in another order. memory_coalescing keyed its

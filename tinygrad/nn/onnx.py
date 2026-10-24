@@ -835,8 +835,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def IsInf(x:Tensor, detect_negative:int=1, detect_positive:int=1): return x.isinf(bool(detect_positive), bool(detect_negative))
 
   # ***** Unary Ops (activation) *****
-  def softmax_1(x:Tensor, axis:int=1): return x.softmax(axis)
-  def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis)
+  # SOFTMAX_CONTIGUOUS=1: the softmax is realized on its own instead of fused into its consumer. Fused into attention's P @ V,
+  # the exp is computed inside the matmul once per (row, key) on a splat of the score across V's lanes (a whole vector exp per
+  # key on the DSP); on its own it is an elementwise kernel that vectorizes the exp across the keys
+  def softmax_1(x:Tensor, axis:int=1): return x.softmax(axis).contiguous() if getenv("SOFTMAX_CONTIGUOUS") else x.softmax(axis)
+  def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis).contiguous() if getenv("SOFTMAX_CONTIGUOUS") else x.softmax(axis)
   Softmax = {OpSetId(Domain.ONNX, 1):softmax_1, OpSetId(Domain.ONNX, 13):softmax_13}
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
   def Gelu(x:Tensor, approximate:str|None=None): return x.gelu(approximate="none" if approximate is None else approximate)

@@ -44,9 +44,25 @@ def _computed(u:UOp) -> bool:
   while u.op in (Ops.STACK, Ops.CAST, Ops.BITCAST) and len(u.src) >= 1 and all(s is u.src[0] for s in u.src): u = u.src[0]
   return u.op in GroupOp.ALU
 
+def _hvx_chunkable(n:int) -> bool: return n % 32 == 0 or 16 <= n <= 128
+def _hvx_chunked(n:int, call, args:list[str]) -> str:
+  """call(*chunks) applied per 32-lane HVX register of n-lane vectors args -> an n-lane expression, all in registers. n not a
+  multiple of 32 (an odd-width upcast like 100 lanes, see heuristic HVX_UPCAST_ODD) is widened to 64 or 128 lanes by repeating
+  valid lanes, and the result shuffled back down to n."""
+  m = n if n % 32 == 0 else 32 if n <= 32 else 64 if n <= 64 else 128
+  def chunk(a:str, i:int) -> str:
+    if m == n == 32: return a
+    return f"__builtin_shufflevector({a}, {a}, {','.join(str(j if j < n else j % n) for j in range(32*i, 32*i+32))})"
+  parts = [call(*[chunk(a, i) for a in args]) for i in range(m // 32)]
+  while len(parts) > 1:  # concatenate registers pairwise back up to m lanes
+    w = 32 * (m // 32 // len(parts))
+    parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {','.join(map(str, range(2*w)))})" for j in range(0, len(parts), 2)]
+  # narrowed back to n lanes through a temporary: naming parts[0] twice in the shuffle would evaluate it twice
+  return parts[0] if m == n else f"({{ __auto_type _w = {parts[0]}; __builtin_shufflevector(_w, _w, {','.join(map(str, range(n)))}); }})"
+
 def _qf_vec(x:UOp) -> bool:
   return HVX_QFLOAT and x.op is Ops.MUL and x.dtype == dtypes.float32 and x._shape is not None and \
-    (n:=x.max_numel()) >= 32 and n % 32 == 0 and all(_computed(s) for s in x.src)
+    (n:=x.max_numel()) >= 16 and _hvx_chunkable(n) and all(_computed(s) for s in x.src)
 
 def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
   widths = sorted({x.max_numel() for x in uops if _qf_vec(x)})
@@ -55,15 +71,9 @@ def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
   # (going through `((__hvx_v*)&a)[i]` instead forces a stack round trip per register -- measured 10x slower)
   out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
          "static inline __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }"]
-  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
   for n in widths:
-    t, k = vec_type(n), n // 32
-    parts = [f"__hvx_mulsf({'a' if k == 1 else f'__builtin_shufflevector(a, a, {lanes(32*i, 32)})'}, "
-             f"{'b' if k == 1 else f'__builtin_shufflevector(b, b, {lanes(32*i, 32)})'})" for i in range(k)]
-    while len(parts) > 1:  # concatenate registers pairwise back up to n lanes
-      w = 32 * (k // len(parts))
-      parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
-    out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){parts[0]}; }}")
+    t = vec_type(n)
+    out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){_hvx_chunked(n, lambda a, b: f'__hvx_mulsf({a}, {b})', ['a', 'b'])}; }}")
   return out
 
 # ***** qfloat exp2 / reciprocal (v68+) *****
@@ -124,7 +134,6 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
          "static inline float __tg_sqrt_s(float x) {"
          " int b; __builtin_memcpy(&b, &x, 4); b = 0x5F3759DF - (b >> 1); float y; __builtin_memcpy(&y, &b, 4);"
          " for (int k = 0; k < 3; k++) y = y * (1.5f - 0.5f * x * y * y); return x * y; }"]
-  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
   for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL), ("sqrt", Ops.SQRT)):
     widths = sorted({n for o, n in uses if o is op})
     if not widths: continue
@@ -134,13 +143,8 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
         assoc.append(f"float: __tg_{name}_s")
         continue
       t = vtype(dtypes.float32, n)
-      if n % 32 == 0:  # whole HVX registers, split / rebuilt with shufflevector (in registers)
-        k = n // 32
-        parts = [f"__tg_{name}_v({'x' if k == 1 else f'__builtin_shufflevector(x, x, {lanes(32*i, 32)})'})" for i in range(k)]
-        while len(parts) > 1:
-          w = 32 * (k // len(parts))
-          parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
-        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ return ({t}){parts[0]}; }}")
+      if _hvx_chunkable(n):  # whole HVX registers (an odd width padded to 64 / 128 lanes), split / rebuilt in registers
+        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ return ({t}){_hvx_chunked(n, lambda c: f'__tg_{name}_v({c})', ['x'])}; }}")
       else:  # other widths: per lane (scalar helper)
         out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ {t} y; for (int i = 0; i < {n}; i++) y[i] = __tg_{name}_s(x[i]); return y; }}")
       assoc.append(f"{t}: __tg_{name}_f{n}")
