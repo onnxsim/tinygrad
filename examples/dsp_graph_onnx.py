@@ -15,24 +15,26 @@ import argparse, json, os, pathlib, sys
 ONNX_DTYPES = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64", 9: "bool", 10: "float16"}
 
 def pretranspose_gemm_weights(model) -> int:
-  """Gemm(A, B, transB=1) with B a constant used by nothing else -> B stored transposed and transB=0. Same result; the generated
-  kernel's output lanes then read B contiguously. Kept (N, K), each reduction step loaded its 128 lanes one scalar at a time
-  from 128 rows (BEVFormer-tiny's encoder FFN: 2.2 s per 2500x256x512 Gemm on the V69). -> the number of Gemms rewritten"""
+  """Gemm(A, B, transB=1) with B a constant -> B stored transposed and transB=0, when every use of B is such a Gemm's B (a weight
+  shared by two Gemms, like BEVFormer's two-frame value_proj, is transposed once). Same result; the generated kernel's output
+  lanes then read B contiguously. Kept (N, K), each reduction step loaded its 128 lanes one scalar at a time from 128 rows
+  (BEVFormer-tiny's encoder FFN: 2.2 s per 2500x256x512 Gemm on the V69). -> the number of Gemms rewritten"""
   import onnx
   from onnx import numpy_helper
   init = {t.name: t for t in model.graph.initializer}
-  uses: dict[str, int] = {}
+  def trans_b(n): return next((a for a in n.attribute if a.name == "transB"), None)
+  uses: dict[str, list] = {}
   for n in model.graph.node:
-    for i in n.input: uses[i] = uses.get(i, 0) + 1
+    for k, i in enumerate(n.input): uses.setdefault(i, []).append((n, k))
+  for o in model.graph.output: uses.setdefault(o.name, []).append((None, -1))
   done = 0
-  for n in model.graph.node:
-    if n.op_type != "Gemm" or len(n.input) < 2 or n.input[1] not in init or uses[n.input[1]] != 1: continue
-    tb = next((a for a in n.attribute if a.name == "transB"), None)
-    if tb is None or tb.i != 1: continue
-    t = init[n.input[1]]
+  for name, us in uses.items():
+    if name not in init or not all(n is not None and n.op_type == "Gemm" and k == 1 and (tb := trans_b(n)) is not None and tb.i == 1
+                                   for n, k in us): continue
+    t = init[name]
     t.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(t).T.copy(), t.name))
-    tb.i = 0
-    done += 1
+    for n, _ in us: trans_b(n).i = 0
+    done += len(us)
   onnx.checker.check_model(model)
   return done
 
