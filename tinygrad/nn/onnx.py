@@ -1092,15 +1092,34 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
 
   def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
     """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, Np), v (..., Np, 32) half, zero-padded to
-    whole tiles: the hand fused attention in ops_dsp.py (_HMX_ATTN), one HMX call (the graph thread's, under the HMX lock)"""
-    from tinygrad.uop.ops import UOp, Ops, KernelInfo
+    whole tiles: the hand attention kernels in test/external/dsp/hand/attn. HMX_ATTN=1: one fused HMX call (its softmax on the
+    graph thread); 2 (default): per head an HMX call for S, the softmax on the DSP_THREADS pool on the same VTCM tiles, an HMX
+    call for P @ V"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
     *bs, Mp, _ = q16.shape
-    Np, H = kt16.shape[-1], prod(bs)
-    def kern(Y, Q, KT, V):
-      srcs = tuple(b.flatten().index(UOp.const(0, dtypes.int)) for b in (Y, Q, KT, V))
-      cu = UOp(Ops.CUSTOM, dtypes.void, srcs, arg=f"__hmx_attn({{0}}, {{1}}, {{2}}, {{3}}, {H}, {M}, {Mp}, {N}, {Np});")
-      return cu.sink(arg=KernelInfo(name=f"hmx_attn_{H}x{M}x{N}", opts_to_apply=()))
-    return Tensor.custom_kernel(Tensor.empty(*bs, M, 32, dtype=dtypes.float32, device=q16.device), q16, kt16, v16, fxn=kern)[0]
+    Np, H, nt = kt16.shape[-1], prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def ptr(b): return b.flatten().index(UOp.const(0, dtypes.int))
+    def call(name, arg, out, *ins, threaded=False):
+      def kern(*bufs):
+        t = UOp.range(nt, 0, AxisType.THREAD) if threaded else None
+        cu = UOp(Ops.CUSTOM, dtypes.void, (*map(ptr, bufs), *((t,) if threaded else ())), arg=arg)
+        return (cu.end(t) if threaded else cu).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+      return Tensor.custom_kernel(out, *ins, fxn=kern)[0]
+    # (the split form's S blocks take 256 KB + 64 KB each of the VTCM: HMX_VTCM_KB=4096 holds 60)
+    if getenv("HMX_ATTN", 2) == 1 or Mp // 32 > (getenv("HMX_VTCM_KB", 256) - 256) // 64:
+      return call(f"hmx_attn_{H}x{M}x{N}", f"__hmx_attn({{0}}, {{1}}, {{2}}, {{3}}, {H}, {M}, {Mp}, {N}, {Np});",
+                  Tensor.empty(*bs, M, 32, dtype=dtypes.float32, device=q16.device), q16, kt16, v16)
+    # the VTCM holds one head at a time: each head's S call takes the previous head's output (read by nothing) to run after it
+    outs, dep = [], q16
+    for h in range(H):
+      tok = call(f"hmx_attn_s_{M}x{N}", f"__hmx_attn_s({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {h}, {M}, {Mp}, {Np});",
+                 Tensor.empty(32, dtype=dtypes.int32, device=q16.device), q16, kt16, v16, dep)
+      tok = call(f"attn_sm_{M}x{N}", f"__attn_sm_vtcm({{0}}, {{1}}, {{2}}, {nt}, {Mp // 32}, {Np // 32}, {N - (Np - 32)});",
+                 Tensor.empty(32, dtype=dtypes.int32, device=q16.device), tok, threaded=True)
+      dep = call(f"hmx_attn_pv_{M}x{N}", f"__hmx_attn_pv({{0}}, {{1}}, {M}, {Np});",
+                 Tensor.empty(M, 32, dtype=dtypes.float32, device=q16.device), tok)
+      outs.append(dep)
+    return Tensor.stack(*outs).reshape(*bs, M, 32)
 
   def _softmax_grp_dsp(x:Tensor) -> Tensor:
     """softmax over x's last axis (2, 4 or 8) by the hand grouped softmax in ops_dsp.py (_SOFTMAX_GRP), split over DSP_THREADS"""
