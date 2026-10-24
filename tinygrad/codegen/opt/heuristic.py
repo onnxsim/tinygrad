@@ -57,7 +57,8 @@ def _stride_in_every(k:Scheduler, axis:int, st:int, inner) -> bool:
     terms = list(idx.split_uop(Ops.ADD))
     want = st if inner in idx.backward_slice else 1
     if want == 1 and any(c is rng for c in terms): continue
-    if not any(c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST and c.src[1].arg == want for c in terms): return False
+    # (a buffer without `inner` may also read one fixed element of each group: a lane broadcast, rendered as a lane gather)
+    if not any(c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST and c.src[1].arg in (want, st) for c in terms): return False
     hit = hit or want == st
   return hit
 

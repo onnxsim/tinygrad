@@ -859,12 +859,16 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kth.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kth, M, N)
       return ret
     # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points):
-    # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). The generated kernels are the default since the
-    # heuristic's small-group rules and the renderer's lane gathers (HVX_SMALL_REDUCE, HVX_LANE_GATHER): within ~1 ms per
-    # BEVFormer encoder layer of the hand kernel (hexagon-sim: 1.7-3x its cycles, from 21x)
-    if str(x.device).startswith("DSP") and x.dtype == dtypes.float32 and x._resolve_dim(axis) == x.ndim - 1 and x.shape[-1] in (2, 4, 8) \
-        and getenv("HAND_SOFTMAX_GRP", 0):
-      return _softmax_grp_dsp(x)
+    # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). Generated, the group max and sum are spelled as
+    # elementwise ops over the R lanes (no reduce): two elementwise kernels, exp(x - max) and e * 1 / sum, each one pass with
+    # the groups as lane gathers (HVX_SMALL_REDUCE, HVX_LANE_GATHER). The reduce form (max, sum of exp, exp / sum) took the exp
+    # twice; hexagon-sim, 160K floats: R=2 0.98 M cycles (hand 1.14 M), R=4 1.06 M (0.82 M), R=8 1.22 M (0.64 M)
+    if str(x.device).startswith("DSP") and x.dtype == dtypes.float32 and x._resolve_dim(axis) == x.ndim - 1 and x.shape[-1] in (2, 4, 8):
+      if getenv("HAND_SOFTMAX_GRP", 0): return _softmax_grp_dsp(x)
+      if getenv("SOFTMAX_GRP_FLAT", 1):
+        def lanes(t:Tensor) -> list[Tensor]: return [t[..., j:j+1] for j in range(t.shape[-1])]
+        e = (x - functools.reduce(Tensor.maximum, lanes(x))).exp().contiguous()
+        return e * (1 / functools.reduce(Tensor.add, lanes(e)))
     if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
     # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the
     # input (vector accumulators), the second the W lanes. One stage reduced each row with the rows as the vector lanes, R floats
