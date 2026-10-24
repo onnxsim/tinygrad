@@ -641,6 +641,9 @@ static void __softmax_grp(float* out, const float* in, int t, int nt, int G, int
   }
 }
 """
+def _hmx_attn_helpers() -> str:
+  # nn/onnx.py _hmx_attn_dsp: the hand fused attention (softmax(q k^T) v per head on the HMX, the softmax on its VTCM tiles)
+  return (pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "attn" / "hmx_attn.h").read_text()
 def _msda_helpers() -> str:
   hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
   return hdr.read_text() + _MSDA_CALL
@@ -2516,6 +2519,7 @@ class DSPRenderer(ClangRenderer):
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_attn(") for u in uops): prefix.append(_hmx_attn_helpers())
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
