@@ -898,13 +898,27 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Min(*data_0:Tensor): return functools.reduce(Tensor.minimum, data_0)
   def Sum(*data_0:Tensor): return functools.reduce(Tensor.add, data_0)
   def Mean(*data_0:Tensor): return Sum(*data_0) / len(data_0)
+  def _reduce_last(x:Tensor, axes, keepdim:bool, op:str) -> Tensor|None:
+    # REDUCE_TWO_STAGE: a reduction over only the last (contiguous) axis, R = 32 * k with k > 1, in two stages: (R // 32, 32) ->
+    # 32 lanes, realized, then the 32. In one stage the rows became the vector lanes, R floats apart, with a 4x4 transpose per
+    # step (BEVFormer's LayerNorm statistics: 15 ms for 2500 rows of 256); the first stage is one 32-lane add per 32 floats
+    if not getenv("REDUCE_TWO_STAGE") or x.ndim == 0 or not isinstance(R:=x.shape[-1], int) or R % 32 or R < 64: return None
+    ax = tuple(sorted(a + x.ndim if a < 0 else a for a in ((axes,) if isinstance(axes, int) else axes or range(x.ndim))))
+    if ax != (x.ndim - 1,): return None
+    split = (*x.shape[:-1], R // 32, 32)
+    if op == "max": return x.reshape(split).max(-2).contiguous().max(-1, keepdim=keepdim)
+    r = x.reshape(split).sum(-2).contiguous().sum(-1, keepdim=keepdim)
+    return r / R if op == "mean" else r
   def ReduceMax(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "max")) is not None: return r
     return data.max(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceMin(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
     return data.min(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceSum(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "sum")) is not None: return r
     return data.sum(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceMean(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "mean")) is not None: return r
     return data.mean(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceSumSquare(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
     return ReduceSum(data.square(), axes, keepdims, noop_with_empty_axes)
@@ -1168,8 +1182,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def LayerNormalization(x:Tensor, scale:Tensor, bias:Tensor|None=None, axis:int=-1, epsilon:float=1e-05, stash_type:int=1):
     assert stash_type == 1, "only float32 is supported"
     axes = tuple(i for i in range(axis if axis >= 0 else x.ndim + axis, x.ndim))
-    mean = (x32:=x.cast(dtypes.float)).mean(axis=axes, keepdim=True)
-    inv_std_dev = (x32.sub(mean)).square().mean(axis=axes, keepdim=True).add(epsilon).rsqrt()
+    x32 = x.cast(dtypes.float)
+    mean = _reduce_last(x32, axes, True, "mean")
+    if mean is None: mean = x32.mean(axis=axes, keepdim=True)
+    var = _reduce_last(x32.sub(mean).square(), axes, True, "mean")
+    inv_std_dev = (var if var is not None else x32.sub(mean).square().mean(axis=axes, keepdim=True)).add(epsilon).rsqrt()
     ret = (x32.sub(mean)*inv_std_dev).cast(x.dtype).mul(scale)
     return (ret.add(bias) if bias is not None else ret), mean, inv_std_dev
   def SkipLayerNormalization(x:Tensor, skip:Tensor, gamma:Tensor, beta:Tensor|None=None, bias:Tensor|None=None, epsilon:float=1e-12):
