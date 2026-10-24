@@ -374,7 +374,7 @@ def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
 # GEMM_FP16 products on the DSP and the hand softmax's results, by the id of the fp32 tensor the ONNX graph sees (with the
 # tensor itself, to tell a reused id): the padded fp16 product a softmax can take instead / the padded fp16 probabilities the
 # next product takes as its A
-_fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor]] = {}
+_fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor]] = {}  # (fp32 result, padded fp16 product, M, N, A, B unpadded)
 _fp16_in: dict[int, tuple[Tensor, Tensor]] = {}
 # softmax(q @ k^T) results that P @ V can instead compute as one fused HMX attention call (_hmx_attn_dsp): q, k^T fp16 operands
 _attn_in: dict[int, tuple[Tensor, Tensor, Tensor, int, int]] = {}
@@ -852,11 +852,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # and its padded fp16 result is what the next GEMM_FP16 product (P @ V) takes as its A. Generated, the slice + cast back, the
     # three softmax kernels and the cast + pad for P @ V took ~45 ms per BEVFormer decoder layer (8 x 900 x 900)
     if (ent := _fp16_out.get(id(x))) is not None and ent[0] is x and x._resolve_dim(axis) == x.ndim - 1 and ent[3] <= 2048:
-      _, y, M, N, q16, kt16 = ent
+      _, y, M, N, q16, kth = ent
       p16 = _softmax_h16_dsp(y, M, N, M + _hmx_pad_rows(M), N + -N % 32)
       ret = p16[..., :M, :N].float()  # only computed if something else reads the probabilities
       _fp16_in[id(ret)] = (ret, p16)
-      if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kt16.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kt16, M, N)
+      if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kth.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kth, M, N)
       return ret
     # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points):
     # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). The generated kernels are the default since the
@@ -1066,26 +1066,31 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # cast first (with whatever the producer fused into it, e.g. a ReLU), then pad as a plain copy: padded in the same kernel, the
     # row select landed on the fp16 result of the fused op instead of the load, which keeps all 128 lanes scalar (BEVFormer's
     # FFN: ~6 ms per 900 x 512 cast)
-    # On the DSP the pad is the hand row copy (_rowcopy_dsp): generated, each row's tail was a per-lane select (BEVFormer's decoder
-    # attention probabilities, 8 x 900 x 900 -> 928 x 928: 129 ms)
+    # On the DSP a column pad that ends inside a 64-lane vector (900 -> 928) is the hand row copy (_rowcopy_dsp): generated, the
+    # column mask varied inside the vector that holds a row's end, memory coalescing grouped those lanes by mask into 4 + 16 +
+    # 8 + 4 pieces and the row was rebuilt lane by lane (BEVFormer's decoder attention probabilities, 8 x 900 x 900 -> 928 x 928:
+    # 129 ms on the V69). A row pad (the Gemms' M) or a narrow one is generated, as fast as the hand copy (hexagon-sim). The
+    # fused attention (_hmx_attn_dsp) takes k^T unpadded, so BEVFormer has none of the first kind left
     dsp = str(a.device).startswith("DSP")
     def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
       t = t.half().contiguous()
       if not (rows or cols): return t
-      if dsp: return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
+      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
+        return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
       return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
     # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: the whole attention as one fused HMX call (HMX_ATTN=0: off)
     if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1):
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
     else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
-    b16 = pad16(b, r32(K), r32(N))
+    bh = b.half().contiguous()
+    b16 = pad16(bh, r32(K), r32(N))
     y = a16.matmul(b16, dtype=dtypes.half).contiguous()
     if y.shape[-2:] == (M, N): return y.float()
     # the slice + cast back fuses into the consumers (a bias add, ...) for free -- except a softmax's, read through the view (49 ms
     # more per BEVFormer decoder layer): on the DSP that takes the padded product itself (_softmax_contig)
     ret = y[..., :M, :N].float()
-    if dsp: _fp16_out[id(ret)] = (ret, y, M, N, a16, b16)
+    if dsp: _fp16_out[id(ret)] = (ret, y, M, N, a16, bh)
     return ret
 
   # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
@@ -1093,13 +1098,13 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
 
   def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
-    """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, Np), v (..., Np, 32) half, zero-padded to
-    whole tiles: the hand attention kernels in test/external/dsp/hand/attn. HMX_ATTN=1: one fused HMX call (its softmax on the
+    """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, N), v (..., Np, 32) half (q and v
+    zero-padded to whole tiles, k^T as it is): the hand attention kernels in test/external/dsp/hand/attn. HMX_ATTN=1: one fused HMX call (its softmax on the
     graph thread); 2 (default): per head an HMX call for S, the softmax on the DSP_THREADS pool on the same VTCM tiles, an HMX
     call for P @ V"""
     from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
     *bs, Mp, _ = q16.shape
-    Np, H, nt = kt16.shape[-1], prod(bs), max(1, getenv("DSP_THREADS", 1))
+    Np, H, nt = N + -N % 32, prod(bs), max(1, getenv("DSP_THREADS", 1))
     def ptr(b): return b.flatten().index(UOp.const(0, dtypes.int))
     def call(name, arg, out, *ins, threaded=False):
       def kern(*bufs):
@@ -1114,7 +1119,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # the VTCM holds one head at a time: each head's S call takes the previous head's output (read by nothing) to run after it
     outs, dep = [], q16
     for h in range(H):
-      tok = call(f"hmx_attn_s_{M}x{N}", f"__hmx_attn_s({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {h}, {M}, {Mp}, {Np});",
+      tok = call(f"hmx_attn_s_{M}x{N}", f"__hmx_attn_s({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {h}, {M}, {Mp}, {N}, {Np});",
                  Tensor.empty(32, dtype=dtypes.int32, device=q16.device), q16, kt16, v16, dep)
       tok = call(f"attn_sm_{M}x{N}", f"__attn_sm_vtcm({{0}}, {{1}}, {{2}}, {nt}, {Mp // 32}, {Np // 32}, {N - (Np - 32)});",
                  Tensor.empty(32, dtype=dtypes.int32, device=q16.device), tok, threaded=True)

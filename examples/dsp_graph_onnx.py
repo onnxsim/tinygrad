@@ -54,6 +54,32 @@ def constants_to_initializers(model) -> int:
   model.graph.node.extend(keep)
   return moved
 
+def keep_attention_vtcm(calls:list, bufs:dict) -> list:
+  """The split hand attention (nn/onnx.py _hmx_attn_dsp) keeps a head's S tiles in VTCM from its S call (hmx_attn_s_*) through
+  the pool's softmax (attn_sm_*) to its P @ V call (hmx_attn_pv_*); data flows between them only through that VTCM, which the
+  schedule doesn't see, so it may put another HMX kernel in between, whose tile caches overwrite S (BEVFormer's decoder: a Gemm
+  between head 2's S and P @ V, cls_scores 13% off). Every call in between that reads nothing the group wrote moves before the
+  S call (the group writes only its tokens, so that's all but the softmax); one that writes what the group reads can't, and
+  is an error. -> the reordered calls"""
+  def base(b): return id(bufs[b][0].base)
+  def writes(c): return {base(c[2][o]) for o in c[3]}
+  def reads(c): return {base(b) for i, b in enumerate(c[2]) if i not in c[3]}
+  out, i = list(calls), 0
+  while i < len(out):
+    if out[i][0].startswith("hmx_attn_s_"):
+      j = next(j for j in range(i + 1, len(out)) if out[j][0].startswith("hmx_attn_pv_"))
+      wrote, used, keep, move = writes(out[i]), reads(out[i]), [], []
+      for c in out[i + 1:j]:
+        if c[0].startswith("attn_sm_") or reads(c) & wrote:
+          keep.append(c); wrote |= writes(c); used |= reads(c)
+        else: move.append(c)
+      used |= reads(out[j])
+      if any(writes(c) & used for c in move): raise RuntimeError(f"call {i}: a call between an attention S and P @ V writes their input")
+      out[i:j] = move + [out[i]] + keep
+      i += len(move)
+    i += 1
+  return out
+
 def main() -> None:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("onnx"); p.add_argument("outdir")
@@ -123,6 +149,7 @@ def main() -> None:
     outs = [r[vo.name] for vo in model.graph.output] if isinstance(r, dict) else [r]
     holder["y"] = (outs[0] if len(outs) == 1 else Tensor.cat(*[o.cast(dtypes.float32).flatten() for o in outs])).contiguous().realize()
   calls, bufs = dsp_graph.capture(fn)
+  calls = keep_attention_vtcm(calls, bufs)
   ops_dsp.DSPCompiler.compile = real_compile
   y = holder["y"]
   used = {id(b[0].base) for b in bufs.values()}

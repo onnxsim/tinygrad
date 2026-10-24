@@ -13,10 +13,13 @@ static inline HVX_Vector __ha_recip(HVX_Vector x) {
   for (int k = 0; k < 3; k++) y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(y, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(two, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(x, y))))));
   return y;
 }
-/* 64 halfwords from p (64-byte aligned, inside one 128-byte block with its row) in the low half: an aligned load + vror never
-   reads past the row's 128-byte block */
-static inline HVX_Vector __ha_ld64(const __fp16* p) {
-  return Q6_V_vror_VR(*(const HVX_Vector*)((unsigned)p & ~127u), (int)(unsigned)p);
+/* n (1..64) halfwords from p, any alignment, in the low lanes (the rest: whatever follows in memory): aligned loads of only
+   the 128-byte blocks holding those n, joined by valign -- unlike an unaligned vector load it never touches a block with
+   nothing of them (the end of a buffer) */
+static inline HVX_Vector __ha_ldu(const __fp16* p, int n) {
+  unsigned a = (unsigned)p & ~127u, e = ((unsigned)p + 2 * n - 1) & ~127u;
+  HVX_Vector v0 = *(const HVX_Vector*)a, v1 = e != a ? *(const HVX_Vector*)(a + 128) : v0;
+  return Q6_V_valign_VVR(v1, v0, (int)(unsigned)p);
 }
 /* softmax over the nt tiles (32 keys each) of one 32-query block st, row pairs [r0, r1), in place: e = 2^((x - max) log2(e) + 7) in hf
    (2^n by the 1536.0 magic number, 2^-g by a degree-4 polynomial kept in qf16), lanes below 2^-13 zeroed (the keys from `valid`
