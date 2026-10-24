@@ -458,10 +458,12 @@ dsp_string = PatternMatcher([
    if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
   # vector casts must convert per lane; a C cast between ext_vector_types is a bitcast
   # under MOCKDSP, fp16 vector casts convert lane by lane through the scalar casts (the v65 backend miscompiles the vector
-  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op
+  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op,
+  # and so does a v68+ capture under MOCKDSP (traced for the device, never run by the mock): with the lane loop, a Gemm's fp16
+  # operand casts on the V69 took 16 ms per 655K values and wrote garbage
   (UPat(Ops.CAST, name="x"), lambda ctx,x: (lambda src, dst, n: f"({{ {ctx.render_type(x)} _r; __typeof__({ctx[x.src[0]]}) _s = {ctx[x.src[0]]}; "
      f"for (int _i = 0; _i < {n}; _i++) _r[_i] = ({ctx.render_dtype(x.dtype)})(_s[_i]); _r; }})")(None, None, x.max_numel())
-   if getenv("MOCKDSP") and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
+   if getenv("MOCKDSP") and not HVX_QFLOAT and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})"
    if x.max_numel() > 1 else None),
   # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a

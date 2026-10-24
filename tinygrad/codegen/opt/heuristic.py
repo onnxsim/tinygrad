@@ -57,8 +57,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   """
   # under MOCKDSP (v65, no fp16 vector hardware), half-precision vector arithmetic is miscompiled by clang's v65 backend:
   # keep half kernels scalar (no upcast, no tensor core) so the mock only ever sees scalar fp16 ops, which the
-  # fp16 helpers cover. The device path (real v69 codegen) is unchanged.
-  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and \
+  # fp16 helpers cover. The device path (real v69 codegen) is unchanged, and so is a v68+ capture under MOCKDSP (HVX_ARCH v68+:
+  # its kernels are only traced for the device, never run by the mock), which needs the HMX tensor core for fp16 matmuls
+  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and int(str(getenv("HVX_ARCH", "v65")).lstrip("v")) < 68 and \
      any(b.dtype == dtypes.half for b in k.bufs):
     return k
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis

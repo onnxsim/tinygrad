@@ -1030,7 +1030,28 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
 
   def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
-    ret = alpha * (A.transpose(transA) @ B.transpose(transB))
+    # GEMM_FP16: the product in fp16 (fp16 inputs, fp32-exact accumulation and one fp16 rounding of the output on the DSP's HMX),
+    # cast back; the bias is added in fp32. Opt-in: it changes the numerics
+    if getenv("GEMM_FP16") and A.dtype == dtypes.float32:
+      # the fp16 operands are realized copies, padded to whole 32 x 32 HMX tiles, and the product is realized before the slice, the
+      # cast back and the bias: the cast fused into the HMX kernel's tile packing, the cast back fused into its output epilogue and
+      # tinygrad's own padding of a tensor-core axis (TC_OPT=2) each made the phone's HMX kernel slow and/or wrong (M = 2500:
+      # 251 ms; padded here to 2528: as fast as M = 2560, 0.7 ms)
+      a, b = A.transpose(transA), B.transpose(transB)
+      (M, K), N = a.shape, b.shape[1]
+      r32 = lambda n: -n % 32
+      # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
+      # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
+      # cast first (with whatever the producer fused into it, e.g. a ReLU), then pad as a plain copy: padded in the same kernel, the
+      # row select landed on the fp16 result of the fused op instead of the load, which keeps all 128 lanes scalar (BEVFormer's
+      # FFN: ~6 ms per 900 x 512 cast)
+      def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
+        t = t.half().contiguous()
+        return t.pad(((0, rows), (0, cols))).contiguous() if rows or cols else t
+      a16 = pad16(a, max(r32(M), 64 - M), r32(K))
+      b16 = pad16(b, r32(K), r32(N))
+      ret = alpha * a16.matmul(b16, dtype=dtypes.half).contiguous()[:M, :N].float()
+    else: ret = alpha * (A.transpose(transA) @ B.transpose(transB))
     if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
     # MATMUL_CONTIGUOUS: the product realized on its own. Fused with a consumer that reads it in another layout (BEVFormer's
     # sampling offsets split into x / y per head), the matmul's output lanes followed that layout and its weight loads became

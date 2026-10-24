@@ -25,14 +25,18 @@ static unsigned char* g_blob;
 #ifdef G_HMX
 /* a program with HMX kernels (graph.h G_HMX, built for v69 with -mhmx): HMX power is voted once, and VTCM + the HMX context are
  * acquired for each run and released after it -- one HMX context per protection domain, and the runner keeps several programs
- * loaded in one PD. The graph thread holds the HMX lock while the calls run; HMX calls are never sliced over the pool
- * (dsp_graph_v65.emit refuses a threaded HMX call). __hmx_vtcm / __hmx_gen are the kernels' tile pool and its generation. */
+ * loaded in one PD. HMX calls run on the graph thread, never sliced over the pool (dsp_graph_v65.emit refuses a threaded HMX
+ * call). __hmx_vtcm / __hmx_gen are the kernels' tile pool and its generation. */
 #include "hmx_runtime.h"
+/* the HMX lock is held only around an HMX call (graph.h calls g_hmx_lock / g_hmx_unlock around each): held for the whole run, the threaded HVX kernels around the
+ * HMX ones (fp16 casts of a Gemm's operands) ran ~70x slower and wrote NaN on the phone */
 unsigned char* __hmx_vtcm;
 unsigned int __hmx_gen;
 static char g_hmx_power_ctx;
 static int g_hmx_powered;
 static hmx_rt_t g_hmx_rt;
+void g_hmx_lock(void) { HAP_compute_res_hmx_lock(g_hmx_rt.ctx); }
+void g_hmx_unlock(void) { HAP_compute_res_hmx_unlock(g_hmx_rt.ctx); }
 #endif
 #ifdef G_VTCM_BYTES
 /* a program with vgather kernels (DSP_V65_VGATHER): the constant 128 KB tables they look up are copied into VTCM once, after the
@@ -188,12 +192,24 @@ int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, 
 static int regions(void) {
   if (g_raw) return 0;
   size_t total = 128;
+#ifdef G_ARENA_BYTES
+  total += G_ARENA_BYTES;  /* the reused regions (G_REG_OFF >= 0) share one arena at the start of the block */
+  for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0 && G_REG_OFF[i] < 0) total += G_REG_BYTES[i];
+#else
   for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0) total += G_REG_BYTES[i];
+#endif
   if (!(g_raw = malloc(total))) return -1;
   memset(g_raw, 0, total);
   unsigned char* p = (unsigned char*)(((uintptr_t)g_raw + 127) & ~(uintptr_t)127);
+#ifdef G_ARENA_BYTES
+  unsigned char* arena = p;
+  p += G_ARENA_BYTES;
+#endif
   for (int i = 0; i < G_NREG; i++) {
     if (G_REG_BLOB[i] >= 0) g_R[i] = g_blob + G_REG_BLOB[i];
+#ifdef G_ARENA_BYTES
+    else if (G_REG_OFF[i] >= 0) g_R[i] = arena + G_REG_OFF[i];
+#endif
     else g_R[i] = p, p += G_REG_BYTES[i];
   }
   return 0;
@@ -226,9 +242,6 @@ static char g_gstack[GRAPH_STACK] __attribute__((aligned(128)));
 static void graph_thread(void* p) {
   job_t* j = (job_t*)p;
   qurt_hvx_lock(QURT_HVX_MODE_128B);
-#ifdef G_HMX
-  if (HAP_compute_res_hmx_lock(g_hmx_rt.ctx)) { j->rc = AEE_EFAILED; qurt_hvx_unlock(); qurt_thread_exit(0); }
-#endif
   j->rc = pool_start(j->threads);
   if (j->rc == 0 && j->start == 0 && j->inLen > 0) {
     int off = 0;
@@ -251,9 +264,6 @@ static void graph_thread(void* p) {
     if (j->start + j->count == G_NCALLS)
       for (int k = 0; k < G_NSTATE; k++) g_copy(g_R[G_IN_REG[G_ST_IN[k]]], g_R[G_OUT_REG] + G_OUT_OFF + G_ST_OFF[k], G_IN_BYTES[G_ST_IN[k]]);  /* state loop-back */
   }
-#ifdef G_HMX
-  HAP_compute_res_hmx_unlock(g_hmx_rt.ctx);
-#endif
   qurt_hvx_unlock();
   qurt_thread_exit(0);
 }
