@@ -838,8 +838,23 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   # SOFTMAX_CONTIGUOUS=1: the softmax is realized on its own instead of fused into its consumer. Fused into attention's P @ V,
   # the exp is computed inside the matmul once per (row, key) on a splat of the score across V's lanes (a whole vector exp per
   # key on the DSP); on its own it is an elementwise kernel that vectorizes the exp across the keys
-  def softmax_1(x:Tensor, axis:int=1): return x.softmax(axis).contiguous() if getenv("SOFTMAX_CONTIGUOUS") else x.softmax(axis)
-  def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis).contiguous() if getenv("SOFTMAX_CONTIGUOUS") else x.softmax(axis)
+  def _softmax_contig(x:Tensor, axis:int) -> Tensor:
+    if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
+    # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the
+    # input (vector accumulators), the second the W lanes. One stage reduced each row with the rows as the vector lanes, R floats
+    # apart -- a strided 4-wide load per row and step (BEVFormer's decoder: 900 keys, 2400 rows)
+    axis = x._resolve_dim(axis)
+    R = x.shape[axis]
+    W = next((w for w in (128, 64, 32) if isinstance(R, int) and R % w == 0 and R > w), None) or \
+        next((w for w in range(min(128, R // 2) if isinstance(R, int) else 0, 32, -1) if R % w == 0), None)
+    if W is None or axis != x.ndim - 1: return x.softmax(axis).contiguous()
+    split = (*x.shape[:-1], R // W, W)
+    # each first stage realized: fused with the second, the scheduler made one kernel and put the vector lanes on the rows again
+    m = x.reshape(split).max(-2).contiguous().max(-1, keepdim=True)
+    e = (x - m).exp()
+    return (e / e.reshape(split).sum(-2).contiguous().sum(-1, keepdim=True)).contiguous()
+  def softmax_1(x:Tensor, axis:int=1): return _softmax_contig(x, axis)
+  def softmax_13(x:Tensor, axis:int=-1): return _softmax_contig(x, axis)
   Softmax = {OpSetId(Domain.ONNX, 1):softmax_1, OpSetId(Domain.ONNX, 13):softmax_13}
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
   def Gelu(x:Tensor, approximate:str|None=None): return x.gelu(approximate="none" if approximate is None else approximate)
@@ -916,7 +931,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Flatten(x:Tensor, axis:int=1): return x.reshape(prod(x.shape[0:axis]), -1)
   def Expand(x:Tensor, shape:list[int]): return x.expand(_broadcast_shape(x.shape, tuple(shape)))
   def Shrink(x:Tensor, bias:float=0.0, lambd:float=0.5): return (x < -lambd)*(x+bias) + (x > lambd)*(x-bias)
-  def Transpose(x:Tensor, perm:list[int]|None=None): return x.permute(order=perm or list(range(x.ndim)[::-1]))
+  # TRANSPOSE_CONTIGUOUS: the transposed copy is realized. As a view, a consumer that wants the transposed layout (attention's
+  # K^T feeding Q @ K^T) reads the source with the transposed strides, so its vector lanes become strided gathers
+  def Transpose(x:Tensor, perm:list[int]|None=None):
+    ret = x.permute(order=perm or list(range(x.ndim)[::-1]))
+    return ret.contiguous() if getenv("TRANSPOSE_CONTIGUOUS") else ret
 
   def Squeeze(data:Tensor, axes:list[int]|None=None):
     return data.squeeze() if axes is None else functools.reduce(lambda d, dim: d.squeeze(dim), sorted(axes, reverse=True), data)
@@ -999,7 +1018,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
     ret = alpha * (A.transpose(transA) @ B.transpose(transB))
     if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
-    return ret
+    # MATMUL_CONTIGUOUS: the product realized on its own. Fused with a consumer that reads it in another layout (BEVFormer's
+    # sampling offsets split into x / y per head), the matmul's output lanes followed that layout and its weight loads became
+    # strided gathers
+    return ret.contiguous() if getenv("MATMUL_CONTIGUOUS") else ret
 
   def Einsum(*Inputs:list[Tensor], equation:str): return Tensor.einsum(equation, *Inputs)
 

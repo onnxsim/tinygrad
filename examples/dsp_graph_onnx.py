@@ -48,6 +48,9 @@ def main() -> None:
   # before tinygrad is imported: these are read at import time
   os.environ.update(DEV="DSP", MOCKDSP="1", HVX_ARCH=args.arch)
   os.environ.setdefault("DSP_THREADS", "4")
+  # layout choices that keep the generated kernels' vector lanes on unit-stride axes (each is 0 to turn off). BEVFormer-tiny on
+  # the V69, all four against none: decoder 3.39 -> 1.19 s, encoder layer 0.91 -> 0.39 s, 3-layer encoder 3.55 -> 1.23 s
+  for flag in ("SOFTMAX_CONTIGUOUS", "MATMUL_CONTIGUOUS", "TRANSPOSE_CONTIGUOUS", "HVX_UPCAST_ODD"): os.environ.setdefault(flag, "1")
   import numpy as np, onnx
   from tinygrad import Tensor, dtypes
   from tinygrad.nn.onnx import OnnxRunner
