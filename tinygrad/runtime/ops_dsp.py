@@ -101,6 +101,11 @@ def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
     out.append(f"static inline {t} __tg_exp2_h{n}({t} x) {{ return ({t}){parts[0]}; }}")
   return out
 
+def _gathered(bidx:UOp) -> bool:
+  # an address computed from a loaded value (a gather): a prefetch a fixed distance past it fetches an unrelated line (MSDA's
+  # tap rows, 128 bytes each, scattered over the value maps: twice the DDR traffic)
+  return any(u.op is Ops.LOAD for s in bidx.src[1:] for u in s.backward_slice)
+
 def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
   if not QF_MATH: return []
   uses = {(Ops.RECIPROCAL if u.op is Ops.FDIV else u.op, u.max_numel()) for u in uops
@@ -503,7 +508,7 @@ dsp_string = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{_prefetch_distance(ctx, bidx, x.dtype.itemsize)+o}), "
                  for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
-   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL else None),
+   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL and not _gathered(bidx) else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
    if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
