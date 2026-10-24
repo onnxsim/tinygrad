@@ -14,6 +14,28 @@ import argparse, json, os, pathlib, sys
 
 ONNX_DTYPES = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64", 9: "bool", 10: "float16"}
 
+def pretranspose_gemm_weights(model) -> int:
+  """Gemm(A, B, transB=1) with B a constant used by nothing else -> B stored transposed and transB=0. Same result; the generated
+  kernel's output lanes then read B contiguously. Kept (N, K), each reduction step loaded its 128 lanes one scalar at a time
+  from 128 rows (BEVFormer-tiny's encoder FFN: 2.2 s per 2500x256x512 Gemm on the V69). -> the number of Gemms rewritten"""
+  import onnx
+  from onnx import numpy_helper
+  init = {t.name: t for t in model.graph.initializer}
+  uses: dict[str, int] = {}
+  for n in model.graph.node:
+    for i in n.input: uses[i] = uses.get(i, 0) + 1
+  done = 0
+  for n in model.graph.node:
+    if n.op_type != "Gemm" or len(n.input) < 2 or n.input[1] not in init or uses[n.input[1]] != 1: continue
+    tb = next((a for a in n.attribute if a.name == "transB"), None)
+    if tb is None or tb.i != 1: continue
+    t = init[n.input[1]]
+    t.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(t).T.copy(), t.name))
+    tb.i = 0
+    done += 1
+  onnx.checker.check_model(model)
+  return done
+
 def main() -> None:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("onnx"); p.add_argument("outdir")
@@ -29,7 +51,12 @@ def main() -> None:
   from tinygrad.nn.onnx import OnnxRunner
   from tinygrad.runtime.support import dsp_graph, dsp_graph_v65
 
-  model = onnx.load(args.onnx, load_external_data=False)
+  model = onnx.load(args.onnx)
+  out = pathlib.Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
+  if os.environ.get("GEMM_PRETRANSPOSE", "1") != "0" and (n := pretranspose_gemm_weights(model)):
+    onnx.save(model, out / "model.onnx")
+    print(f"pre-transposed the constant B of {n} transB=1 Gemms", file=sys.stderr)
+    args.onnx = str(out / "model.onnx")
   init = {i.name for i in model.graph.initializer}
   graph_inputs = [vi for vi in model.graph.input if vi.name not in init]
   run = OnnxRunner(args.onnx)
@@ -53,7 +80,6 @@ def main() -> None:
   y = holder["y"]
   used = {id(b[0].base) for b in bufs.values()}
   ins = [(name, t) for name, t in feeds.items() if id(t.uop.buffer.base) in used]
-  out = pathlib.Path(args.outdir)
   info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for _, t in ins], y.uop.buffer)
   print(f"emitted {info['calls']} calls ({info['threaded_calls']} threaded), {info['kernels']} kernels, hmx={info['hmx']}, "
         f"{info['blob']/1e6:.1f} MB weights, {info['scratch']/1e6:.2f} MB scratch -> {out}", file=sys.stderr)
