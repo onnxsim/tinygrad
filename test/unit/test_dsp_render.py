@@ -38,6 +38,19 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((a.float() * b.float()).sum(axis=0))
     self.assertIn("float128", src)
 
+  def test_gathered_row_loads_whole(self):
+    # a row gather (a loaded row index * 256 + lane) whose rows are split into two 128-lane chunks: lane 0's index renders
+    # as row + chunk and the other lanes' as (chunk + row) + k, the same sum in another order. memory_coalescing keyed its
+    # groups on the exact UOp, so lane 0 was its own group and the row came out as 1 + 64 + 32 + 16 + 8 + 4 + 1 + 1 + 1
+    # misaligned pieces (BEVFormer's sparse SCA reduce: 8.5 -> 0.7 ms on the phone once it is one load per chunk)
+    rows, idx = Tensor.empty(64 * 256), Tensor.empty(6, 16, dtype=dtypes.int32)
+    ok = idx < 64
+    elems = (idx * ok.cast(dtypes.int32)).reshape(-1, 1) * 256 + Tensor.arange(256, dtype=dtypes.int32).reshape(1, 256)
+    g = Tensor(rows.uop.index(elems.reshape(-1).uop)).reshape(6, 16, 256)
+    src = dsp_source((g * ok.cast(dtypes.float32).reshape(6, 16, 1)).sum(0))
+    self.assertNotRegex(src, r"\bfloat(64|32|16|8|4)_u\b", "a gathered row was split into narrower unaligned loads")
+    self.assertIn("float128", src)
+
   def test_strided_reduce_prefetches_rows_ahead(self):
     # a reduction down the rows of a row-major (512, 1024) half matrix: the load moves 2 KB per reduce step, so it prefetches
     # HVX_PREFETCH_STRIDES (4) rows ahead, not HVX_PREFETCH bytes (one row)

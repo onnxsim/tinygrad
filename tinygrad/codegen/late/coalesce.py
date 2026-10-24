@@ -111,6 +111,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
 
   # collect
   memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp], dict[int, list[UOp]]] = defaultdict(dict)
+  add_roots: dict[tuple, UOp] = {}
   for u in sink.toposort():
     # TODO: this should handle images too, it's just memory coalescing
     if u.op in {Ops.LOAD, Ops.STORE}:
@@ -127,6 +128,10 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       elif idx.op is Ops.CONST and idx.val is Invalid: root_src, arg = "INVALID", 0
       elif idx.op is Ops.CONST: root_src, arg = "CONST", idx.val
       else: root_src, arg = idx, 0
+      # the same sum with its terms in another order is the same root: a gathered row's lane 0 indexed as b+a and its other
+      # lanes as (a+b)+k fell into two groups, and the 128-lane row load split into misaligned pieces (1, 64, 32, ..., 1)
+      if isinstance(root_src, UOp) and root_src.op is Ops.ADD:
+        root_src = add_roots.setdefault(tuple(sorted(root_src.split_uop(Ops.ADD), key=lambda t: t.tuplize)), root_src)
       memory[(u.op, buf, root_src, valid)].setdefault(arg, []).append(u)
 
   # on the DSP, don't merge loads wider than the widest contiguous store group: a wider load that consumers only use in
