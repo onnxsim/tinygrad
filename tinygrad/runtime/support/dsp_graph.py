@@ -27,7 +27,8 @@ def _cap_exec(ctx, call, ast):
     ids.append(id(b))
   outs = {ast.arg.globals.index(i) for i in ast.arg.outs}
   src = ast.src[2].arg
-  if "__hmx_qadd_chunk(" in src: outs.add(0)  # the custom QLinearAdd kernel writes its output in the CUSTOM call, not a STORE
+  # the custom QLinearAdd / MSDA kernels write their output in the CUSTOM call, not a STORE
+  if "__hmx_qadd_chunk(" in src or "__msda_call(" in src: outs.add(0)
   # a DSP_THREADS kernel takes a trailing core_id: its slices are the launch's global_size[0] (0: not threaded)
   nthreads = int(ast.arg.global_size[0]) if 'core_id' in ast.arg.runtimevars else 0
   _CAP["calls"].append((re.sub(r"\x1b\[[0-9;]*m", "", ast.arg.name), src, ids, outs, nthreads))

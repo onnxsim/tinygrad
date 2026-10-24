@@ -51,6 +51,7 @@ class Domain(enum.Enum):
   MICROSOFT_NCHWC = "com.microsoft.nchwc"
   MICROSOFT_EXPERIMENTAL = "com.microsoft.experimental"
   PYTORCH_ATEN = "org.pytorch.aten"
+  ONNXSIM = "onnxsim"  # onnxsim's own ops (MSDA: the hand-kernel span of bevformer_tiny/msda_hvx/export_msda_op.py in onnxsim)
   @classmethod
   def from_onnx(cls, domain: str | None) -> "Domain": return cls.ONNX if domain is None or domain == "" else cls(domain)
 
@@ -1517,6 +1518,55 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       tap = Tensor(rows.uop.index(elems.reshape(-1).uop)).reshape(N, Ho, Wo, C) * w.unsqueeze(-1).cast(X.dtype)
       out = tap if out is None else out + tap
     return cast(Tensor, out).permute(0, 3, 1, 2)
+
+  def MSDA(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None=None, H:int=0, W:int=0):
+    """onnxsim::MSDA: one-level multi-scale deformable attention in the hand DSP kernel's contract (test/external/dsp/hand/msda,
+    mode MSDA_REF_PIX): value (NV, H*W, C) channels-last, ref (NVR, Q, R, 2) in [0, 1], off (Q, M, NO, P, 2) raw offsets in
+    pixels, attw (Q, M, NO, P), vis (NV, Q) uint8 or absent -> (Q, C) = the mean over the visible maps of
+    sum_p attw * bilinear(value[v, :, head h], ref[.., p % R] * (W, H) - 0.5 + off). On the DSP it is that hand kernel (one call,
+    queries split over DSP_THREADS); elsewhere the same math through GridSample"""
+    NV, S, C = value.shape
+    Q, M, NO, P, _ = off.shape
+    NVR, R = ref.shape[0], ref.shape[2]
+    assert S == H * W and C % M == 0 and NO in (1, NV) and NVR in (1, NV), f"MSDA: inconsistent shapes {value.shape} {ref.shape} {off.shape}"
+    if str(value.device).startswith("DSP"): return _msda_dsp(value, ref, off, attw, vis, H, W)
+    D = C // M
+    # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
+    refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
+    wh = Tensor([float(W), float(H)], dtype=value.dtype)
+    maps = []
+    for v in range(NV):
+      loc = refp[v if NVR > 1 else 0].reshape(Q, 1, P, 2) + off[:, :, v if NO > 1 else 0] / wh                 # (Q, M, P, 2)
+      s = GridSample(value[v].reshape(H * W, M, D).permute(1, 2, 0).reshape(M, D, H, W), (2 * loc - 1).permute(1, 0, 2, 3))
+      a = attw[:, :, v if NO > 1 else 0].permute(1, 0, 2).reshape(M, 1, Q, P)                                   # s: (M, D, Q, P)
+      maps.append((s * a).sum(-1).reshape(C, Q).T)                                                             # (Q, C)
+    per_map = Tensor.stack(*maps, dim=0)                                                                        # (NV, Q, C)
+    if vis is None: return per_map.mean(0)
+    vf = vis.cast(value.dtype).reshape(NV, Q, 1)
+    return (per_map * vf).sum(0) / vf.sum(0).maximum(1.0)
+
+  def _msda_dsp(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    NV, S, C = value.shape
+    Q, M, NO, P, _ = off.shape
+    NVR, R = ref.shape[0], ref.shape[2]
+    nt = max(1, getenv("DSP_THREADS", 1))
+    # the kernel reads value / loc / attw / out as whole aligned buffers from their first byte (its HVX body wants 128-byte
+    # alignment), so each input is assigned into a buffer of its own: a slice of a realized buffer can stay a view, and the call
+    # would get its base pointer
+    def own(t:Tensor, dt) -> Tensor: return Tensor.empty(*t.shape, dtype=dt, device=t.device).assign(t.cast(dt))
+    ins = [own(value, dtypes.float32), own(off, dtypes.float32), own(ref, dtypes.float32), own(attw, dtypes.float32)]
+    if vis is not None: ins.append(own(vis, dtypes.uint8))
+    consts = f"{NV}, {S}, {H}, {W}, {M}, {C // M}, {P}, {Q}, {NO}, {NVR}, {R}"
+    def kern(Y, *bufs):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), *[b.flatten().index(UOp.const(0, dtypes.int)) for b in bufs], t)
+      vis_arg = "{5}" if vis is not None else "0"
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
+               arg=f"__msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"msda_{NV}x{Q}x{M}x{P}", opts_to_apply=()))
+    y = Tensor.empty(Q, C, dtype=dtypes.float32, device=value.device)
+    return Tensor.custom_kernel(y, *ins, fxn=kern)[0]
 
   def Compress(inp:Tensor, condition:list[bool], axis:int|None=None):
     if axis is None:

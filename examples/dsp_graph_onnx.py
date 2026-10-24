@@ -38,6 +38,22 @@ def pretranspose_gemm_weights(model) -> int:
   onnx.checker.check_model(model)
   return done
 
+def constants_to_initializers(model) -> int:
+  """Constant nodes -> initializers, so they are realized (and their python values read, see main) before the capture: a
+  Constant node's output is made inside it, where a value the runner reads on the host comes back as zeros. -> the number moved"""
+  from onnx import helper, numpy_helper
+  keep, moved = [], 0
+  for n in model.graph.node:
+    attr = {a.name: a for a in n.attribute}
+    if n.op_type == "Constant" and n.domain in ("", "ai.onnx") and "value" in attr:
+      t = helper.get_attribute_value(attr["value"])
+      model.graph.initializer.append(numpy_helper.from_array(numpy_helper.to_array(t), n.output[0]))
+      moved += 1
+    else: keep.append(n)
+  del model.graph.node[:]
+  model.graph.node.extend(keep)
+  return moved
+
 def main() -> None:
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("onnx"); p.add_argument("outdir")
@@ -48,6 +64,7 @@ def main() -> None:
   # before tinygrad is imported: these are read at import time
   os.environ.update(DEV="DSP", MOCKDSP="1", HVX_ARCH=args.arch)
   os.environ.setdefault("DSP_THREADS", "4")
+  os.environ.setdefault("PARALLEL", "0")  # compile in this process: the capture's stand-in compiler (below) doesn't reach a pool
   # layout choices that keep the generated kernels' vector lanes on unit-stride axes (each is 0 to turn off). BEVFormer-tiny on
   # the V69, all four against none: decoder 3.39 -> 1.19 s, encoder layer 0.91 -> 0.39 s, 3-layer encoder 3.55 -> 1.23 s
   # (REDUCE_TWO_STAGE on top: 1.12 / 0.32 / 0.97 s)
@@ -60,9 +77,15 @@ def main() -> None:
 
   model = onnx.load(args.onnx)
   out = pathlib.Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
+  changed = False
   if os.environ.get("GEMM_PRETRANSPOSE", "1") != "0" and (n := pretranspose_gemm_weights(model)):
-    onnx.save(model, out / "model.onnx")
     print(f"pre-transposed the constant B of {n} transB=1 Gemms", file=sys.stderr)
+    changed = True
+  if n := constants_to_initializers(model):
+    print(f"{n} Constant nodes made initializers", file=sys.stderr)
+    changed = True
+  if changed:
+    onnx.save(model, out / "model.onnx")
     args.onnx = str(out / "model.onnx")
   init = {i.name for i in model.graph.initializer}
   graph_inputs = [vi for vi in model.graph.input if vi.name not in init]
@@ -70,6 +93,12 @@ def main() -> None:
   # constants first: lowerings read them with .numpy(), and inside the capture no kernel runs
   for v in run.graph_values.values():
     if isinstance(v, Tensor): v.realize()
+  # and the python values the runner reads from small constants (Gather indices, Split sizes, Reshape shapes): read inside the
+  # capture, .tolist() runs a copy kernel that doesn't run there and reads zeros -- BEVFormer's 3-layer encoder took every
+  # layer's camera value maps from one merged value_proj output with scalar Gather indices: all three layers read slice 0
+  from tinygrad.nn.onnx import _to_python_const
+  for name, v in run.graph_values.items():
+    if name in run.const_names and isinstance(v, Tensor) and v.numel() <= 4096: run._python_const_cache[name] = _to_python_const(v)
   if hasattr(run, "_qdq_grid"): run._qdq_grid()  # the QDQ lowering (when the graph has one) is built on the first call: build it here
   feeds = {}
   for vi in graph_inputs:
@@ -78,12 +107,21 @@ def main() -> None:
     if any(d <= 0 for d in shape): sys.exit(f"input {vi.name} has a dynamic shape {shape}; export with static shapes")
     feeds[vi.name] = Tensor(np.zeros(shape, ONNX_DTYPES[tt.elem_type])).realize()
 
+  # inside the capture nothing runs, so its kernels needn't compile for the mock (clang-19's v68+ HVX path, the qemu link): a
+  # stand-in binary keyed by the source, as bevformer_tiny/tinygrad_port/capture_msda.py's NO_COMPILE in onnxsim. The device
+  # build compiles every kernel with the Hexagon SDK's compiler. (clang-19 crashed on the hand MSDA kernel's HVX body, and the
+  # mock link has no memcpy.)
+  import hashlib
+  from tinygrad.runtime import ops_dsp
+  real_compile = ops_dsp.DSPCompiler.compile
+  ops_dsp.DSPCompiler.compile = lambda self, src: b"NOCOMPILE" + hashlib.sha256(src.encode()).digest()
   holder: dict = {}
   def fn():
     r = run(feeds)
     outs = [r[vo.name] for vo in model.graph.output] if isinstance(r, dict) else [r]
     holder["y"] = (outs[0] if len(outs) == 1 else Tensor.cat(*[o.cast(dtypes.float32).flatten() for o in outs])).contiguous().realize()
   calls, bufs = dsp_graph.capture(fn)
+  ops_dsp.DSPCompiler.compile = real_compile
   y = holder["y"]
   used = {id(b[0].base) for b in bufs.values()}
   ins = [(name, t) for name, t in feeds.items() if id(t.uop.buffer.base) in used]

@@ -483,6 +483,23 @@ dsp_string = PatternMatcher([
   (UPat(Ops.INDEX, src=(UPat(Ops.LOAD), UPat()), name="x"), _lane_of_loaded),
 ])
 
+# onnxsim::MSDA (nn/onnx.py MSDA): the hand-written multi-scale deformable attention kernel, test/external/dsp/hand/msda/msda_kernel.h,
+# inlined as the kernel's prelude (its HVX body from v68 on, its scalar body below), plus one call that fills its argument
+# struct for the one-level, MSDA_REF_PIX case and runs this thread's slice of the queries
+_MSDA_CALL = """
+static void __msda_call(float* out, const float* value, const float* loc, const float* ref, const float* attw, const unsigned char* vis,
+                        int t, int nt, int NV, int S, int H, int W, int M, int D, int P, int Q, int NO, int NVR, int R) {
+  msda_args_t a;  /* every field set (no memset: the freestanding mock link has none); only level 0 is read with L = 1 */
+  a.NV = NV; a.L = 1; a.H[0] = H; a.W[0] = W; a.start[0] = 0; a.S = S; a.M = M; a.D = D; a.P = P; a.Q = Q; a.NO = NO;
+  a.mode = MSDA_REF_PIX; a.NVR = NVR; a.RL = 1; a.R = R; a.RD = 2; a.vdtype = MSDA_F32;
+  a.value = value; a.value_u8 = 0; a.vscale = 0; a.vzp = 0; a.loc = loc; a.ref = ref; a.attw = attw; a.vis = vis; a.out = out;
+  msda_run(&a, (int)((long)Q * t / nt), (int)((long)Q * (t + 1) / nt));
+}
+"""
+def _msda_helpers() -> str:
+  hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
+  return hdr.read_text() + _MSDA_CALL
+
 # ***** HVX re-vectorization *****
 # devectorizer2 splits every elementwise op into per-lane scalars and memory_coalescing only regroups the loads and
 # stores (up to 128 lanes for DSP), so the ALU in between is rendered as `(int128){(a[0]+b[0]),(a[1]+b[1]),...}`, which
@@ -2350,6 +2367,7 @@ class DSPRenderer(ClangRenderer):
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__msda_call(") for u in uops): prefix.append(_msda_helpers())
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
@@ -2708,10 +2726,12 @@ _TRUNCF = "({union{float f;unsigned u;} _v={(%s)}; int _e=(int)((_v.u>>23)&255u)
 # LLVM 19's Hexagon backend aborts ("Cannot select: v8i8 = bitcast <v8i1 HexagonISD::V2Q>") when a few scalar float compares,
 # ANDed with other bools, get packed into one small (4/8-lane) char/int vector -- a lane-stacked store of compare results,
 # e.g. a pairwise IoU test. Without HVX float (v65/v66) the compares can't be vectorized profitably anyway: an empty asm on
-# each scalar float compare result keeps it a scalar predicate and the backend never forms the v8i1.
+# each scalar float compare result keeps it a scalar predicate and the backend never forms the v8i1. The Hexagon SDK's compiler
+# aborts the same way for v69 code (BEVFormer's camera visibility, (bev_mask.sum(-1) > 0) stored as 8 uint8 lanes), so a v68+
+# capture (rendered here, under MOCKDSP) keeps the barrier too; real vector compares (HVX_REVEC_CMP) are not scalar and unaffected
 _FCMP = "({_Bool _c=(%s); __asm__(\"\" : \"+r\"(_c)); _c;})"
 def _scalar_fcmp(ctx, x:UOp) -> str|None:
-  if HVX_QFLOAT or x.max_numel() != 1 or x.src[0].max_numel() != 1 or not dtypes.is_float(x.src[0].dtype): return None
+  if x.max_numel() != 1 or x.src[0].max_numel() != 1 or not dtypes.is_float(x.src[0].dtype): return None
   return _FCMP % ctx.code_for_op[x.op](*[ctx[s] for s in x.src], x.src[0].dtype)
 mock_dsp_string = PatternMatcher([(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="x"), _scalar_fcmp)])
 
