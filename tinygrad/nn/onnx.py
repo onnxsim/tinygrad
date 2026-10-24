@@ -858,10 +858,12 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       _fp16_in[id(ret)] = (ret, p16)
       if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kt16.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kt16, M, N)
       return ret
-    # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points): the hand
-    # grouped softmax (_softmax_grp_dsp)
+    # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points):
+    # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). The generated kernels are the default since the
+    # heuristic's small-group rules and the renderer's lane gathers (HVX_SMALL_REDUCE, HVX_LANE_GATHER): within ~1 ms per
+    # BEVFormer encoder layer of the hand kernel (hexagon-sim: 1.7-3x its cycles, from 21x)
     if str(x.device).startswith("DSP") and x.dtype == dtypes.float32 and x._resolve_dim(axis) == x.ndim - 1 and x.shape[-1] in (2, 4, 8) \
-        and getenv("HAND_SOFTMAX_GRP", 1):
+        and getenv("HAND_SOFTMAX_GRP", 0):
       return _softmax_grp_dsp(x)
     if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
     # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the

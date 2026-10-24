@@ -223,6 +223,33 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   if not all(isinstance(l, int) for l in lanes) or lanes != list(range(lanes[0], lanes[0]+len(lanes))): return None
   return v, lanes
 
+def _lane_gather(srcs:tuple[UOp, ...]) -> tuple[list[UOp], list[int]]|None:
+  # STACK of constant lanes of up to 8 equal-width vectors (a per-group value repeated over the group's lanes, lane i -> i // 4;
+  # element k of 32 groups of 4 loaded as four 32-lane vectors) -> (the vectors, lanes into their concatenation): rendered as
+  # __builtin_shufflevector (pairs concatenated first), which clang lowers to HVX permutes, instead of a lane constructor
+  if len(srcs) < 2 or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in srcs): return None
+  vs: list[UOp] = []
+  for s in srcs:
+    if s.src[0] not in vs: vs.append(s.src[0])
+  w = vs[0]._shape
+  if len(vs) > 8 or w is None or len(w) != 1 or any(v._shape != w for v in vs): return None
+  lanes = [_lane(s.src[1]) for s in srcs]
+  if not all(isinstance(l, int) for l in lanes): return None
+  return vs, [vs.index(s.src[0]) * w[0] + l for s, l in zip(srcs, lanes)]
+
+def _render_lane_gather(ctx, x:UOp) -> str|None:
+  if not HVX_LANE_GATHER or (g:=_lane_gather(x.src)) is None: return None
+  vs, lanes = g
+  w = vs[0]._shape[0]
+  def cat(a:str, b:str, n:int) -> str: return f"__builtin_shufflevector({a}, {b}, {','.join(map(str, range(2 * n)))})"
+  # concatenate pairwise (an odd one out paired with itself) down to the two operands of the final shuffle
+  srcs = [ctx[v] for v in vs]
+  while len(srcs) > 2:
+    srcs = [cat(srcs[i], srcs[i + 1] if i + 1 < len(srcs) else srcs[i], w) for i in range(0, len(srcs), 2)]
+    w *= 2
+  a, b = (srcs[0], srcs[0]) if len(srcs) == 1 else srcs
+  return f"(({ctx.render_type(x)})__builtin_shufflevector({a}, {b}, {','.join(map(str, lanes))}))"
+
 def _lane_concat(x:UOp) -> list[UOp]|None:
   # STACK(a[0..n-1], b[0..n-1], ...) of whole equal-width vectors one after another (memory_coalescing loads a 128-lane int32 row as
   # two 64-lane vectors) -> [a, b, ...]
@@ -450,6 +477,7 @@ dsp_string = PatternMatcher([
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _render_lane_concat(ctx, x) if getenv("DSP_LANE_CONCAT", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
+  (UPat(Ops.STACK, name="x"), _render_lane_gather),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
   # vector load): reload that element as a scalar (then one vsplat) -- the lane splat clang v19 builds with vinserts
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _splat_of_loaded_lane(ctx, x)),
@@ -657,6 +685,7 @@ def _msda_helpers() -> str:
 # STACK(op(a_i, b_i) for i) -> op(STACK(a_i), STACK(b_i)); STACK(v[0], ..., v[n-1]) -> v. clang lowers ext_vector_type
 # arithmetic straight to HVX under -mhvx. Compares/WHERE are left scalar: C vector compares yield same-width int masks,
 # not _Bool vectors, so they'd need mask-dtype plumbing -- MAX (the common select) is native instead.
+HVX_LANE_GATHER = getenv("HVX_LANE_GATHER", 1)
 HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
 # with qfloat (v68+) EXP2 / RECIPROCAL / float FDIV are rendered as vector helpers (_qf_math_helpers) instead of being
 # decomposed, so they re-vectorize too (added while QF_MATH is on, see _vec_ops)
@@ -682,6 +711,8 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     if any(c.op is not Ops.INDEX or len(c.src) != 2 or c.src[0]._shape is None or len(c.src[0]._shape) != 1 for c in col): return False
     lanes = [_lane(c.src[1]) for c in col]
     if None in lanes: return False
+    # any constant lanes of up to 8 equal-width vectors (_lane_gather: rendered as shuffles)
+    if HVX_LANE_GATHER and _lane_gather(col) is not None: return True
     return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
                                                                        ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
   if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col))) and \

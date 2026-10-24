@@ -9,6 +9,7 @@ from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
+HVX_SMALL_REDUCE = getenv("HVX_SMALL_REDUCE", 1)
 # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
 # between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
 HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
@@ -28,6 +29,36 @@ def _every_unit_stride(k:Scheduler, axis:int) -> bool:
     if rng not in idx.backward_slice: continue
     if not any(c is rng for c in idx.split_uop(Ops.ADD)): return False
     hit = True
+  return hit
+
+def _contiguous_with_upcast(k:Scheduler, axis:int) -> bool:
+  # every buffer indexed along this axis reads it at unit stride, or at a stride equal to the extent of an upcast axis it reads
+  # at unit stride (the axis then continues that upcast's lanes contiguously: a softmax over groups of 4 with the 4 upcast takes
+  # 32 groups as 128 contiguous lanes), and at least one buffer does
+  rng, hit = k.rngs[axis], False
+  ups = {k.rngs[a]: int(k.full_shape[a]) for a in k.axes_of(AxisType.UPCAST)}
+  for b in k.bufs:
+    idx = b.src[1].get_idx()
+    if rng not in idx.backward_slice: continue
+    terms = list(idx.split_uop(Ops.ADD))
+    if not any(c is rng for c in terms):
+      st = next((int(c.src[1].arg) for c in terms if c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST), None)
+      if st is None or not any(u in ups and ups[u] == st for u in terms): return False
+    hit = True
+  return hit
+
+def _stride_in_every(k:Scheduler, axis:int, st:int, inner) -> bool:
+  # every buffer that reads `inner` (a range at unit stride) reads `axis` at stride st, and every other buffer reading `axis`
+  # reads it at unit stride: the axis continues `inner`'s elements contiguously (groups of st one after another)
+  rng, hit = k.rngs[axis], False
+  for b in k.bufs:
+    idx = b.src[1].get_idx()
+    if rng not in idx.backward_slice: continue
+    terms = list(idx.split_uop(Ops.ADD))
+    want = st if inner in idx.backward_slice else 1
+    if want == 1 and any(c is rng for c in terms): continue
+    if not any(c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST and c.src[1].arg == want for c in terms): return False
+    hit = hit or want == st
   return hit
 
 def _odd_upcasts(k, axis:int, cap:int) -> list[int]:
@@ -119,6 +150,34 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if dsp_scalar_float:
     reuse_axes = [a for a in k.upcastable_dims if k.full_shape[a] > 1 and any(k.rngs[a] not in b.src[1].get_idx().backward_slice for b in k.bufs)]
     dsp_scalar_float = len(reuse_axes) >= 2
+
+  # on qfloat DSPs, a reduction over a small contiguous axis (softmax / max / sum over 2..8 floats: deformable attention's
+  # sampling points) whose groups sit one after another: 32 groups as the vector lanes and the small axis unrolled, so its R
+  # loads per step are the lanes of R contiguous vectors (memory_coalescing merges them; the shuffles that pick each group
+  # element are register permutes). As the generic rules left it -- 128 groups as lanes, the R steps a loop -- every load was a
+  # 128-lane stride-R gather: BEVFormer's encoder-layer softmax over 4 points, 5.7 M cycles for the max and sum vs 1 M by hand
+  if is_dsp and HVX_SMALL_REDUCE and max_bytes is None and k.reduceop is not None and len(k.axes_of(AxisType.REDUCE)) == 1:
+    r = k.axes_of(AxisType.REDUCE)[0]
+    R = int(k.full_shape[r]) if isinstance(k.full_shape[r], int) else 0
+    if 2 <= R <= 8 and _every_unit_stride(k, r):
+      for a in k.upcastable_dims[::-1]:
+        if k.full_shape[a] % 32 == 0 and _stride_in_every(k, a, R, k.rngs[r]):
+          k.apply_opt(Opt(OptOps.UPCAST, a, 32))
+          k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(k.axes_of(AxisType.REDUCE)[0]), 0))  # (the upcast moved it)
+          return apply_threads(k)
+
+  # ...and the elementwise kernels over such groups (the softmax's normalisation): the small axis whole and 128 / R groups, so
+  # lanes are 128 contiguous floats (the generic rules took 128 groups as lanes with a 2-wide axis left a loop: stride-2 lanes)
+  if is_dsp and HVX_SMALL_REDUCE and max_bytes is None and k.reduceop is None:
+    for r in k.upcastable_dims[::-1]:
+      R = int(k.full_shape[r]) if isinstance(k.full_shape[r], int) else 0
+      if not (2 <= R <= 8 and 128 % R == 0 and _every_unit_stride(k, r)): continue
+      a = next((a for a in k.upcastable_dims[::-1] if a != r and k.full_shape[a] % (128 // R) == 0 and _stride_in_every(k, a, R, k.rngs[r])), None)
+      if a is None: continue
+      rr = k.rngs[r]
+      k.apply_opt(Opt(OptOps.UPCAST, a, 128 // R))
+      k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rr), 0))  # (the upcast above may have moved it)
+      return apply_threads(k)
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -244,7 +303,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # vector (up to 128 lanes in all) when every buffer reads it at unit stride
   if is_dsp and HVX_UPCAST_ELEMWISE and not k.axes_of(AxisType.REDUCE) and k.upcasted and k.upcast_size() < 32:
     for axis, w in itertools.product(k.upcastable_dims[::-1], (128, 64, 32)):
-      if (w == 32 or k.upcast_size() * w <= 128) and k.full_shape[axis] % w == 0 and _every_unit_stride(k, axis):
+      if (w == 32 or k.upcast_size() * w <= 128) and k.full_shape[axis] % w == 0 and \
+          (_every_unit_stride(k, axis) or _contiguous_with_upcast(k, axis)):
         k.apply_opt(Opt(OptOps.UPCAST, axis, w))
         break
 
