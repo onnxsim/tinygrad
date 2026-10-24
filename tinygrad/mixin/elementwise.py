@@ -5,6 +5,13 @@ from tinygrad.dtype import dtypes, ConstType, PyConst, least_upper_dtype, least_
 from tinygrad.helpers import argfix, polyN
 from tinygrad.mixin.creation import CreationMixin
 
+def _int_valued(x) -> bool:
+  """a float that is only an integer converted to float (through movement ops): trunc / floor / ceil / round leave it unchanged.
+  A QuantizeLinear right after a DequantizeLinear of the same scale rounds exactly such values"""
+  u = getattr(x, "uop", x)
+  while u.op in (Ops.RESHAPE, Ops.PERMUTE, Ops.EXPAND, Ops.SHRINK, Ops.FLIP, Ops.CONTIGUOUS): u = u.src[0]
+  return u.op is Ops.CAST and dtypes.is_float(u.dtype) and dtypes.is_int(u.src[0].dtype)
+
 if TYPE_CHECKING:
   from tinygrad.uop.ops import UOp, sint
 
@@ -472,7 +479,7 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]).trunc().numpy())
     ```
     """
-    return self.alu(Ops.TRUNC)
+    return self if _int_valued(self) else self.alu(Ops.TRUNC)
 
   def sqrt(self) -> Self:
     """
@@ -656,6 +663,7 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]).ceil().numpy())
     ```
     """
+    if _int_valued(self): return self
     return (self > (b := self.trunc())).where(b+1, b)
 
   def floor(self) -> Self:
@@ -666,6 +674,7 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]).floor().numpy())
     ```
     """
+    if _int_valued(self): return self
     return (self < (b := self.trunc())).where(b-1, b)
 
   def relu(self) -> Self:
@@ -892,6 +901,7 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]).round().numpy())
     ```
     """
+    if _int_valued(self): return self
     return ((self > 0).eq((b := self.trunc() / 2.0).trunc().eq(b))).where((self - 0.5).ceil(), (self + 0.5).floor())
 
   def sign(self) -> Self:
