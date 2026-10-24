@@ -571,6 +571,76 @@ static void __softmax_h16(void* out, const void* in, int t, int nt, int B, int R
   }
 }
 """
+# the hand softmax over small groups of nn/onnx.py _softmax_grp_dsp (deformable attention's weights over 4 / 8 sampling points):
+# generated, the group max and sum read the R floats of each group at stride R (scalar gathers on HVX) and the exp ran 8 lanes
+# wide, one lane at a time (BEVFormer's encoder layer: ~13 ms). hexagon-sim: max abs error 6e-6 against fp64
+_SOFTMAX_GRP = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+typedef float __sg_f __attribute__((ext_vector_type(32)));
+typedef int __sg_i __attribute__((ext_vector_type(32)));
+static inline __sg_f __sg_mul(__sg_f a, __sg_f b) { __asm__("" : "+v"(a)); __asm__("" : "+v"(b)); return a * b; }
+static inline __sg_f __sg_exp2(__sg_f x) {  /* ops_dsp.py's __tg_exp2_v */
+  x = __builtin_elementwise_max(x, (__sg_f)(-126.0f));
+  __sg_f r = x + 12582912.0f; __asm__("" : "+v"(r));
+  __sg_i n = __builtin_bit_cast(__sg_i, r) - 0x4B400000;
+  __sg_f f = x - (r - 12582912.0f), p = 0.000153592089f * f + 0.0013392627f;
+  p = __sg_mul(p, f) + 0.00961838476f; p = __sg_mul(p, f) + 0.0555034727f; p = __sg_mul(p, f) + 0.240226448f;
+  p = __sg_mul(p, f) + 0.693147182f; p = __sg_mul(p, f) + 1.0f; __asm__("" : "+v"(p));
+  return __builtin_bit_cast(__sg_f, __builtin_bit_cast(__sg_i, p) + (n << 23));
+}
+static inline __sg_f __sg_recip(__sg_f x) {
+  __sg_f y = __builtin_bit_cast(__sg_f, 0x7EF311C7 - __builtin_bit_cast(__sg_i, x));
+  for (int k = 0; k < 3; k++) y = __sg_mul(y, 2.0f - __sg_mul(x, y));
+  return y;
+}
+static inline float __sg_exp2_s(float x) {
+  x = x < -126.0f ? -126.0f : x;
+  float r = x + 12582912.0f; int n; __builtin_memcpy(&n, &r, 4); n -= 0x4B400000;
+  float f = x - (r - 12582912.0f), p = 0.000153592089f;
+  p = p * f + 0.0013392627f; p = p * f + 0.00961838476f; p = p * f + 0.0555034727f; p = p * f + 0.240226448f;
+  p = p * f + 0.693147182f; p = p * f + 1.0f;
+  int b; __builtin_memcpy(&b, &p, 4); b += n << 23; __builtin_memcpy(&p, &b, 4); return p;
+}
+/* out[g, :] = softmax(in[g, :]) for G groups of R = 2, 4 or 8 contiguous floats, this thread's slice of the blocks of 32 groups:
+   the block's R vectors dealt (vdeal, log2 R levels) so that vector j holds one element of every group, the softmax lane-wise
+   across them, shuffled back (vshuff). in / out 128-byte aligned; the groups past the last whole block scalar, on thread 0 */
+static void __softmax_grp(float* out, const float* in, int t, int nt, int G, int R) {
+  int nb = G / 32, b0 = (int)((long)nb * t / nt), b1 = (int)((long)nb * (t + 1) / nt), lv = R == 8 ? 3 : R == 4 ? 2 : 1;
+  for (int b = b0; b < b1; b++) {
+    HVX_Vector v[8], w[8];
+    for (int k = 0; k < R; k++) v[k] = ((const HVX_Vector*)(in + (long)b * 32 * R))[k];
+    for (int l = 0; l < lv; l++) {
+      for (int i = 0; i < R / 2; i++) {
+        HVX_VectorPair d = Q6_W_vdeal_VVR(v[2 * i + 1], v[2 * i], -4);
+        w[i] = Q6_V_lo_W(d), w[R / 2 + i] = Q6_V_hi_W(d);
+      }
+      for (int k = 0; k < R; k++) v[k] = w[k];
+    }
+    __sg_f m = (__sg_f)v[0];
+    for (int k = 1; k < R; k++) m = __builtin_elementwise_max(m, (__sg_f)v[k]);
+    __sg_f s = (__sg_f)(0.0f);
+    for (int k = 0; k < R; k++) { __sg_f e = __sg_exp2(__sg_mul((__sg_f)v[k] - m, (__sg_f)(1.44269504f))); v[k] = (HVX_Vector)e; s = s + e; }
+    __sg_f inv = __sg_recip(s);
+    for (int k = 0; k < R; k++) v[k] = (HVX_Vector)__sg_mul((__sg_f)v[k], inv);
+    for (int l = 0; l < lv; l++) {
+      for (int i = 0; i < R / 2; i++) {
+        HVX_VectorPair d = Q6_W_vshuff_VVR(v[R / 2 + i], v[i], -4);
+        w[2 * i] = Q6_V_lo_W(d), w[2 * i + 1] = Q6_V_hi_W(d);
+      }
+      for (int k = 0; k < R; k++) v[k] = w[k];
+    }
+    for (int k = 0; k < R; k++) ((HVX_Vector*)(out + (long)b * 32 * R))[k] = v[k];
+  }
+  if (t != 0) return;
+  for (int g = nb * 32; g < G; g++) {
+    const float* x = in + (long)g * R; float* y = out + (long)g * R, m = x[0], s = 0.f;
+    for (int k = 1; k < R; k++) m = x[k] > m ? x[k] : m;
+    for (int k = 0; k < R; k++) { y[k] = __sg_exp2_s((x[k] - m) * 1.44269504f); s += y[k]; }
+    for (int k = 0; k < R; k++) y[k] /= s;
+  }
+}
+"""
 def _msda_helpers() -> str:
   hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
   return hdr.read_text() + _MSDA_CALL
@@ -2445,6 +2515,7 @@ class DSPRenderer(ClangRenderer):
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__msda_call(") for u in uops): prefix.append(_msda_helpers())
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

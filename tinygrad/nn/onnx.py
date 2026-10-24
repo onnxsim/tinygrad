@@ -855,6 +855,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       ret = p16[..., :M, :N].float()  # only computed if something else reads the probabilities
       _fp16_in[id(ret)] = (ret, p16)
       return ret
+    # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points): the hand
+    # grouped softmax (_softmax_grp_dsp)
+    if str(x.device).startswith("DSP") and x.dtype == dtypes.float32 and x._resolve_dim(axis) == x.ndim - 1 and x.shape[-1] in (2, 4, 8) \
+        and getenv("HAND_SOFTMAX_GRP", 1):
+      return _softmax_grp_dsp(x)
     if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
     # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the
     # input (vector accumulators), the second the W lanes. One stage reduced each row with the rows as the vector lanes, R floats
@@ -1078,6 +1083,20 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
   # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
   def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
+
+  def _softmax_grp_dsp(x:Tensor) -> Tensor:
+    """softmax over x's last axis (2, 4 or 8) by the hand grouped softmax in ops_dsp.py (_SOFTMAX_GRP), split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    R, nt = x.shape[-1], max(1, getenv("DSP_THREADS", 1))
+    G = x.numel() // R
+    # its own aligned buffer (the kernel reads whole vectors from its first byte), assigned so the producer fuses into the copy
+    xin = Tensor.empty(*x.shape, dtype=dtypes.float32, device=x.device).assign(x)
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs, arg=f"__softmax_grp({{0}}, {{1}}, {{2}}, {nt}, {G}, {R});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"softmax_grp_{G}x{R}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*x.shape, dtype=dtypes.float32, device=x.device), xin, fxn=kern)[0]
 
   def _softmax_h16_dsp(y:Tensor, M:int, N:int, R2:int, C2:int) -> Tensor:
     """y (..., R, C) half, contiguous -> (..., R2, C2) half: the softmax over each row's first N of its first M rows, zeros
