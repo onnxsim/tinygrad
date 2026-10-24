@@ -105,7 +105,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     if src not in knames:
       kn = knames[src] = f"k{len(knames)}"
       body = src.split("/* DSP boilerplate */")[0]
-      m = re.search(r"noinline\)\) void\s+(\w+)\(", body)
+      # a tiny kernel may come without the noinline attribute (a one-element int64 fill: `void E(long* restrict data0_1)`)
+      m = re.search(r"noinline\)\) void\s+(\w+)\(", body) or re.search(r"^void\s+(\w+)\(", body, re.M)
       if m is None: raise ValueError(f"no kernel function in {name}")
       text = re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1)
       if vg.get(src): text = vg[src].replace("kK", kn)

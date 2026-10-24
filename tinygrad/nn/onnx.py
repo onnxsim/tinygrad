@@ -1428,6 +1428,33 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     indices = (indices < 0).where(x.shape[axis], 0) + indices
     return x.gather(axis, indices)
 
+  def GridSample(X:Tensor, grid:Tensor, align_corners:int=0, mode:str="linear", padding_mode:str="zeros"):
+    # 2-D bilinear, zero padding (BEVFormer's / Deformable DETR's sampling). X is laid out channel-last, so each tap reads its C
+    # channels as one contiguous row, and the rows are gathered with a direct indexed load (Tensor.gather is a one-hot compare
+    # summed over all H*W positions per tap). Out-of-range taps read row 0 with weight 0
+    if mode not in ("linear", "bilinear") or padding_mode != "zeros" or X.ndim != 4:
+      raise NotImplementedError(f"GridSample: only 2-D bilinear with zero padding, got mode={mode} padding_mode={padding_mode}")
+    N, C, H, W = X.shape
+    Ho, Wo = grid.shape[1], grid.shape[2]
+    rows = X.permute(0, 2, 3, 1).reshape(N * H * W * C).contiguous()
+    gx, gy = grid[..., 0], grid[..., 1]
+    # ONNX / torch: align_corners maps -1 and 1 to the corner pixels' centers, otherwise to the outer edges
+    if align_corners: x, y = (gx + 1) * ((W - 1) / 2), (gy + 1) * ((H - 1) / 2)
+    else: x, y = ((gx + 1) * W - 1) / 2, ((gy + 1) * H - 1) / 2
+    x0, y0 = x.floor(), y.floor()
+    fx, fy = x - x0, y - y0
+    base = (Tensor.arange(N, dtype=dtypes.int32) * (H * W)).reshape(N, 1, 1)
+    out = None
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+      xt, yt = x0 + dx, y0 + dy
+      ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
+      w = ok.where((fx if dx else 1 - fx) * (fy if dy else 1 - fy), 0.0)
+      row = ok.where(base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32), 0)
+      elems = row.reshape(-1, 1) * C + Tensor.arange(C, dtype=dtypes.int32).reshape(1, C)
+      tap = Tensor(rows.uop.index(elems.reshape(-1).uop)).reshape(N, Ho, Wo, C) * w.unsqueeze(-1).cast(X.dtype)
+      out = tap if out is None else out + tap
+    return cast(Tensor, out).permute(0, 3, 1, 2)
+
   def Compress(inp:Tensor, condition:list[bool], axis:int|None=None):
     if axis is None:
       inp = inp.flatten()
