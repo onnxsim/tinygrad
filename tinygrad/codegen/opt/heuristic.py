@@ -1,5 +1,5 @@
 import itertools
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, tc
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, resolve, AxisType
@@ -86,8 +86,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       # single-instruction, single-thread op with no warp/lane cooperation, so it has no LOCAL axis to use)
       if tk.ren is not None and tk.ren.has_local and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]):
         tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
-      # the DSP's TensorCore is one HVX thread's instruction: split its kernel over the hardware threads like any other
-      return apply_threads(tk) if tk.ren is not None and tk.ren.target.device == "DSP" else tk
+      # the DSP's vrmpy TensorCore is one HVX thread's instruction: split its kernel over the hardware threads like any other. Not
+      # an HMX one: the HMX unit is held by one thread (the graph skel's), and its fused int8 requant epilogue declares its flags
+      # once per output run, which a split leaves undeclared in the other slices
+      if tk.ren is not None and tk.ren.target.device == "DSP" and getattr(tk, "tensor_core", None) not in tc.hexagon_hmx + tc.hexagon_hmx_i8:
+        return apply_threads(tk)
+      return tk
 
   # make a copy so it does not mutate the input
   k = k.copy()

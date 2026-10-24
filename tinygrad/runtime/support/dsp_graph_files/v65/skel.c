@@ -7,6 +7,9 @@
 #include <string.h>
 #include "qurt.h"
 #include "AEEStdErr.h"
+#ifdef G_HMX
+#include "HAP_power.h"
+#endif
 #include "tg_graph.h"
 extern unsigned long long HAP_perf_get_time_us(void);
 
@@ -19,6 +22,18 @@ static const int G_ST_IN[1] = {0}, G_ST_OFF[1] = {0}, G_ST_LEN[1] = {0};
 #endif
 
 static unsigned char* g_blob;
+#ifdef G_HMX
+/* a program with HMX kernels (graph.h G_HMX, built for v69 with -mhmx): HMX power is voted once, and VTCM + the HMX context are
+ * acquired for each run and released after it -- one HMX context per protection domain, and the runner keeps several programs
+ * loaded in one PD. The graph thread holds the HMX lock while the calls run; HMX calls are never sliced over the pool
+ * (dsp_graph_v65.emit refuses a threaded HMX call). __hmx_vtcm / __hmx_gen are the kernels' tile pool and its generation. */
+#include "hmx_runtime.h"
+unsigned char* __hmx_vtcm;
+unsigned int __hmx_gen;
+static char g_hmx_power_ctx;
+static int g_hmx_powered;
+static hmx_rt_t g_hmx_rt;
+#endif
 #ifdef G_VTCM_BYTES
 /* a program with vgather kernels (DSP_V65_VGATHER): the constant 128 KB tables they look up are copied into VTCM once, after the
  * weights are in, and the kernels read them there (G_VTAB(slot) is null without VTCM: they run their scalar loops). vgather reads
@@ -147,7 +162,13 @@ static void perf_release(void) { if (g_perf_refs > 0 && --g_perf_refs == 0) HAP_
 #define G_PERF_RELEASE()
 #endif
 int tg_graph_open(const char* uri, remote_handle64* h) { G_PERF(); *h = (remote_handle64)(uintptr_t)malloc(1); return 0; }
-int tg_graph_close(remote_handle64 h) { G_VTCM_RELEASE(); G_PERF_RELEASE(); free((void*)(uintptr_t)h); return 0; }
+int tg_graph_close(remote_handle64 h) {
+  G_VTCM_RELEASE(); G_PERF_RELEASE();
+#ifdef G_HMX
+  if (g_hmx_powered) { HAP_power_destroy(&g_hmx_power_ctx); g_hmx_powered = 0; }
+#endif
+  free((void*)(uintptr_t)h); return 0;
+}
 
 int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, int chunkLen) {
   if (total != G_BLOB_BYTES) return AEE_EBADPARM;
@@ -205,6 +226,9 @@ static char g_gstack[GRAPH_STACK] __attribute__((aligned(128)));
 static void graph_thread(void* p) {
   job_t* j = (job_t*)p;
   qurt_hvx_lock(QURT_HVX_MODE_128B);
+#ifdef G_HMX
+  if (HAP_compute_res_hmx_lock(g_hmx_rt.ctx)) { j->rc = AEE_EFAILED; qurt_hvx_unlock(); qurt_thread_exit(0); }
+#endif
   j->rc = pool_start(j->threads);
   if (j->rc == 0 && j->start == 0 && j->inLen > 0) {
     int off = 0;
@@ -227,6 +251,9 @@ static void graph_thread(void* p) {
     if (j->start + j->count == G_NCALLS)
       for (int k = 0; k < G_NSTATE; k++) g_copy(g_R[G_IN_REG[G_ST_IN[k]]], g_R[G_OUT_REG] + G_OUT_OFF + G_ST_OFF[k], G_IN_BYTES[G_ST_IN[k]]);  /* state loop-back */
   }
+#ifdef G_HMX
+  HAP_compute_res_hmx_unlock(g_hmx_rt.ctx);
+#endif
   qurt_hvx_unlock();
   qurt_thread_exit(0);
 }
@@ -237,15 +264,23 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags
   if (start < 0 || count < 0 || start + count > G_NCALLS || tLen < 1) return AEE_EBADPARM;
   if (regions()) return AEE_ENOMEMORY;
   G_VTCM_SETUP();
+#ifdef G_HMX
+  if (!g_hmx_powered) { if (hmx_rt_power(&g_hmx_power_ctx, 1)) return AEE_EFAILED; g_hmx_powered = 1; }
+  if (hmx_rt_acquire(&g_hmx_rt, G_VTCM_KB * 1024)) { if (g_hmx_rt.ctx) hmx_rt_release(&g_hmx_rt); return AEE_ERESOURCENOTFOUND; }
+  __hmx_vtcm = g_hmx_rt.vtcm; __hmx_gen++;
+#endif
   memset(t, 0, tLen * sizeof(uint64));
   job_t j = {start, count, threads, 0, t, tLen, flags, in, inLen};
   qurt_thread_attr_t ta; qurt_thread_attr_init(&ta);
   qurt_thread_attr_set_stack_addr(&ta, g_gstack); qurt_thread_attr_set_stack_size(&ta, GRAPH_STACK);
   qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
   qurt_thread_t tid; int st;
-  if (qurt_thread_create(&tid, &ta, graph_thread, &j)) return AEE_EFAILED;
-  qurt_thread_join(tid, &st);
-  if (j.rc) return AEE_EFAILED;
+  int created = qurt_thread_create(&tid, &ta, graph_thread, &j);
+  if (created == 0) qurt_thread_join(tid, &st);
+#ifdef G_HMX
+  hmx_rt_release(&g_hmx_rt);
+#endif
+  if (created || j.rc) return AEE_EFAILED;
   if (start + count == G_NCALLS) {
     const unsigned char* o = g_R[G_OUT_REG] + G_OUT_OFF;
     if (outLen > 0) {

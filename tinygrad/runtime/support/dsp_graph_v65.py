@@ -97,6 +97,10 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       same = [c for c in calls if c[1] == src]
       const_table = all(len(c[2]) == 3 and id(base[c[2][2]]) in blob_off and c[4] == nthreads for c in same)
       vg[src] = alt if alt and const_table else None
+  # HMX kernels (a v69 capture with HMX=1): the skel takes the HMX lock on the graph thread only, so they can't be sliced over the pool
+  hmx = any("__hmx_" in src for _, src, *_ in calls)
+  for name, src, _, _, nthreads in calls:
+    if nthreads and "__hmx_" in src: raise ValueError(f"{name}: an HMX kernel can't run on the DSP_THREADS pool")
   for n, (name, src, ids, _, nthreads) in enumerate(calls):
     if src not in knames:
       kn = knames[src] = f"k{len(knames)}"
@@ -123,6 +127,7 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
        f"#define G_NCALLS {len(calls)}", f"#define G_NREG {len(regions)}", f"#define G_BLOB_BYTES {len(blob)}",
        f"#define G_NIN {len(inputs)}", f"#define G_OUT_REG {rid[out_id]}", f"#define G_OUT_OFF {out_view.offset}",
        f"#define G_OUT_BYTES {out_view.nbytes}",
+       *([f"#define G_HMX 1", f"#define G_VTCM_KB {int(os.environ.get('HMX_VTCM_KB', 256))}"] if hmx else []),
        "static const unsigned G_REG_BYTES[G_NREG] = {" + ", ".join(str(_rnd(r.nbytes)) for r in regions) + "};",
        "static const int G_REG_BLOB[G_NREG] = {" + ", ".join(str(blob_off.get(id(r), -1)) for r in regions) + "};",
        "static const int G_IN_REG[G_NIN] = {" + ", ".join(str(rid[i]) for i in in_ids) + "};",
@@ -145,7 +150,7 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
        "static void g_call(int i, unsigned char** R) {", "  switch (i) {", *cases, "  }", "}"]
   (o / "graph.h").write_text("\n".join(h) + "\n")
   (o / "blob.bin").write_bytes(bytes(blob))
-  return {"calls": len(calls), "kernels": len(knames), "regions": len(regions), "blob": len(blob),
+  return {"calls": len(calls), "kernels": len(knames), "regions": len(regions), "blob": len(blob), "hmx": hmx,
           "threaded_calls": sum(1 for c in calls if c[4]), "input_bytes": [x.nbytes for x in inputs], "output_bytes": out_view.nbytes,
           "scratch": sum(_rnd(r.nbytes) for r in regions if id(r) not in blob_off)}
 
@@ -176,7 +181,7 @@ void _start(void) {
 def _kernel_flags(arch:str="v65") -> list[str]:
   return [*_hvx_args(arch), "-O2", "-fPIC", "-ffreestanding", "-nostdlib", "-fno-stack-protector", "-Wno-deprecated-non-prototype"]
 
-def compile_kernels(outdir, arch:str="v65") -> list[str]:
+def compile_kernels(outdir, arch:str="v65", cc:str|None=None, extra:tuple[str, ...]=()) -> list[str]:
   """k<n>.c -> k<n>.o, once for both the qemu program and the skel (same flags). Objects are cached across compiles by source,
   flags and compiler (DSP_GRAPH_OBJ_CACHE, default ~/.cache/tinygrad/dsp_graph_v65): a recompile after a small codegen change
   rebuilds only the kernels whose source changed. The largest sources start first, since they set the wall time"""
@@ -185,8 +190,8 @@ def compile_kernels(outdir, arch:str="v65") -> list[str]:
   o = pathlib.Path(outdir)
   cache = pathlib.Path(os.environ.get("DSP_GRAPH_OBJ_CACHE", pathlib.Path.home() / ".cache/tinygrad/dsp_graph_v65"))
   cache.mkdir(parents=True, exist_ok=True)
-  flags = _kernel_flags(arch)
-  ver = subprocess.run([_cc(), "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+  flags, cc = [*_kernel_flags(arch), *extra], cc or _cc()
+  ver = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
   ks = sorted((p for p in o.glob("k*.c")), key=lambda p: -p.stat().st_size)
   def one(k:pathlib.Path):
     obj = k.with_suffix(".o")
@@ -194,7 +199,7 @@ def compile_kernels(outdir, arch:str="v65") -> list[str]:
     cached = cache / f"{key}.o"
     if not cached.exists():
       tmp = cache / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
-      subprocess.run([_cc(), "-c", *flags, "-o", str(tmp), str(k)], check=True)
+      subprocess.run([cc, "-c", *flags, "-o", str(tmp), str(k)], check=True)
       os.replace(tmp, cached)
     shutil.copyfile(cached, obj)
   with ThreadPoolExecutor(os.cpu_count()) as ex: list(ex.map(one, ks))
@@ -215,6 +220,8 @@ def run_qemu(outdir, xs:list[bytes], timeout:int=3600) -> bytes:
                         timeout=timeout).stdout
 
 def build(outdir, skel_arch:str="v68", kernel_arch:str="v65") -> tuple[pathlib.Path, pathlib.Path]:
+  # kernel_arch v68+ (qfloat HVX, HMX): the kernels are built with the SDK's hexagon-clang (-mhmx when graph.h has G_HMX) and the skel
+  # for the same arch; v65 kernels keep $CC (the SDK 6.x compiler starts at v68)
   """the FastRPC skel (tg_graph.so) + Android client. The kernels are built for kernel_arch with $CC (a v65-capable clang; the
   Hexagon SDK 6.x compiler starts at v68); the skel for skel_arch with the SDK's. Needs HEXAGON_SDK_ROOT, HEXAGON_TOOLCHAIN and an
   NDK clang (NDK_CLANG). On the phone: client 'file:///tg_graph.so?tg_graph_skel_handle_invoke&_modver=1.0&_dom=cdsp' <dir with
@@ -222,14 +229,20 @@ def build(outdir, skel_arch:str="v68", kernel_arch:str="v65") -> tuple[pathlib.P
   o, sdk, tc = pathlib.Path(outdir), pathlib.Path(os.environ["HEXAGON_SDK_ROOT"]), pathlib.Path(os.environ["HEXAGON_TOOLCHAIN"])
   ndk = os.environ.get("NDK_CLANG", "/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang")
   for f in ("skel.c", "client.c", "tg_graph.idl"): shutil.copy(FILES / f, o / f)
+  new_arch = int(kernel_arch.lstrip("v")) >= 68
+  hmx = new_arch and "#define G_HMX 1" in (o / "graph.h").read_text()
+  if new_arch: skel_arch = kernel_arch
+  if hmx: shutil.copy(FILES.parent / "hmx_runtime.h", o / "hmx_runtime.h")
   inc = ["-I", ".", "-I", str(sdk / "incs"), "-I", str(sdk / "incs/stddef")]
   qurt = ["-I", str(sdk / f"rtos/qurt/compute{skel_arch}/include/qurt"), "-I", str(sdk / f"rtos/qurt/compute{skel_arch}/include/posix")]
   def run(cmd): subprocess.run(cmd, cwd=o, check=True)
   run([str(sdk / "ipc/fastrpc/qaic/Ubuntu/qaic"), "-I", str(sdk / "incs"), "-I", str(sdk / "incs/stddef"), "tg_graph.idl"])
   hc = [str(tc / "bin/hexagon-clang"), "-c", "-O2", "-fPIC", f"-mcpu=hexagon{skel_arch}"]
   run([*hc, *inc, "-o", "skel_rpc.o", "tg_graph_skel.c"])
-  run([*hc, f"-mhvx={skel_arch}", "-mhvx-length=128b", "-Wno-deprecated-non-prototype", *inc, *qurt, "-o", "impl.o", "skel.c"])
-  ks = [k[:-2] + ".c" for k in compile_kernels(o, kernel_arch)]
+  run([*hc, f"-mhvx={skel_arch}", "-mhvx-length=128b", *(["-mhmx"] if hmx else []), "-Wno-deprecated-non-prototype", *inc, *qurt,
+       "-o", "impl.o", "skel.c"])
+  ks = [k[:-2] + ".c" for k in (compile_kernels(o, kernel_arch, cc=str(tc / "bin/hexagon-clang"), extra=("-mhmx",) if hmx else ())
+                                if new_arch else compile_kernels(o, kernel_arch))]
   lib = tc / f"target/hexagon/lib/{skel_arch}/G0"
   run([str(tc / "bin/hexagon-link"), "-Bdynamic", "-shared", "-export-dynamic", "-o", "tg_graph.so", "skel_rpc.o", "impl.o",
        *[k[:-2] + ".o" for k in ks], str(lib / "pic/libgcc.a"), str(lib / "pic/libgcc.so")])
@@ -244,7 +257,7 @@ def write_case(outdir, xs:list[bytes], ref:bytes) -> None:
   (o / "ref.bin").write_bytes(ref)
 
 ARTIFACT_MAGIC = b"TGHXV65\0"
-def pack(outdir, artifact_path, program_lines:list[str]) -> int:
+def pack(outdir, artifact_path, program_lines:list[str], arch:str="v65") -> int:
   """the runner artifact for a compiler service (tools/onnx-remote's onnx-remote-compiler in onnxsim): tg_graph.so, blob.bin and
   program.txt (program_lines: the I/O contract, one record per line) in one little-endian container -- magic TGHXV65\\0, u32 file
   count, then per file u32 name length, name, u64 size, bytes -- so a runner unpacks it with no archive or JSON library"""
@@ -253,6 +266,7 @@ def pack(outdir, artifact_path, program_lines:list[str]) -> int:
   files = [("tg_graph.so", (o / "tg_graph.so").read_bytes()), ("blob.bin", (o / "blob.bin").read_bytes()),
            ("program.txt", ("\n".join(program_lines) + "\n").encode())]
   with open(artifact_path, "wb") as f:
-    f.write(ARTIFACT_MAGIC + struct.pack("<I", len(files)))
+    # the same container and tg_graph ABI for every arch; the magic names the DSP arch the program needs (TGHXV65\0, TGHXV69\0)
+    f.write((ARTIFACT_MAGIC if arch == "v65" else f"TGHX{arch.upper()}".encode() + b"\0") + struct.pack("<I", len(files)))
     for name, data in files: f.write(struct.pack("<I", len(name)) + name.encode() + struct.pack("<Q", len(data)) + data)
   return pathlib.Path(artifact_path).stat().st_size
