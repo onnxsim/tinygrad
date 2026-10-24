@@ -1659,7 +1659,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     Q, M, NO, P, _ = off.shape
     NVR, R = ref.shape[0], ref.shape[2]
     assert S == H * W and C % M == 0 and NO in (1, NV) and NVR in (1, NV), f"MSDA: inconsistent shapes {value.shape} {ref.shape} {off.shape}"
-    if str(value.device).startswith("DSP"): return _msda_dsp(value, ref, off, attw, vis, H, W)
+    if str(value.device).startswith("DSP") and getenv("HAND_MSDA", 1): return _msda_dsp(value, ref, off, attw, vis, H, W)
     D = C // M
     # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
     refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
