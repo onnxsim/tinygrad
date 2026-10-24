@@ -67,8 +67,10 @@ def main() -> None:
   os.environ.setdefault("PARALLEL", "0")  # compile in this process: the capture's stand-in compiler (below) doesn't reach a pool
   # layout choices that keep the generated kernels' vector lanes on unit-stride axes (each is 0 to turn off). BEVFormer-tiny on
   # the V69, all four against none: decoder 3.39 -> 1.19 s, encoder layer 0.91 -> 0.39 s, 3-layer encoder 3.55 -> 1.23 s
-  # (REDUCE_TWO_STAGE on top: 1.12 / 0.32 / 0.97 s)
-  for flag in ("SOFTMAX_CONTIGUOUS", "MATMUL_CONTIGUOUS", "TRANSPOSE_CONTIGUOUS", "HVX_UPCAST_ODD", "REDUCE_TWO_STAGE"):
+  # (REDUCE_TWO_STAGE on top: 1.12 / 0.32 / 0.97 s). HVX_UPCAST_ELEMWISE: an elementwise kernel whose small masked axis (a concat's)
+  # was upcast also gets its unit-stride axis as vector lanes -- BEVFormer's temporal-attention input, concat(prev_bev, query) cast
+  # to fp16 for GEMM_FP16, ran fully scalar at 17 ms per layer (3-layer encoder with onnxsim::MSDA + GEMM_FP16: 235 -> 162 ms)
+  for flag in ("SOFTMAX_CONTIGUOUS", "MATMUL_CONTIGUOUS", "TRANSPOSE_CONTIGUOUS", "HVX_UPCAST_ODD", "REDUCE_TWO_STAGE", "HVX_UPCAST_ELEMWISE"):
     os.environ.setdefault(flag, "1")
   import numpy as np, onnx
   from tinygrad import Tensor, dtypes
