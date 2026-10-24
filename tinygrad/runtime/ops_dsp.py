@@ -496,6 +496,81 @@ static void __msda_call(float* out, const float* value, const float* loc, const 
   msda_run(&a, (int)((long)Q * t / nt), (int)((long)Q * (t + 1) / nt));
 }
 """
+# the hand row copy of nn/onnx.py _rowcopy_dsp (the zero pad of GEMM_FP16's HMX operands): out (B, rows, cols) half = the top-left
+# of each of in's B (R, C) half matrices, zero-filled; this thread's slice of the B * rows output rows, by unaligned HVX loads and
+# stores (rows are only 2-byte aligned)
+_ROWCOPY = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+static void __rowcopy(void* out, const void* in, int t, int nt, int B, int R, int C, int rows, int cols) {
+  int total = B * rows, r0 = (int)((long)total * t / nt), r1 = (int)((long)total * (t + 1) / nt), n = C < cols ? C : cols;
+  for (int i = r0; i < r1; i++) {
+    int b = i / rows, r = i % rows, m = r < R ? n : 0, j = 0;
+    const __fp16* s = (const __fp16*)in + ((long)b * R + r) * C;
+    __fp16* d = (__fp16*)out + (long)i * cols;
+    for (; j + 64 <= m; j += 64) *(HVX_UVector*)(d + j) = *(const HVX_UVector*)(s + j);
+    for (; j < m; j++) d[j] = s[j];
+    for (; j + 64 <= cols; j += 64) *(HVX_UVector*)(d + j) = Q6_V_vzero();
+    for (; j < cols; j++) d[j] = 0;
+  }
+}
+"""
+# the hand fp16 softmax of nn/onnx.py _softmax_h16_dsp (attention probabilities between two GEMM_FP16 HMX products): out (B, R2, C2)
+# half, row r < M = softmax over in[b, r, :N] of in (B, R, C) half, zero past N and in rows from M; this thread's slice of the
+# B * R2 output rows. exp in hf (qf16 arithmetic), offset to 2^7 at the row max, lanes below 2^-13 zeroed; the row sum in qf32.
+# hexagon-sim, 2 x 70 x 900 rows of logits up to +-30: max abs error 1e-3 against fp32 on the same fp16 inputs
+_SOFTMAX_H16 = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#define __SM_H(q) Q6_Vhf_equals_Vqf16(q)
+static inline HVX_Vector __sm_hsplat(float f) { union { __fp16 h; short s; } u; u.h = (__fp16)f; return Q6_Vh_vsplat_R(u.s); }
+static void __softmax_h16(void* out, const void* in, int t, int nt, int B, int R, int C, int M, int N, int R2, int C2) {
+  const HVX_Vector lo = __sm_hsplat(-13.f), dmin = __sm_hsplat(-20.f), l2e = __sm_hsplat(1.44269504f), seven = __sm_hsplat(7.f),
+                   magic = Q6_Vh_vsplat_R(0x6600), c4 = __sm_hsplat(0.00961813f), c3 = __sm_hsplat(-0.0555041f),
+                   c2 = __sm_hsplat(0.2402265f), c1 = __sm_hsplat(-0.6931472f), c0 = __sm_hsplat(1.f), one = Q6_Vh_vsplat_R(0x3C00),
+                   k2m7 = __sm_hsplat(1.f / 128.f), zero = Q6_V_vzero();
+  HVX_Vector buf[32];  /* one row, N <= 2048 */
+  __attribute__((aligned(128))) float part[32];
+  unsigned short* bu = (unsigned short*)buf;
+  int total = B * R2, r0 = (int)((long)total * t / nt), r1 = (int)((long)total * (t + 1) / nt), nv = (N + 63) / 64;
+  for (int i = r0; i < r1; i++) {
+    int b = i / R2, r = i % R2, j = 0;
+    unsigned short* d = (unsigned short*)out + (long)i * C2;
+    if (r >= M) { for (; j < C2; j++) d[j] = 0; continue; }
+    const unsigned short* s = (const unsigned short*)in + ((long)b * R + r) * C;
+    for (; j + 64 <= N; j += 64) buf[j / 64] = *(const HVX_UVector*)(s + j);
+    for (; j < nv * 64; j++) bu[j] = j < N ? s[j] : 0xF753;  /* -30000: finite, so x - max stays finite in hf */
+    HVX_Vector m = buf[0];
+    for (int k = 1; k < nv; k++) m = Q6_Vhf_vmax_VhfVhf(m, buf[k]);
+    for (int sh = 64; sh >= 2; sh >>= 1) m = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vror_VR(m, sh));
+    HVX_Vector a0 = zero, a1 = zero;
+    for (int k = 0; k < nv; k++) {
+      /* e = 2^((x - max) log2(e) + 7), lanes below 2^-13 zeroed (the pad lanes among them); 2^n by the 1536.0 magic number,
+         2^-g (g = n - t) by a degree-4 polynomial, as test/external/dsp/hand/mcc/mb_hvx.h's mbv_hexp2_n */
+      HVX_Vector x = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_vmax_VhfVhf(__SM_H(Q6_Vqf16_vsub_VhfVhf(buf[k], m)), dmin), l2e)), seven));
+      HVX_VectorPred keep = Q6_Q_vcmp_gt_VhfVhf(x, lo);
+      x = Q6_Vhf_vmax_VhfVhf(x, lo);
+      HVX_Vector rr = __SM_H(Q6_Vqf16_vadd_VhfVhf(x, magic)), n = Q6_Vh_vsub_VhVh(rr, magic);
+      HVX_Vector g = __SM_H(Q6_Vqf16_vsub_VhfVhf(__SM_H(Q6_Vqf16_vsub_VhfVhf(rr, magic)), x));
+      HVX_Vector p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(g, c4)), c3));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c2));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c1));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c0));
+      HVX_Vector e = Q6_V_vmux_QVV(keep, Q6_Vh_vadd_VhVh(p, Q6_Vh_vasl_VhR(n, 10)), zero);
+      buf[k] = e;
+      HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(e, one);
+      a0 = Q6_Vqf32_vadd_Vqf32Vqf32(a0, Q6_V_lo_W(w)), a1 = Q6_Vqf32_vadd_Vqf32Vqf32(a1, Q6_V_hi_W(w));
+    }
+    *(HVX_Vector*)part = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1));
+    float sum = 0.f;
+    for (int k = 0; k < 32; k++) sum += part[k];
+    const HVX_Vector inv = __sm_hsplat(128.f / sum);  /* e <= 128 and sum >= 128: P = e * (128 / sum) / 128 stays normal */
+    for (int k = 0; k < nv; k++) buf[k] = __SM_H(Q6_Vqf16_vmpy_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(buf[k], inv)), k2m7));
+    for (j = 0; j + 64 <= C2 && j < nv * 64; j += 64) *(HVX_UVector*)(d + j) = buf[j / 64];
+    for (; j < C2; j++) d[j] = j < nv * 64 ? bu[j] : 0;
+  }
+}
+"""
 def _msda_helpers() -> str:
   hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
   return hdr.read_text() + _MSDA_CALL
@@ -2368,6 +2443,8 @@ class DSPRenderer(ClangRenderer):
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__msda_call(") for u in uops): prefix.append(_msda_helpers())
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

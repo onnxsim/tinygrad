@@ -371,6 +371,12 @@ required_input_python_consts: dict[str, tuple[int, ...]] = {
 def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
   return t.data().tobytes() if t.dtype == dtypes.uint8 else t.tolist()
 
+# GEMM_FP16 products on the DSP and the hand softmax's results, by the id of the fp32 tensor the ONNX graph sees (with the
+# tensor itself, to tell a reused id): the padded fp16 product a softmax can take instead / the padded fp16 probabilities the
+# next product takes as its A
+_fp16_out: dict[int, tuple[Tensor, Tensor, int, int]] = {}
+_fp16_in: dict[int, tuple[Tensor, Tensor]] = {}
+
 # ***** runner ******
 debug = int(getenv("DEBUGONNX", "0"))
 limit = int(getenv("ONNXLIMIT", "-1"))
@@ -840,6 +846,15 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   # the exp is computed inside the matmul once per (row, key) on a splat of the score across V's lanes (a whole vector exp per
   # key on the DSP); on its own it is an elementwise kernel that vectorizes the exp across the keys
   def _softmax_contig(x:Tensor, axis:int) -> Tensor:
+    # the last-axis softmax of a GEMM_FP16 product on the DSP (attention, Q @ K^T): the hand fp16 softmax on the padded product,
+    # and its padded fp16 result is what the next GEMM_FP16 product (P @ V) takes as its A. Generated, the slice + cast back, the
+    # three softmax kernels and the cast + pad for P @ V took ~45 ms per BEVFormer decoder layer (8 x 900 x 900)
+    if (ent := _fp16_out.get(id(x))) is not None and ent[0] is x and x._resolve_dim(axis) == x.ndim - 1 and ent[3] <= 2048:
+      _, y, M, N = ent
+      p16 = _softmax_h16_dsp(y, M, N, M + _hmx_pad_rows(M), N + -N % 32)
+      ret = p16[..., :M, :N].float()  # only computed if something else reads the probabilities
+      _fp16_in[id(ret)] = (ret, p16)
+      return ret
     if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
     # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the
     # input (vector accumulators), the second the W lanes. One stage reduced each row with the rows as the vector lanes, R floats
@@ -1030,28 +1045,76 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def GlobalAveragePool(X:Tensor): return X.mean(axis=tuple(range(2, X.ndim)), keepdim=True)
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
 
+  def _matmul_fp16(a:Tensor, b:Tensor) -> Tensor:
+    """a (..., M, K) @ b (..., K, N) in fp16 (fp16 inputs, fp32-exact accumulation and one fp16 rounding of the output on the
+    DSP's HMX), cast back to fp32. The fp16 operands are realized copies, padded to whole 32 x 32 HMX tiles, and the product is
+    realized before the slice and the cast back: the cast fused into the HMX kernel's tile packing, the cast back fused into its
+    output epilogue and tinygrad's own padding of a tensor-core axis (TC_OPT=2) each made the phone's HMX kernel slow and/or
+    wrong (M = 2500: 251 ms; padded here to 2528: as fast as M = 2560, 0.7 ms)"""
+    (M, K), N = a.shape[-2:], b.shape[-1]
+    r32 = lambda n: -n % 32
+    # cast first (with whatever the producer fused into it, e.g. a ReLU), then pad as a plain copy: padded in the same kernel, the
+    # row select landed on the fp16 result of the fused op instead of the load, which keeps all 128 lanes scalar (BEVFormer's
+    # FFN: ~6 ms per 900 x 512 cast)
+    # On the DSP the pad is the hand row copy (_rowcopy_dsp): generated, each row's tail was a per-lane select (BEVFormer's decoder
+    # attention probabilities, 8 x 900 x 900 -> 928 x 928: 129 ms)
+    dsp = str(a.device).startswith("DSP")
+    def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
+      t = t.half().contiguous()
+      if not (rows or cols): return t
+      if dsp: return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
+      return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
+    if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
+    else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
+    b16 = pad16(b, r32(K), r32(N))
+    y = a16.matmul(b16, dtype=dtypes.half).contiguous()
+    if y.shape[-2:] == (M, N): return y.float()
+    # the slice + cast back fuses into the consumers (a bias add, ...) for free -- except a softmax's, read through the view (49 ms
+    # more per BEVFormer decoder layer): on the DSP that takes the padded product itself (_softmax_contig)
+    ret = y[..., :M, :N].float()
+    if dsp: _fp16_out[id(ret)] = (ret, y, M, N)
+    return ret
+
+  # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
+  # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
+  def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
+
+  def _softmax_h16_dsp(y:Tensor, M:int, N:int, R2:int, C2:int) -> Tensor:
+    """y (..., R, C) half, contiguous -> (..., R2, C2) half: the softmax over each row's first N of its first M rows, zeros
+    elsewhere. The hand fp16 softmax in ops_dsp.py (_SOFTMAX_H16), the rows split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    *bs, R, C = y.shape
+    B, nt = prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs, arg=f"__softmax_h16({{0}}, {{1}}, {{2}}, {nt}, {B}, {R}, {C}, {M}, {N}, {R2}, {C2});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"softmax_h16_{B}x{M}x{N}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*bs, R2, C2, dtype=dtypes.half, device=y.device), y, fxn=kern)[0]
+
+  def _rowcopy_dsp(x:Tensor, rows:int, cols:int) -> Tensor:
+    """x (..., R, C) half, contiguous -> (..., rows, cols) half: the top-left rows x cols of each matrix, zeros where x has none.
+    The hand row copy in ops_dsp.py (_ROWCOPY), the rows split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    *bs, R, C = x.shape
+    B, nt = prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
+               arg=f"__rowcopy({{0}}, {{1}}, {{2}}, {nt}, {B}, {R}, {C}, {rows}, {cols});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"rowcopy_{B}x{R}x{C}_{rows}x{cols}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*bs, rows, cols, dtype=dtypes.half, device=x.device), x, fxn=kern)[0]
+
+  def MatMul(A:Tensor, B:Tensor):
+    # GEMM_FP16 (see Gemm) covers MatMul's products too, batched ones included (BEVFormer's decoder self-attention: Q @ K^T and
+    # P @ V over 8 heads)
+    if getenv("GEMM_FP16") and A.dtype == dtypes.float32 and A.ndim >= 2 and B.ndim >= 2: return _matmul_fp16(A, B)
+    return A @ B
+
   def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
-    # GEMM_FP16: the product in fp16 (fp16 inputs, fp32-exact accumulation and one fp16 rounding of the output on the DSP's HMX),
-    # cast back; the bias is added in fp32. Opt-in: it changes the numerics
-    if getenv("GEMM_FP16") and A.dtype == dtypes.float32:
-      # the fp16 operands are realized copies, padded to whole 32 x 32 HMX tiles, and the product is realized before the slice, the
-      # cast back and the bias: the cast fused into the HMX kernel's tile packing, the cast back fused into its output epilogue and
-      # tinygrad's own padding of a tensor-core axis (TC_OPT=2) each made the phone's HMX kernel slow and/or wrong (M = 2500:
-      # 251 ms; padded here to 2528: as fast as M = 2560, 0.7 ms)
-      a, b = A.transpose(transA), B.transpose(transB)
-      (M, K), N = a.shape, b.shape[1]
-      r32 = lambda n: -n % 32
-      # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
-      # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
-      # cast first (with whatever the producer fused into it, e.g. a ReLU), then pad as a plain copy: padded in the same kernel, the
-      # row select landed on the fp16 result of the fused op instead of the load, which keeps all 128 lanes scalar (BEVFormer's
-      # FFN: ~6 ms per 900 x 512 cast)
-      def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
-        t = t.half().contiguous()
-        return t.pad(((0, rows), (0, cols))).contiguous() if rows or cols else t
-      a16 = pad16(a, max(r32(M), 64 - M), r32(K))
-      b16 = pad16(b, r32(K), r32(N))
-      ret = alpha * a16.matmul(b16, dtype=dtypes.half).contiguous()[:M, :N].float()
+    # GEMM_FP16: the product in fp16 on the DSP's HMX (_matmul_fp16); the bias is added in fp32. Opt-in: it changes the numerics
+    if getenv("GEMM_FP16") and A.dtype == dtypes.float32: ret = alpha * _matmul_fp16(A.transpose(transA), B.transpose(transB))
     else: ret = alpha * (A.transpose(transA) @ B.transpose(transB))
     if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
     # MATMUL_CONTIGUOUS: the product realized on its own. Fused with a consumer that reads it in another layout (BEVFormer's
