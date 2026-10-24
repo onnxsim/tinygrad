@@ -862,6 +862,7 @@ static inline {vt_c} __{name}({vt_a} a, {vt_b} b, {vt_c} c) {{
 # every K panel at a stride of _hmx_stride(kt) slots -- no load pair (<= 32 tiles) crosses a 256 KB window (a PD fault), so
 # whole weight matrices (fc2: 16 x 64 tiles) stay packed across a call instead of being repacked per output tile
 HMX_VTCM_KB = getenv("HMX_VTCM_KB", 256)
+HMX_PF_A_ROWS = getenv("HMX_PF_A_ROWS", 1)
 _HMX_AO = 65536  # activation staging, ahead of the operand pool in VTCM
 # _HMX_CB (128 slots of 2 KB) is reserved out of the same VTCM as the A region, and the whole
 # grant is shared rather than half of it: at the phone's 4 MB the old half-pool left 192 KB
@@ -2208,7 +2209,11 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs; the exact
       # cache paths prefetch whole panels on their first fill instead (a per-K-block l2fetch there cost ~12% of the call)
       if w not in span: pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
-      pfa = f" __hmx_prefetch_next({ptr[0]}, {ptr[1]});"
+      # A: its whole K panel (32 rows x K) on the first K block. __hmx_prefetch_next fetches the tile 32 rows down -- B's next K
+      # block, but for A the next row tile, used only after the N loop: an A read once (attention's P @ V, P a 13.8 MB product
+      # packed from DDR) went at ~2 GB/s
+      pfa = (f" if (({kr})==0) __hmx_prefetch_rows({ptr[0]}, {ptr[1]}, {64*kt});" if HMX_PF_A_ROWS and e is not None and (loops is not None or any(ro)) else
+             f" __hmx_prefetch_next({ptr[0]}, {ptr[1]});")
       pa = pfa + pa if not ro[0] else pa.replace("{{ _a = _s;", "{{ _a = _s;" + pfa, 1)
     elif all(v.max_numel() == 32 for v, _ in rows):
       pa = "".join(f" *(__hmx_h64*)(_a+{64*q}) = __builtin_shufflevector({{{2*q}}},{{{2*q+1}}},{_ILV});" for q in range(16))
