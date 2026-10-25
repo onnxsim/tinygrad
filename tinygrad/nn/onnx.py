@@ -1082,7 +1082,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
         return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
       return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
-    # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: the whole attention as one fused HMX call (HMX_ATTN=0: off)
+    # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: the whole attention as one fused HMX call (HMX_ATTN=0: off;
+    # 3: generated, head by head)
+    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1) == 3:
+      return _attn_heads(ent[1], ent[2], b.half(), ent[3], ent[4])
     if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1):
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
@@ -1100,6 +1103,31 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
   # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
   def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
+
+  def _attn_heads(q16:Tensor, kt:Tensor, v:Tensor, M:int, N:int) -> Tensor:
+    """softmax(q k^T) v as generated kernels, one head at a time, transposed: S^T = K Q^T on the HMX (fp16), the softmax over the
+    keys -- S^T's rows, so the row max and sum are vector reduces with the queries as lanes, one stage each (over S's rows they
+    were lane reductions: a second stage of stride-64 gathers, 0.8 ms per head on the V69) --, O^T = V^T P^T on the HMX with
+    P^T as its row-major B. From q (..., >= M, 32) half, k^T (..., 32, N), v (..., N, 32) -> (..., M, 32) float. A head's S^T
+    and P^T (1.8 MB each for BEVFormer's 900 x 900) fit the VTCM the graph emitter places intermediates in (DSP_GRAPH_VTCM_KB);
+    all heads at once (13.8 MB) don't. Queries and keys are padded to a multiple of 64: rows of whole, aligned fp16 vectors.
+    The padding keys are masked by a constant bias column (-30000), the exp is computed once, in fp16 (exp2 of an fp16
+    argument: the renderer's 64-lane helper, HVX_HF_EXP2; probabilities within 5e-3 of fp32's). Each head's O^T is written into
+    its slice of one buffer (stacked, the heads were a per-element select over 8 buffers: 24 ms per decoder layer)"""
+    *bs, _, D = q16.shape
+    Mp, Np = M + -M % 64, N + -N % 64
+    qT = q16.reshape(-1, *q16.shape[-2:])[:, :M].pad(((0, 0), (0, Mp - M), (0, 0))).transpose(1, 2).contiguous()   # (H, 32, Mp)
+    kp = kt.reshape(-1, D, N).transpose(1, 2).pad(((0, 0), (0, Np - N), (0, 0))).half().contiguous()          # (H, Np, 32)
+    vT = v.reshape(-1, N, D).transpose(1, 2).pad(((0, 0), (0, 32), (0, Np - N))).half().contiguous()          # (H, 64, Np)
+    bias = Tensor([[0.0]] * N + [[-30000.0]] * (Np - N), device=q16.device)                                 # (Np, 1)
+    out = Tensor.zeros(qT.shape[0], D, Mp, dtype=dtypes.float32, device=q16.device).contiguous()
+    for h in range(qT.shape[0]):
+      x = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous().float() + bias                                  # S^T (Np, Mp)
+      m = x.max(0, keepdim=True)
+      e = ((x - m) * (1 / math.log(2))).half().float().exp2().half().contiguous()
+      pT = (e.float() * (1 / e.float().sum(0, keepdim=True))).half().contiguous()                            # P^T (Np, Mp)
+      out[h] = vT[h].matmul(pT, dtype=dtypes.half).contiguous()[:D].float()                                  # O^T (32, Mp)
+    return out[..., :M].transpose(-1, -2).reshape(*bs, M, D)
 
   def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
     """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, N), v (..., Np, 32) half (q and v
