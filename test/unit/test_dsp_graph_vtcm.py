@@ -62,4 +62,12 @@ class TestVtcmPlacement(unittest.TestCase):
     self.assertNotIn("G_REG_VTCM", self.emit(calls, bufs, x, y, 0))
     self.assertNotIn("G_REG_VTCM", self.emit(calls, bufs, x, y, 8))
 
+class TestCoreParam(unittest.TestCase):
+  def test_core_position(self):
+    # the threaded kernel's core id goes where its signature declares it (a buffer index skipped: declared before the last buffer)
+    def sig(params): return f"__attribute__((noinline)) void E_1({', '.join(params)}) {{ }}\n/* DSP boilerplate */"
+    self.assertEqual(g._core_param(sig(["float* data0_4", "float* data1_4", "const int data2_"]), 2), 2)
+    self.assertEqual(g._core_param(sig(["float* data0_4", "const int data2_", "float* data2_4"]), 2), 1)
+    self.assertEqual(g._core_param(sig(["float* data0_4", "float* data1_4"]), 2), 2)
+
 if __name__ == "__main__": unittest.main()

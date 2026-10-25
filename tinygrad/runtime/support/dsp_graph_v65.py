@@ -83,6 +83,14 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
     elif pre.endswith("*(") or not hmx: return False  # a scalar access; a pointer handed to a non-HMX (hand) kernel's code
   return seen
 
+def _core_param(src:str, nbufs:int) -> int:
+  """the position of a threaded kernel's core id (its `const int` parameter) among its parameters (default: after the buffers)"""
+  body = src.split("/* DSP boilerplate */")[0]
+  m = re.search(r"noinline\)\) void\s+\w+\(([^{]*)\)\s*\{", body)
+  if m is None: return nbufs
+  params = [p.strip() for p in m.group(1).split(",")]
+  return next((i for i, p in enumerate(params) if p.startswith("const int")), nbufs)
+
 def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict:
   """calls/bufs from dsp_graph.capture; inputs: the graph's input Buffers in order, output: its output Buffer"""
   o = pathlib.Path(outdir)
@@ -141,7 +149,11 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
         cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} (vgather) */")
       else: cases.append(f"  case {n}: {knames[src]}({args}, G_VTAB({slot}), G_VSLOT); break;  /* {name} (vgather) */")
     elif nthreads:
-      thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({args}, core); }}")
+      # the core id goes where the kernel declares it: usually last, but a kernel whose buffer indices skip one (eight per-head
+      # inputs numbered 0-7 and 9) declares it before the last buffer
+      a = [f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids]
+      a.insert(_core_param(src, len(ids)), "core")
+      thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({', '.join(a)}); }}")
       cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
     elif "__hmx_" in src: cases.append(f"  case {n}: g_hmx_lock(); {knames[src]}({args}); g_hmx_unlock(); break;  /* {name} */")
     else: cases.append(f"  case {n}: {knames[src]}({args}); break;  /* {name} */")

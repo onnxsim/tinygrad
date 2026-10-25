@@ -289,6 +289,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # vectors need unit stride. Such a kernel (a conv epilogue over 1350 pixels: only the channel axis divides) stays scalar
         # (integer reductions too: they are HVX vector code; only the scalar float register blocking gains from such upcasts)
         if is_dsp and max_bytes is not None and not dsp_scalar_float and gathers and getenv("DSP_V65_NO_GATHER_UPCAST", 1): continue
+        # HVX: no gathering upcast for a broadcast's reuse while another axis is unit-stride in every buffer (HVX_UPCAST_CONTIG takes
+        # it below). A per-key bias on attention scores made the rows the lanes: the max over 928 x 960 fp16 scores read 2-byte
+        # gathers 960 apart, 27.5 M cycles vs 3.4 M for the sum next to it
+        # (reductions only: an elementwise stack of per-head outputs got 3x slower without its row upcast)
+        if vector_dsp and HVX_UPCAST_CONTIG and gathers and k.reduceop is not None and not k.axes_of(AxisType.UPCAST) and \
+            any(a2 != axis and _every_unit_stride(k, a2) for a2 in k.upcastable_dims): continue
         xb_choices.append((gathers if vector_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if vector_dsp else 0,
                            axis, upcast_amount))
     if xb_choices:
