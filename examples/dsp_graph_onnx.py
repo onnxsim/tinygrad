@@ -98,6 +98,11 @@ def main() -> None:
   # to fp16 for GEMM_FP16, ran fully scalar at 17 ms per layer (3-layer encoder with onnxsim::MSDA + GEMM_FP16: 235 -> 162 ms)
   for flag in ("SOFTMAX_CONTIGUOUS", "MATMUL_CONTIGUOUS", "TRANSPOSE_CONTIGUOUS", "HVX_UPCAST_ODD", "REDUCE_TWO_STAGE", "HVX_UPCAST_ELEMWISE"):
     os.environ.setdefault(flag, "1")
+  # intermediates in the VTCM the HMX tile pool leaves of DSP_VTCM_TOTAL_KB (the V69's 8 MB; dsp_graph_v65.emit picks them by
+  # liveness and access width; a cDSP that grants less runs them from DDR). BEVFormer-tiny with a 3 MB pool: decoder 84 -> 64 ms,
+  # 1 / 3 encoder layers 42 -> 36 / 111 -> 105 ms
+  if os.environ.get("HMX"):
+    os.environ.setdefault("DSP_GRAPH_VTCM_KB", str(max(0, int(os.environ.get("DSP_VTCM_TOTAL_KB", "8192")) - int(os.environ.get("HMX_VTCM_KB", "256")) - 72)))
   import numpy as np, onnx
   from tinygrad import Tensor, dtypes
   from tinygrad.nn.onnx import OnnxRunner
@@ -156,6 +161,7 @@ def main() -> None:
   ins = [(name, t) for name, t in feeds.items() if id(t.uop.buffer.base) in used]
   info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for _, t in ins], y.uop.buffer)
   print(f"emitted {info['calls']} calls ({info['threaded_calls']} threaded), {info['kernels']} kernels, hmx={info['hmx']}, "
+        f"{info['vtcm_regions']} regions in {info['vtcm_bytes']/1e6:.2f} MB VTCM, "
         f"{info['blob']/1e6:.1f} MB weights, {info['scratch']/1e6:.2f} MB scratch -> {out}", file=sys.stderr)
   dsp_graph_v65.build(out, kernel_arch=args.arch)
 

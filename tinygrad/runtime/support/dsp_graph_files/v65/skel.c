@@ -189,14 +189,21 @@ int tg_graph_load(remote_handle64 h, int offset, int total, const uint8* chunk, 
   return 0;
 }
 
+#ifndef G_GVTCM_BYTES
+#define G_GVTCM_BYTES 0
+static const int G_REG_VTCM[G_NREG] = {[0 ... G_NREG - 1] = -1};
+#endif
+#ifdef G_HMX
+static unsigned char *g_gvtcm_ddr, *g_gvtcm_raw;  /* the VTCM regions' DDR fallback, once a larger VTCM request was refused */
+#endif
 static int regions(void) {
   if (g_raw) return 0;
   size_t total = 128;
 #ifdef G_ARENA_BYTES
   total += G_ARENA_BYTES;  /* the reused regions (G_REG_OFF >= 0) share one arena at the start of the block */
-  for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0 && G_REG_OFF[i] < 0) total += G_REG_BYTES[i];
+  for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0 && G_REG_OFF[i] < 0 && G_REG_VTCM[i] < 0) total += G_REG_BYTES[i];
 #else
-  for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0) total += G_REG_BYTES[i];
+  for (int i = 0; i < G_NREG; i++) if (G_REG_BLOB[i] < 0 && G_REG_VTCM[i] < 0) total += G_REG_BYTES[i];
 #endif
   if (!(g_raw = malloc(total))) return -1;
   memset(g_raw, 0, total);
@@ -210,6 +217,7 @@ static int regions(void) {
 #ifdef G_ARENA_BYTES
     else if (G_REG_OFF[i] >= 0) g_R[i] = arena + G_REG_OFF[i];
 #endif
+    else if (G_REG_VTCM[i] >= 0) g_R[i] = 0;  /* in VTCM past the HMX tile pool: set on every run, after the acquire */
     else g_R[i] = p, p += G_REG_BYTES[i];
   }
   return 0;
@@ -276,8 +284,24 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags
   G_VTCM_SETUP();
 #ifdef G_HMX
   if (!g_hmx_powered) { if (hmx_rt_power(&g_hmx_power_ctx, 1)) return AEE_EFAILED; g_hmx_powered = 1; }
-  if (hmx_rt_acquire(&g_hmx_rt, G_VTCM_KB * 1024)) { if (g_hmx_rt.ctx) hmx_rt_release(&g_hmx_rt); return AEE_ERESOURCENOTFOUND; }
+  /* the intermediates placed in VTCM (G_REG_VTCM) sit past the tile pool; + 4 KB: an HVX load may run past the last one (an
+   * unmapped address faults, unlike DDR slack). A cDSP that doesn't grant that much: the tile pool alone, and those regions in
+   * one DDR block instead (same results, without the speed) */
+  unsigned char* gv = 0;
+  if (G_GVTCM_BYTES && !g_gvtcm_ddr) {
+    if (hmx_rt_acquire(&g_hmx_rt, G_VTCM_KB * 1024 + G_GVTCM_BYTES + 4096) == 0) gv = g_hmx_rt.vtcm + G_VTCM_KB * 1024;
+    else if (g_hmx_rt.ctx) hmx_rt_release(&g_hmx_rt);  /* granted without a VTCM pointer */
+  }
+  if (!gv) {
+    if (G_GVTCM_BYTES && !g_gvtcm_ddr) {
+      if (!(g_gvtcm_raw = malloc(G_GVTCM_BYTES + 4096 + 128))) return AEE_ENOMEMORY;
+      g_gvtcm_ddr = (unsigned char*)(((uintptr_t)g_gvtcm_raw + 127) & ~(uintptr_t)127);
+    }
+    if (hmx_rt_acquire(&g_hmx_rt, G_VTCM_KB * 1024)) { if (g_hmx_rt.ctx) hmx_rt_release(&g_hmx_rt); return AEE_ERESOURCENOTFOUND; }
+    gv = g_gvtcm_ddr;
+  }
   __hmx_vtcm = g_hmx_rt.vtcm; __hmx_gen++;
+  for (int i = 0; i < G_NREG; i++) if (G_REG_VTCM[i] >= 0) g_R[i] = gv + G_REG_VTCM[i];
 #endif
   memset(t, 0, tLen * sizeof(uint64));
   job_t j = {start, count, threads, 0, t, tLen, flags, in, inLen};
