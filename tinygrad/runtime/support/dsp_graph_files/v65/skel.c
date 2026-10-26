@@ -78,7 +78,8 @@ static char* g_raw;
 
 /* ----- thread pool ----- */
 #define POOL_MAX 8
-#define HELPER_STACK (96 * 1024)
+/* 192 KB: a 32 x 32 transposing copy (heuristic HVX_TRANSPOSE) spills a 97 KB frame, which overran 96 KB on a pool thread */
+#define HELPER_STACK (192 * 1024)
 static char g_hstack[POOL_MAX][HELPER_STACK] __attribute__((aligned(128)));
 static qurt_thread_t g_htid[POOL_MAX];
 static int g_pool_n = 1;  /* participants, the graph thread included */

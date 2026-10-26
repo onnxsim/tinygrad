@@ -10,6 +10,8 @@ from tinygrad.codegen.opt.postrange import Scheduler
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
 HVX_SMALL_REDUCE = getenv("HVX_SMALL_REDUCE", 1)
+HVX_TRANSPOSE = getenv("HVX_TRANSPOSE", 1)
+HVX_TRANSPOSE_B = getenv("HVX_TRANSPOSE_B", 32)
 # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
 # between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
 HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
@@ -178,6 +180,20 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       rr = k.rngs[r]
       k.apply_opt(Opt(OptOps.UPCAST, a, 128 // R))
       k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rr), 0))  # (the upcast above may have moved it)
+      return apply_threads(k)
+
+  # a transposing copy (an axis contiguous in one buffer is strided in another, and another axis the other way round): both axes
+  # upcast by 32, so loads and stores are whole rows and the transpose happens in registers (lane gathers). Upcast on the output's
+  # contiguous axis alone, every load was a strided scalar (attention's per-head 900 x 32 -> 32 x 960 copies: 45 cycles a value)
+  if is_dsp and HVX_TRANSPOSE and max_bytes is None and k.reduceop is None and not k.axes_of(AxisType.UPCAST):
+    def unit_in(a): return {i for i, b in enumerate(k.bufs) if any(c is k.rngs[a] for c in b.src[1].get_idx().split_uop(Ops.ADD))}
+    def strided_in(a): return {i for i, b in enumerate(k.bufs) if k.rngs[a] in b.src[1].get_idx().backward_slice} - unit_in(a)
+    dims = [a for a in k.upcastable_dims if isinstance(k.full_shape[a], int) and k.full_shape[a] % 32 == 0]
+    pair = next(((a, b) for a in dims for b in dims if a != b and k.full_shape[b] % HVX_TRANSPOSE_B == 0 and (unit_in(a) & strided_in(b)) and (unit_in(b) & strided_in(a))), None)
+    if pair is not None:
+      ra, rb = k.rngs[pair[0]], k.rngs[pair[1]]
+      k.apply_opt(Opt(OptOps.UPCAST, pair[0], 32))
+      k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rb), HVX_TRANSPOSE_B))
       return apply_threads(k)
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
