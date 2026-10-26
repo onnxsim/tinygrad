@@ -189,9 +189,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     def unit_in(a): return {i for i, b in enumerate(k.bufs) if any(c is k.rngs[a] for c in b.src[1].get_idx().split_uop(Ops.ADD))}
     def strided_in(a): return {i for i, b in enumerate(k.bufs) if k.rngs[a] in b.src[1].get_idx().backward_slice} - unit_in(a)
     dims = [a for a in k.upcastable_dims if isinstance(k.full_shape[a], int) and k.full_shape[a] % 32 == 0]
-    pair = next(((a, b) for a in dims for b in dims if a != b and k.full_shape[b] % HVX_TRANSPOSE_B == 0 and (unit_in(a) & strided_in(b)) and (unit_in(b) & strided_in(a))), None)
+    pair = next(((a, b) for a in dims for b in dims if a != b and k.full_shape[b] % HVX_TRANSPOSE_B == 0 and
+                 (unit_in(a) & strided_in(b)) and (unit_in(b) & strided_in(a))), None)
     if pair is not None:
-      ra, rb = k.rngs[pair[0]], k.rngs[pair[1]]
+      rb = k.rngs[pair[1]]
       k.apply_opt(Opt(OptOps.UPCAST, pair[0], 32))
       k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rb), HVX_TRANSPOSE_B))
       return apply_threads(k)
