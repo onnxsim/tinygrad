@@ -266,7 +266,8 @@ class TestDSPHmx(unittest.TestCase):
     self.assertLess(kernel.index("__hmx_begin();"), loop)
     self.assertIn("= __hmx_ca(", kernel)
     self.assertNotIn("__hmx_mac(_a, _b)", kernel)
-    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+    # (B's two N tiles cached by the inner loop: the paired output's two spans, and the single tile's in its two branches)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 4)
     self.assertLess(loop, kernel.index("__hmx_mac_span("))
     self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store()"))
     # no 2 KB tile values, no per-K accumulator round trip
@@ -298,6 +299,16 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("__hmx_store2()", kernel)
     self.assertIn("__hmx_outp(", kernel)
 
+  def test_output_pairing_inner(self):
+    # every B tile cached and indexed by the inner tile loop (attention's S^T = K Q^T, one K tile, M = N): even inner tiles
+    # compute n and n+1 (B's next slot) and write full 128-byte rows; the first outer pass, which packs B tile n+1 only in
+    # iteration n+1, stores tile by tile
+    kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_mac_span(__hmx_ca(0), __hmx_cb((Lidx2)*1+1), 1);", kernel)
+    self.assertIn("__hmx_store2()", kernel)
+    self.assertIn("__hmx_outp(", kernel)
+    self.assertIn("if ((Lidx1)>0) { if ((Lidx2)%2==0 && (Lidx2)+1<30)", kernel)
+
   def test_large_vtcm_pool(self):
     # HMX_VTCM_KB > 256: A and B share one pool of loop-indexed slots, B after A's from a 32-slot boundary, K panels at a
     # window-safe stride (18 K tiles -> 32 slots), so B (inner-indexed after the interchange) no longer goes through the
@@ -308,7 +319,7 @@ class TestDSPHmx(unittest.TestCase):
     finally: ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = old
     self.assertIn("_b = __hmx_ca(32+(Lidx2)*32+(Ridx0))", kernel)  # after A (18 slots, rounded to 32), 32 per panel
     self.assertNotIn("__hmx_lookup(", kernel)
-    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 4)  # inner-paired output (test_output_pairing_inner)
 
   def test_epilogue_single_m_tile(self):
     # an epilogue (bias + residual) on an HMX output with a single M tile: the accumulator array follows the output's memory

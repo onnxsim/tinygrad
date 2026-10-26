@@ -62,6 +62,40 @@ class TestVtcmPlacement(unittest.TestCase):
     self.assertNotIn("G_REG_VTCM", self.emit(calls, bufs, x, y, 0))
     self.assertNotIn("G_REG_VTCM", self.emit(calls, bufs, x, y, 8))
 
+  def test_eviction_by_traffic(self):
+    # a big buffer four kernels touch, live across short-lived ones placed first (more uses per byte-call): it takes the place
+    # of the ones in its way when they carry less traffic in all (uses x bytes)
+    x, w, y = FakeBuf(16384), FakeBuf(16384), FakeBuf(16384)
+    s, t1, t2 = FakeBuf(32768), FakeBuf(24576), FakeBuf(24576)
+    bufs = {id(b): [b, b.nbytes, None] for b in (x, w, y, s, t1, t2)}
+    hmx, e = kern("h", [VEC, VEC], hmx=True), kern("e", [VEC])
+    calls = [("h", hmx, [id(s), id(x), id(w)], {0}, 0),     # s = f(x, w)
+             ("e", e, [id(t1), id(x)], {0}, 0),             # t1, t2: short-lived, between s's uses
+             ("e", e, [id(t2), id(t1)], {0}, 0),
+             ("e", e, [id(s), id(s)], {0}, 0),              # s in place
+             ("e", e, [id(y), id(s)], {0}, 0),
+             ("e", e, [id(x), id(t2)], {0}, 0)]
+    h = self.emit(calls, bufs, w, y, 48)
+    regs = [int(v) for v in re.search(r"G_REG_VTCM\[G_NREG\] = \{([^}]*)\}", h).group(1).split(",")]
+    order = list(dict.fromkeys(i for _, _, ids, *_ in calls for i in ids))
+    self.assertGreaterEqual(regs[order.index(id(s))], 0)
+
+class TestHoist(unittest.TestCase):
+  def test_hoist_out_of_hmx_chain(self):
+    # calls between an HMX producer and the HMX consumer of its output that don't depend on the chain move before the producer
+    sys_path = str(pathlib.Path(__file__).resolve().parents[2] / "examples")
+    import sys
+    if sys_path not in sys.path: sys.path.insert(0, sys_path)
+    from dsp_graph_onnx import hoist_out_of_hmx_chains
+    b = {n: FakeBuf(4096) for n in "iswvoz"}
+    bufs = {id(t): [t] for t in b.values()}
+    H, E = "__hmx_call_start();", "plain"
+    calls = [("S", H, [id(b["s"]), id(b["i"])], {0}), ("max", E, [id(b["w"]), id(b["s"])], {0}),
+             ("vproj", E, [id(b["v"]), id(b["i"])], {0}), ("vT", E, [id(b["z"]), id(b["v"])], {0}),
+             ("PV", H, [id(b["o"]), id(b["s"]), id(b["w"]), id(b["z"])], {0})]
+    names = [c[0] for c in hoist_out_of_hmx_chains(calls, bufs)]
+    self.assertEqual(names, ["vproj", "vT", "S", "max", "PV"])
+
 class TestCoreParam(unittest.TestCase):
   def test_core_position(self):
     # the threaded kernel's core id goes where its signature declares it (a buffer index skipped: declared before the last buffer)

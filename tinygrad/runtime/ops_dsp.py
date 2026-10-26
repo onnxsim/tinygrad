@@ -90,7 +90,7 @@ _QF_EXP2_C = [1.53592089e-4, 1.33926270e-3, 9.61838476e-3, 5.55034727e-2, 2.4022
 def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
   widths = sorted({u.max_numel() for u in uops if _hf_exp2_src(u) is not None})
   if not widths: return []
-  out = [_HF_EXP2]
+  out = [_HF_EXP2_QF16 if HVX_HF_EXP2 == 1 else _HF_EXP2]
   for n in widths:
     t, k = vtype(dtypes.half, n), n // 64
     lanes = [",".join(str(i) for i in range(64*j, 64*j+64)) for j in range(k)]
@@ -196,6 +196,31 @@ static inline __hvx_h __tg_exp2_h(__hvx_h x) {
   b = x < (__hvx_h)(__fp16)-14.0f ? (__hvx_hs)(short)0 : b;
   b = x >= (__hvx_h)(__fp16)16.0f ? (__hvx_hs)(short)0x7C00 : b;
   return __builtin_bit_cast(__hvx_h, b);
+}"""
+
+# the same exp2 with the polynomial kept in qf16 (HVX_HF_EXP2=1; 2: the helper above): each step a qf16 multiply-add on a qf16
+# operand, converted to hf once at the end, and the clamp folded into the range masks -- the hand attention softmax's form
+# (test/external/dsp/hand/attn/attn_softmax.h). Converted to hf after every op it took twice the instructions: BEVFormer's
+# per-head exp over 960 x 960 fp16 scores, 0.29 ms on the V69
+_HF_EXP2_QF16 = r"""#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+typedef __fp16 __hvx_h __attribute__((ext_vector_type(64)));
+static inline HVX_Vector __tg_hsplat(float f) { union { __fp16 h; short s; } u; u.h = (__fp16)f; return Q6_Vh_vsplat_R(u.s); }
+static inline __hvx_h __tg_exp2_h(__hvx_h xh) {
+  const HVX_Vector x = __builtin_bit_cast(HVX_Vector, xh), lo = __tg_hsplat(-14.f), hi = __tg_hsplat(15.99f), sixteen = __tg_hsplat(16.f),
+                   magic = Q6_Vh_vsplat_R(0x6600), inf = Q6_Vh_vsplat_R(0x7C00), zero = Q6_V_vzero();
+  HVX_Vector xc = Q6_Vhf_vmin_VhfVhf(Q6_Vhf_vmax_VhfVhf(x, lo), hi);
+  HVX_Vector r = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(xc, magic));
+  HVX_Vector n = Q6_Vh_vsub_VhVh(r, magic);
+  HVX_Vector g = Q6_Vqf16_vsub_Vqf16Vhf(Q6_Vqf16_vsub_VhfVhf(r, magic), xc);
+  HVX_Vector p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(g, __tg_hsplat(0.00961813f)), __tg_hsplat(-0.0555041f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(0.2402265f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(-0.6931472f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(1.f));
+  HVX_Vector e = Q6_Vh_vadd_VhVh(Q6_Vhf_equals_Vqf16(p), Q6_Vh_vasl_VhR(n, 10));
+  e = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(lo, x), zero, e);
+  e = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(sixteen, x), e, inf);
+  return __builtin_bit_cast(__hvx_h, e);
 }"""
 
 def _hf_div(u:UOp) -> bool:
@@ -2263,7 +2288,8 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
         if ea and eb:
           # K tiles stay in VTCM: no load pair per K block, one spanning pair after the loop (see the output statement)
-          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc, _hmx_stride(kt), "%2*" in eb[1], int(outer.vmax) + 1)
+          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc, _hmx_stride(kt), "%2*" in eb[1], int(outer.vmax) + 1,
+                     eb[1].endswith(f"({iname})*{_hmx_stride(kt)}"), ti)
           ea, eb = ea[0], eb[0]
         else: ea, eb = ea and ea[0], eb and eb[0]
         pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
@@ -2312,6 +2338,21 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         vt = {32: "__hmx_h32", 64: "__hmx_h64", 128: "__hmx_h128"}.get(len(lanes))
         if vt is None: return _hmx_bail(uops, 11)
         outs.append(f" *({vt}*){{{k}}} = ({vt}){{{{{','.join(f'_p[{l}]' for l in lanes)}}}}};")
+    def pair_inner(rowptr:list[UOp]) -> tuple[str, tuple]|None:
+      # every B tile cached, indexed by the inner tile loop (attention's S^T = K Q^T: one K tile, 30 x 30 output tiles): on
+      # even inner tiles compute tiles n, n+1 (B's next slot) and write full 128-byte rows (__hmx_outp); odd ones have nothing
+      # left to do. The first outer pass packs B tile n+1 only in iteration n+1, so it stores tile by tile
+      if not (w in span and span[w][11] and bool(getenv("HMX_OUTPAIR", 1)) and _hmx_ptr_pairable(rowptr, span[w][4], ranges)):
+        return None
+      ab, bb, kt_, o_, i_, on_, in_, bacc, st_ = span[w][:9]
+      n0, n1 = "{%d}" % len(rowptr), "{%d}" % (len(rowptr)+1)
+      ab, bb = ab.replace(on_, n0).replace(in_, n1), bb.replace(on_, n0).replace(in_, n1)
+      mac0 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});"
+      mac1 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}+{st_}), {kt_});"
+      pp = "".join(f" __hmx_outp({{{2*q}}}, {{{2*q+1}}}, _p+{64*q}, _q+{64*q});" for q in range(16))
+      one = f"{{{{{mac0} const __fp16* _p = __hmx_store();" + "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16)) + " }}"
+      return (f"{{{{ if (({n0})>0) {{{{ if (({n1})%2==0 && ({n1})+1<{span[w][12]}) {{{{{mac0} const __fp16* _p = __hmx_store();{mac1}"
+              f" const __fp16* _q = __hmx_store2();{pp} }}}} else if (({n1})%2==0) {one} }}}} else {one} }}}}", (o_, i_))
     if (direct:=_hmx_direct_out(uops, pos, users, end_at, stores)) is not None:
       # the accumulator array is only copied to an output buffer after the loop: write the tile rows there directly
       rowptr, gone = direct
@@ -2322,7 +2363,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       if w in span and span[w][9] and bool(getenv("HMX_OUTPAIR", 1)) and _hmx_ptr_pairable(rowptr, span[w][3], ranges):
         # B tiles n, n+1 are packed together on even n: compute both output tiles there (two spanning load pairs, two
         # stores to VTCM) and write full 128-byte rows; odd n has nothing left to do; an unpaired last tile stores alone
-        ab, bb, kt_, o_, i_, on_, in_, bacc, st_, _, ON = span[w]
+        ab, bb, kt_, o_, i_, on_, in_, bacc, st_, _, ON = span[w][:11]
         n0, n1 = "{%d}" % len(rowptr), "{%d}" % (len(rowptr)+1)
         ab, bb = ab.replace(on_, n0).replace(in_, n1), bb.replace(on_, n0).replace(in_, n1)
         mac0 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});"
@@ -2333,6 +2374,11 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         at = max(pos[g] for g in gone if g.op is Ops.STORE)
         after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
                                         [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+(o_, i_), code)])
+        continue
+      if (pc:=pair_inner(rowptr)) is not None:
+        at = max(pos[g] for g in gone if g.op is Ops.STORE)
+        after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
+                                        [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+pc[1], pc[0])])
         continue
       # where the last replaced store was: every row pointer expression is rendered by then
       at = max(pos[g] for g in gone if g.op is Ops.STORE)
@@ -2348,6 +2394,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       row_of[i] = so.src[0]
     if sorted(row_of) == list(range(32)):
       rowptr = [row_of[i] for i in range(32)]
+      if (pc:=pair_inner(rowptr)) is not None:
+        after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+pc[1], pc[0]))
+        continue
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       sm, sx = span_mac(tuple(rowptr))
       after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}"))

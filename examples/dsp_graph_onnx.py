@@ -73,6 +73,34 @@ def sink_calls(calls:list, bufs:dict) -> list:
     if j > i + 1: out.insert(j - 1, out.pop(i))
   return out
 
+def hoist_out_of_hmx_chains(calls:list, bufs:dict) -> list:
+  """A buffer one HMX call writes and a later HMX call reads (the generated attention's per-head S^T: the S^T product, its max and
+  exp, P @ V) is what the graph emitter's VTCM arena gains most from; every call in between that doesn't depend on what was
+  written since the producer moves before it (sinking put BEVFormer's whole V projection chain between a layer's first S^T and
+  its P @ V, and S^T no longer fit next to its buffers). -> the reordered calls"""
+  def span(b): v = bufs[b][0]; return (id(v.base), v.offset, v.offset + v.nbytes)
+  def hit(xs, ys): return any(a == c and lo < hi2 and lo2 < hi for a, lo, hi in xs for c, lo2, hi2 in ys)
+  def writes(c): return [span(c[2][o]) for o in c[3]]
+  def touches(c): return [span(b) for b in c[2]]
+  out, i = list(calls), 0
+  while i < len(out):
+    c = out[i]
+    if "__hmx_" in c[1]:
+      for w in writes(c):
+        j = max((j for j in range(i + 1, min(i + 32, len(out))) if hit(touches(out[j]), [w])), default=None)
+        if j is None or "__hmx_" not in out[j][1]: continue
+        wrote, keep, move = writes(c), [], []
+        for d in out[i + 1:j]:
+          # depends on the chain: reads or overwrites what it wrote; or is overwritten... by it (moved first, it would read late)
+          if hit(touches(d), wrote) or hit(writes(d), [sp for k in keep for sp in touches(k)] + touches(c)): keep.append(d); wrote += writes(d)
+          else: move.append(d)
+        if move:
+          out[i:j] = move + [c] + keep
+          i += len(move)
+        break
+    i += 1
+  return out
+
 def keep_attention_vtcm(calls:list, bufs:dict) -> list:
   """The split hand attention (nn/onnx.py _hmx_attn_dsp) keeps a head's S tiles in VTCM from its S call (hmx_attn_s_*) through
   the pool's softmax (attn_sm_*) to its P @ V call (hmx_attn_pv_*); data flows between them only through that VTCM, which the
@@ -179,6 +207,7 @@ def main() -> None:
     holder["y"] = (outs[0] if len(outs) == 1 else Tensor.cat(*[o.cast(dtypes.float32).flatten() for o in outs])).contiguous().realize()
   calls, bufs = dsp_graph.capture(fn)
   if os.environ.get("DSP_GRAPH_SINK", "1") != "0": calls = sink_calls(calls, bufs)
+  if os.environ.get("DSP_GRAPH_HMX_HOIST", "1") != "0": calls = hoist_out_of_hmx_chains(calls, bufs)
   calls = keep_attention_vtcm(calls, bufs)
   ops_dsp.DSPCompiler.compile = real_compile
   y = holder["y"]

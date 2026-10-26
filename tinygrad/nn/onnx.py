@@ -7,7 +7,7 @@ from tinygrad.mixin.op import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, TC_OPT
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, _to_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
-from tinygrad.uop.ops import sint, _broadcast_shape
+from tinygrad.uop.ops import sint, _broadcast_shape, UOp
 
 # ***** protobuf definitions ******
 class WireType(enum.IntEnum):
@@ -374,10 +374,27 @@ def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
 # GEMM_FP16 products on the DSP and the hand softmax's results, by the id of the fp32 tensor the ONNX graph sees (with the
 # tensor itself, to tell a reused id): the padded fp16 product a softmax can take instead / the padded fp16 probabilities the
 # next product takes as its A
-_fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor]] = {}  # (fp32 result, padded fp16 product, M, N, A, B unpadded)
+# (fp32 result, padded fp16 product, M, N, A, B unpadded, fp32 A, B)
+_fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor, Tensor, Tensor]] = {}
 _fp16_in: dict[int, tuple[Tensor, Tensor]] = {}
 # softmax(q @ k^T) results that P @ V can instead compute as one fused HMX attention call (_hmx_attn_dsp): q, k^T fp16 operands
-_attn_in: dict[int, tuple[Tensor, Tensor, Tensor, int, int]] = {}
+_attn_in: dict[int, tuple[Tensor, Tensor, Tensor, int, int, Tensor, Tensor]] = {}  # (+ the fp32 q, k^T the product took)
+# realized transposed copies (TRANSPOSE_CONTIGUOUS) -> the transposing view each copies: a consumer that builds its own layout
+# from an operand (the generated attention, _attn_heads) reads through them to the source (_untranspose)
+_tview: dict[UOp, UOp] = {}
+
+def _untranspose(t:Tensor) -> Tensor:
+  """t with each realized transposed copy it reads through movement and elementwise ops (BEVFormer's k^T: Transpose, Reshape,
+  Transpose, Mul by the scale) replaced by its view, so a copy into another layout reads the source once. It stops at anything
+  else (a reduce, a realized product): rebuilt past those, the graph above them would be computed again"""
+  from tinygrad.uop.ops import Ops, GroupOp
+  @functools.cache
+  def go(u:UOp) -> UOp:
+    if (v := _tview.get(u)) is not None: return go(v)
+    if u.op not in GroupOp.Movement and u.op not in GroupOp.ALU and u.op is not Ops.CAST: return u
+    src = tuple(go(x) for x in u.src)
+    return u if all(a is b for a, b in zip(src, u.src)) else u.replace(src=src)
+  return Tensor(go(t.uop), device=t.device)
 
 # ***** runner ******
 debug = int(getenv("DEBUGONNX", "0"))
@@ -852,11 +869,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # and its padded fp16 result is what the next GEMM_FP16 product (P @ V) takes as its A. Generated, the slice + cast back, the
     # three softmax kernels and the cast + pad for P @ V took ~45 ms per BEVFormer decoder layer (8 x 900 x 900)
     if (ent := _fp16_out.get(id(x))) is not None and ent[0] is x and x._resolve_dim(axis) == x.ndim - 1 and ent[3] <= 2048:
-      _, y, M, N, q16, kth = ent
+      _, y, M, N, q16, kth, qa, kb = ent
       p16 = _softmax_h16_dsp(y, M, N, M + _hmx_pad_rows(M), N + -N % 32)
       ret = p16[..., :M, :N].float()  # only computed if something else reads the probabilities
       _fp16_in[id(ret)] = (ret, p16)
-      if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kth.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kth, M, N)
+      if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kth.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kth, M, N, qa, kb)
       return ret
     # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points):
     # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). Generated, the group max and sum are spelled as
@@ -981,8 +998,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     perm = perm or list(range(x.ndim)[::-1])
     ret = x.permute(order=perm)
     if not getenv("TRANSPOSE_CONTIGUOUS"): return ret
-    if str(x.device).startswith("DSP") and getenv("TRANSPOSE_SPLIT", 1) and (sp := _transpose_split(x, perm)) is not None: return sp
-    return ret.contiguous()
+    if str(x.device).startswith("DSP") and getenv("TRANSPOSE_SPLIT", 1) and (sp := _transpose_split(x, perm)) is not None: out = sp
+    else: out = ret.contiguous()
+    _tview[out.uop] = ret.uop
+    return out
   def _transpose_split(x:Tensor, perm:list[int]) -> Tensor|None:
     # a transposing copy whose two swapped axes (the input's last, the one that becomes the output's last) are multiples of 32
     # takes 32 x 32 blocks (heuristic HVX_TRANSPOSE, renderer HVX_TRANSPOSE_NET: 0.3 ms for 6 x 256 x 384 floats on the V69).
@@ -1105,7 +1124,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: the whole attention as one fused HMX call (HMX_ATTN=0: off;
     # 3: generated, head by head)
     if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1) == 3:
-      return _attn_heads(ent[1], ent[2], b.half(), ent[3], ent[4])
+      return _attn_heads(ent[5], ent[6], b, ent[3], ent[4])
     if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1):
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
@@ -1117,37 +1136,57 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # the slice + cast back fuses into the consumers (a bias add, ...) for free -- except a softmax's, read through the view (49 ms
     # more per BEVFormer decoder layer): on the DSP that takes the padded product itself (_softmax_contig)
     ret = y[..., :M, :N].float()
-    if dsp: _fp16_out[id(ret)] = (ret, y, M, N, a16, bh)
+    if dsp: _fp16_out[id(ret)] = (ret, y, M, N, a16, bh, a, b)
     return ret
 
   # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
   # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
   def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
 
-  def _attn_heads(q16:Tensor, kt:Tensor, v:Tensor, M:int, N:int) -> Tensor:
+  def _attn_heads(q:Tensor, kt:Tensor, v:Tensor, M:int, N:int) -> Tensor:
     """softmax(q k^T) v as generated kernels, one head at a time, transposed: S^T = K Q^T on the HMX (fp16), the softmax over the
-    keys -- S^T's rows, so the row max and sum are vector reduces with the queries as lanes, one stage each (over S's rows they
-    were lane reductions: a second stage of stride-64 gathers, 0.8 ms per head on the V69) --, O^T = V^T P^T on the HMX with
-    P^T as its row-major B. From q (..., >= M, 32) half, k^T (..., 32, N), v (..., N, 32) -> (..., M, 32) float. A head's S^T
-    and P^T (1.8 MB each for BEVFormer's 900 x 900) fit the VTCM the graph emitter places intermediates in (DSP_GRAPH_VTCM_KB);
-    all heads at once (13.8 MB) don't. Queries and keys are padded to a multiple of 64: rows of whole, aligned fp16 vectors.
+    keys -- S^T's rows, so the row max is a vector reduce with the queries as lanes, one stage (over S's rows it was a lane
+    reduction: a second stage of stride-64 gathers, 0.8 ms per head on the V69) --, O^T = V^T P^T on the HMX with P^T as its
+    row-major B. From q (..., M, 32), k^T (..., 32, N), v (..., N, 32) fp32 -> (..., M, 32) fp32. A head's S^T, exp'd in
+    place (1.8 MB for BEVFormer's 900 x 900), fits the VTCM the graph emitter places intermediates in (DSP_GRAPH_VTCM_KB); all
+    heads at once (13.8 MB) don't. Queries and keys are padded to a multiple of 64: rows of whole, aligned fp16 vectors.
     The padding keys are masked by a constant bias column (-30000), the exp is computed once, in fp16 (exp2 of an fp16
-    argument: the renderer's 64-lane helper, HVX_HF_EXP2; probabilities within 5e-3 of fp32's). Each head's O^T is written into
-    its slice of one buffer (stacked, the heads were a per-element select over 8 buffers: 24 ms per decoder layer)"""
-    *bs, _, D = q16.shape
-    Mp, Np = M + -M % 64, N + -N % 64
-    qT = q16.reshape(-1, *q16.shape[-2:])[:, :M].pad(((0, 0), (0, Mp - M), (0, 0))).transpose(1, 2).contiguous()   # (H, 32, Mp)
-    kp = kt.reshape(-1, D, N).transpose(1, 2).pad(((0, 0), (0, Np - N), (0, 0))).half().contiguous()          # (H, Np, 32)
-    vT = v.reshape(-1, N, D).transpose(1, 2).pad(((0, 0), (0, 32), (0, Np - N))).half().contiguous()          # (H, 64, Np)
-    bias = Tensor([[0.0]] * N + [[-30000.0]] * (Np - N), device=q16.device)                                 # (Np, 1)
-    out = Tensor.zeros(qT.shape[0], D, Mp, dtype=dtypes.float32, device=q16.device).contiguous()
-    for h in range(qT.shape[0]):
-      x = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous().float() + bias                                  # S^T (Np, Mp)
+    argument: the renderer's 64-lane helper, HVX_HF_EXP2; probabilities within 5e-3 of fp32's).
+    The operands are built from the projections' outputs (_untranspose: BEVFormer's are (900, 256) row-major): Q^T and V^T as
+    32 x 32 block transposes, K as rows; and the result is one block transpose back to (M, heads x 32). Built from the ONNX
+    graph's realized (heads, 900, 32) / (heads, 32, 900) copies, each operand was a second transposing copy with rows of 900
+    (no whole vectors: 2.9 ms each, 13 ms per decoder layer)"""
+    *bs, _, D = q.shape
+    H, Mp, Np = prod(bs), M + -M % 64, N + -N % 64
+    q, kt, v = (_untranspose(t) for t in (q, kt, v))
+    # in fp32 (rows of 32 floats: whole HVX vectors, block transposes by the transpose network), padded rows first, cast last
+    def rows(t:Tensor, n:int, p:int) -> Tensor: return t.reshape(H, n, D).pad(((0, 0), (0, p - n), (0, 0))).contiguous()
+    # q times log2(e): S^T comes out in base 2 (exp2 of S^T - max, no multiply)
+    qT = (rows(q, M, Mp) * (1 / math.log(2))).transpose(1, 2).contiguous().half().contiguous()               # (H, 32, Mp)
+    kp = rows(kt.transpose(-1, -2), N, Np).half().contiguous()                                               # (H, Np, 32)
+    # V^T's row 32 is ones over the keys (zeros past N): the P V product's row 32 is then each query's sum of exp, and the
+    # normalization is a divide in the store of O^T (as a pass of its own over P^T: 0.25 ms per head on the V69, the sum 0.05)
+    ones = Tensor([1.0] * N + [0.0] * (Np - N), device=q.device).reshape(1, 1, Np).expand(H, 1, Np).pad(((0, 0), (0, 31), (0, 0)))
+    vT = rows(v, N, Np).transpose(1, 2).contiguous().cat(ones, dim=1).contiguous().half().contiguous()       # (H, 64, Np)
+    bias = Tensor([[0.0]] * N + [[-30000.0]] * (Np - N), device=q.device).half()                            # (Np, 1)
+    # each head's unnormalized O^T and its sums stored (cast to fp32) into its rows of one buffer: one store kernel per head.
+    # Stacked or concatenated, the heads were a per-element select over 8 buffers (24 ms per decoder layer); built in a zeros
+    # buffer, the scheduler folded the stores into one such kernel. The divide goes into the block transpose back: in the
+    # store, the sums' broadcast over the 32 rows made the rows the upcast axis (strided scalar loads and stores)
+    oT = Tensor.empty(H, D + 1, Mp, dtype=dtypes.float32, device=q.device)
+    for h in range(H):
+      s16 = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous()                                               # S^T (Np, Mp)
+      # the shift by the max in fp16 (the exponent is rounded to fp16 for the exp anyway): in fp32 the conversions both ways
+      # doubled the exp kernel (0.39 ms per head on the V69)
+      x = s16 + bias
       m = x.max(0, keepdim=True)
-      e = ((x - m) * (1 / math.log(2))).half().float().exp2().half().contiguous()
-      pT = (e.float() * (1 / e.float().sum(0, keepdim=True))).half().contiguous()                            # P^T (Np, Mp)
-      out[h] = vT[h].matmul(pT, dtype=dtypes.half).contiguous()[:D].float()                                  # O^T (32, Mp)
-    return out[..., :M].transpose(-1, -2).reshape(*bs, M, D)
+      # exp(S^T) over S^T's own buffer: one 1.8 MB region per head
+      e = (x - m).exp2()
+      e = s16.assign(e) if getenv("ATTN_EXP_INPLACE", 1) else e.contiguous()
+      y = vT[h].matmul(e, dtype=dtypes.half).contiguous().float()                                            # (V^T | 1) exp
+      oT[h].assign(y[:D + 1])                                                                                 # O^T | sums
+    o = (oT[:, :D] * (1 / oT[:, D:])).permute(2, 0, 1).reshape(Mp, H * D).contiguous()[:M]                   # (M, H x 32)
+    return o.reshape(M, H, D).permute(1, 0, 2).reshape(*bs, M, D)
 
   def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
     """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, N), v (..., Np, 32) half (q and v
