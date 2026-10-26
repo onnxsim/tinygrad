@@ -2,7 +2,7 @@ import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, tc
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.uop.ops import Ops, GroupOp, resolve, AxisType
 from tinygrad.dtype import dtypes
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -12,6 +12,7 @@ HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
 HVX_SMALL_REDUCE = getenv("HVX_SMALL_REDUCE", 1)
 HVX_TRANSPOSE = getenv("HVX_TRANSPOSE", 1)
 HVX_TRANSPOSE_B = getenv("HVX_TRANSPOSE_B", 32)
+HVX_TRANSPOSE_NET = getenv("HVX_TRANSPOSE_NET", 1)
 # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
 # between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
 HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
@@ -162,7 +163,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if is_dsp and HVX_SMALL_REDUCE and max_bytes is None and k.reduceop is not None and len(k.axes_of(AxisType.REDUCE)) == 1:
     r = k.axes_of(AxisType.REDUCE)[0]
     R = int(k.full_shape[r]) if isinstance(k.full_shape[r], int) else 0
-    if 2 <= R <= 8 and _every_unit_stride(k, r):
+    # (R = 32 with the transpose network: the 32 groups' rows are a 32 x 32 block, the sum is over its columns -- HVX_TRANSPOSE_NET)
+    if (2 <= R <= 8 or (R == 32 and HVX_TRANSPOSE_NET)) and _every_unit_stride(k, r):
       for a in k.upcastable_dims[::-1]:
         if k.full_shape[a] % 32 == 0 and _stride_in_every(k, a, R, k.rngs[r]):
           k.apply_opt(Opt(OptOps.UPCAST, a, 32))
@@ -416,16 +418,39 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   return apply_threads(k)
 
+def _work_per_elem(k:Scheduler) -> int:
+  # a rough per-element cost of the kernel: its ALU ops, transcendentals / reciprocals 20 each (scalar float code on the DSP: an
+  # inverse sigmoid of 2700 reference points, exp + two reciprocals + a log polynomial each, took 1.2 ms on one thread)
+  heavy = (Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.SQRT, Ops.SIN, Ops.FDIV)
+  return max(1, sum(20 if u.op in heavy else 1 for u in k.ast.toposort() if u.op in GroupOp.ALU and dtypes.is_float(u.dtype)) // 8)
+
 def apply_threads(k:Scheduler) -> Scheduler:
   if k.ren.has_threads and k.ren.global_max is not None:
+    pool = getattr(k.ren, "pool_threads", k.ren.global_max[0])
+    if getattr(k.ren, "thread_work_weighted", False):
+      w = _work_per_elem(k)
+      def few(t:int) -> bool: return resolve(prod(k.full_shape) * w // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
+    else:
+      def few(t:int) -> bool: return resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
     for threads in [32,16,12,8,6,5,4,3,2]:
       # Skip if too many threads. Heuristic: use about 128K ops per thread (a renderer whose per-element cost is far higher, like
       # the DSP's scalar float, sets a lower thread_min_elems)
-      if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < threads): continue
+      if threads > pool or few(threads): continue
       for axis in k.axes_of(AxisType.WEAK):
         if k.full_shape[axis] % threads == 0:
           try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))
           except KernelOptError: pass
           break
       if k.applied_opts and k.applied_opts[-1].op is OptOps.THREAD: break
+    # no axis divides by a pool size (625 rows = 5^4): more slices than threads, when they spread evenly enough (25 slices over 4
+    # threads: 89%). BEVFormer's LayerNorm second stage ran on one thread, 0.7 ms per call
+    if pool > 1 and k.ren.global_max[0] > pool and not any(o.op is OptOps.THREAD for o in k.applied_opts) and not few(pool):
+      def balance(t:int) -> float: return t / (pool * -(-t // pool))
+      for axis in k.axes_of(AxisType.WEAK):
+        n = k.full_shape[axis]
+        cands = [t for t in range(pool + 1, k.ren.global_max[0] + 1) if isinstance(n, int) and n % t == 0 and balance(t) >= 0.85]
+        if cands:
+          try: k.apply_opt(Opt(OptOps.THREAD, axis, min(cands)))
+          except KernelOptError: continue
+          break
   return k

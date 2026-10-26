@@ -233,6 +233,8 @@ def _lane_gather(srcs:tuple[UOp, ...]) -> tuple[list[UOp], list[int]]|None:
   # element k of 32 groups of 4 loaded as four 32-lane vectors) -> (the vectors, lanes into their concatenation): rendered as
   # __builtin_shufflevector (pairs concatenated first), which clang lowers to HVX permutes, instead of a lane constructor
   if len(srcs) < 2 or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in srcs): return None
+  # (one lane repeated is a splat: _splat_of_loaded_lane reloads it as a scalar for one vsplat)
+  if all(s is srcs[0] for s in srcs): return None
   vs: list[UOp] = []
   for s in srcs:
     if s.src[0] not in vs: vs.append(s.src[0])
@@ -241,6 +243,57 @@ def _lane_gather(srcs:tuple[UOp, ...]) -> tuple[list[UOp], list[int]]|None:
   lanes = [_lane(s.src[1]) for s in srcs]
   if not all(isinstance(l, int) for l in lanes): return None
   return vs, [vs.index(s.src[0]) * w[0] + l for s, l in zip(srcs, lanes)]
+
+HVX_TRANSPOSE_NET = getenv("HVX_TRANSPOSE_NET", 1)
+def _transpose_col(x:UOp) -> tuple[list[UOp], int]|None:
+  # STACK(v_0[i], v_1[i], ..., v_{n-1}[i]) of n distinct n-lane vectors (n a power of two, >= 8): column i of the n x n block
+  # whose rows are the v_j -- what a transposing copy's stores are once both its axes are upcast (heuristic HVX_TRANSPOSE)
+  n = len(x.src)
+  if n < 8 or n & (n - 1) or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in x.src): return None
+  vs = [s.src[0] for s in x.src]
+  lanes = {_lane(s.src[1]) for s in x.src}
+  if len(lanes) != 1 or None in lanes or len(set(vs)) != n or any(v._shape != (n,) for v in vs): return None
+  return vs, lanes.pop()
+
+def _transpose_helper(t:str, n:int) -> str:
+  # the n x n transpose of rows r0..r{n-1} into o[0..n-1]: log2(n) butterfly stages of two shuffles per row pair (rows r, r+b:
+  # swap r's columns with bit b set and r+b's with it clear). A barrier per stage: without it LLVM folds each output's chain of
+  # shuffles back into one wide multi-source shuffle. Called once per block (_transpose_groups), its columns read from o
+  lines = [f"static inline void __tr{n}_{_c_ident(t)}({t}* o, {', '.join(f'{t} r{j}' for j in range(n))}) {{"]
+  b = n // 2
+  while b:
+    lo = ",".join(str(c if not c & b else n + c - b) for c in range(n))
+    hi = ",".join(str(c + b if not c & b else n + c) for c in range(n))
+    for r in range(n):
+      if r & b: continue
+      lines.append(f"  {{ {t} a = r{r}, c = r{r + b}; r{r} = __builtin_shufflevector(a, c, {lo}); r{r + b} = __builtin_shufflevector(a, c, {hi}); }}")
+    lines.append("  " + " ".join(f'__asm__("" : "+v"(r{j}));' for j in range(n)))
+    b //= 2
+  lines.append("  " + " ".join(f"o[{j}] = r{j};" for j in range(n)))
+  return "\n".join(lines + ["}"])
+
+def _c_ident(t:str) -> str: return re.sub(r"\W", "_", t)
+
+def _transpose_groups(ren, uops:list[UOp]) -> list[UOp]:
+  """the column STACKs of each block (_transpose_col, whole 128-byte rows): one statement computing the block's transpose into a
+  local array, inserted before its first column, and every column rendered as an element of it (ren._tr_cols)"""
+  ren._tr_cols, ren._tr_types = {}, set()
+  if not HVX_TRANSPOSE_NET: return uops
+  groups: dict[tuple, list[tuple[int, UOp, int]]] = {}
+  for p, u in enumerate(uops):
+    if u.op is Ops.STACK and (g := _transpose_col(u)) is not None and len(g[0]) * u.dtype.itemsize == 128:
+      groups.setdefault(tuple(g[0]), []).append((p, u, g[1]))
+  inserts: dict[int, UOp] = {}
+  for gid, (vs, cols) in enumerate(groups.items()):
+    if len(cols) < 2: continue
+    n, t = len(vs), ren._render_dtype(cols[0][1].dtype, len(vs), AddrSpace.REG)
+    ren._tr_types.add((t, n))
+    inserts[min(p for p, _, _ in cols)] = UOp(Ops.CUSTOM, dtypes.void, tuple(vs),
+      f"{t} _tr{gid}[{n}]; __tr{n}_{_c_ident(t)}(_tr{gid}, " + ", ".join(f"{{{j}}}" for j in range(n)) + ");")
+    for _, u, i in cols: ren._tr_cols[u] = f"_tr{gid}[{i}]"
+  return [x for p, u in enumerate(uops) for x in ((inserts[p], u) if p in inserts else (u,))]
+
+def _render_transpose_col(ctx, x:UOp) -> str|None: return getattr(ctx, "_tr_cols", {}).get(x)
 
 def _render_lane_gather(ctx, x:UOp) -> str|None:
   if not HVX_LANE_GATHER or (g:=_lane_gather(x.src)) is None: return None
@@ -482,6 +535,7 @@ dsp_string = PatternMatcher([
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _render_lane_concat(ctx, x) if getenv("DSP_LANE_CONCAT", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
+  (UPat(Ops.STACK, name="x"), _render_transpose_col),
   (UPat(Ops.STACK, name="x"), _render_lane_gather),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
   # vector load): reload that element as a scalar (then one vsplat) -- the lane splat clang v19 builds with vinserts
@@ -2465,8 +2519,14 @@ class DSPRenderer(ClangRenderer):
   # v65: one 128-byte HVX register bounds a useful upcast (see hand_coded_optimizations)
   @property
   def upcast_max_bytes(self): return 128 if _v65_hw() else None
+  # the pool runs a kernel's slices strided over its DSP_THREADS threads, so a kernel may take more slices than threads: an axis
+  # no thread count divides (625 = 5^4 rows) can still be split, 25 slices over 4 threads (apply_threads)
+  # (v68+ only, like the arithmetic-weighted thread threshold: the v65 programs are tuned and checked without them)
   @property
-  def global_max(self): return (DSP_THREADS, 0, 0) if DSP_THREADS > 1 else None  # type: ignore[override]
+  def global_max(self): return (DSP_THREADS * (1 if _v65_hw() else 8), 0, 0) if DSP_THREADS > 1 else None  # type: ignore[override]
+  pool_threads = DSP_THREADS
+  @property
+  def thread_work_weighted(self) -> bool: return not _v65_hw()  # apply_threads weighs elements by the kernel's arithmetic
   def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
   buffer_suffix = " restrict __attribute__((align_value(128)))"
   kernel_typedef = "__attribute__((noinline)) void"
@@ -2501,6 +2561,7 @@ class DSPRenderer(ClangRenderer):
   def render(self, uops:list[UOp]) -> str:
     self._hmx_acc = False
     if self.hmx_acc: uops, self._hmx_acc = _hmx_acc_rewrite(uops)
+    uops = _transpose_groups(self, uops)
     # _lane_window: uop positions and (position, buffer) of every store
     self._pos = {u:i for i,u in enumerate(uops)}
     self._stores = [(i, _hmx_param(u.src[0])) for i,u in enumerate(uops) if u.op is Ops.STORE]
@@ -2555,6 +2616,7 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     prefix += _cmp_helpers(uops)
+    prefix += [_transpose_helper(t, n) for t, n in sorted(getattr(self, '_tr_types', ()))]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
