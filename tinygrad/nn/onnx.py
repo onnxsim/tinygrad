@@ -1707,7 +1707,15 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     Q, M, NO, P, _ = off.shape
     NVR, R = ref.shape[0], ref.shape[2]
     assert S == H * W and C % M == 0 and NO in (1, NV) and NVR in (1, NV), f"MSDA: inconsistent shapes {value.shape} {ref.shape} {off.shape}"
-    if str(value.device).startswith("DSP") and getenv("HAND_MSDA", 1): return _msda_dsp(value, ref, off, attw, vis, H, W)
+    if str(value.device).startswith("DSP") and getenv("HAND_MSDA", 1):
+      # MSDA_SPLIT_MAPS=1: the plain mean over several maps (BEVFormer's two-frame temporal attention) as one call per map, so a
+      # map's values (2.56 MB) fit the graph's VTCM arena: the calls got faster (6.5 -> 4.7 ms per encoder layer on the V69) but
+      # the per-map copies of the interleaved offsets / weights cost more (9.7 ms over 3 layers)
+      if vis is None and NV > 1 and getenv("MSDA_SPLIT_MAPS", 0):
+        per = [_msda_dsp(value[v:v+1], ref[v:v+1] if NVR > 1 else ref, off[:, :, v:v+1] if NO > 1 else off,
+                         attw[:, :, v:v+1] if NO > 1 else attw, None, H, W) for v in range(NV)]
+        return functools.reduce(Tensor.add, per) * (1.0 / NV)
+      return _msda_dsp(value, ref, off, attw, vis, H, W)
     D = C // M
     # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
     refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
@@ -1741,7 +1749,8 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), *[b.flatten().index(UOp.const(0, dtypes.int)) for b in bufs], t)
       vis_arg = "{5}" if vis is not None else "0"
       cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
-               arg=f"__msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
+               # (the value maps, parameter 1, are read as whole 128-byte rows: the graph emitter may put them in VTCM)
+               arg=f"/* vtcm-params: 1 */ __msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
       return cu.end(t).sink(arg=KernelInfo(name=f"msda_{NV}x{Q}x{M}x{P}", opts_to_apply=()))
     y = Tensor.empty(Q, C, dtype=dtypes.float32, device=value.device)
     return Tensor.custom_kernel(y, *ins, fxn=kern)[0]

@@ -54,6 +54,25 @@ def constants_to_initializers(model) -> int:
   model.graph.node.extend(keep)
   return moved
 
+def sink_calls(calls:list, bufs:dict) -> list:
+  """Each call moved to just before the first later call that depends on it (reads what it writes, or writes what it reads or
+  writes), last calls first. The capture runs every kernel as early as possible, so a buffer lived from its producer near the
+  start to a consumer much later (BEVFormer's camera value maps: calls 3 to 76): later producers shorten live ranges, and the
+  graph emitter's VTCM arena (DSP_GRAPH_VTCM_KB) holds more of what is live at once. -> the reordered calls"""
+  # byte ranges within base buffers: slices of one buffer (BEVFormer's merged value projection, read per layer, written per layer)
+  # don't order each other
+  def span(b): v = bufs[b][0]; return (id(v.base), v.offset, v.offset + v.nbytes)
+  def writes(c): return [span(c[2][o]) for o in c[3]]
+  def touches(c): return [span(b) for b in c[2]]
+  def hit(xs, ys): return any(a == c and lo < hi2 and lo2 < hi for a, lo, hi in xs for c, lo2, hi2 in ys)
+  out = list(calls)
+  for i in range(len(out) - 2, -1, -1):
+    c = out[i]
+    w, t = writes(c), touches(c)
+    j = next((j for j in range(i + 1, len(out)) if hit(touches(out[j]), w) or hit(writes(out[j]), t)), len(out))
+    if j > i + 1: out.insert(j - 1, out.pop(i))
+  return out
+
 def keep_attention_vtcm(calls:list, bufs:dict) -> list:
   """The split hand attention (nn/onnx.py _hmx_attn_dsp) keeps a head's S tiles in VTCM from its S call (hmx_attn_s_*) through
   the pool's softmax (attn_sm_*) to its P @ V call (hmx_attn_pv_*); data flows between them only through that VTCM, which the
@@ -101,6 +120,11 @@ def main() -> None:
   # intermediates in the VTCM the HMX tile pool leaves of DSP_VTCM_TOTAL_KB (the V69's 8 MB; dsp_graph_v65.emit picks them by
   # liveness and access width; a cDSP that grants less runs them from DDR). BEVFormer-tiny with a 3 MB pool: decoder 84 -> 64 ms,
   # 1 / 3 encoder layers 42 -> 36 / 111 -> 105 ms
+  # buffer reuse planned by the graph emitter (DSP_GRAPH_REUSE: DDR by liveness, after the call sinking and the VTCM arena), not
+  # by tinygrad's memory planner: its aliasing of unrelated tensors made calls depend on each other (a copy of BEVFormer's
+  # camera value maps couldn't move past a reuse of its source region) and kept the maps out of VTCM. Scratch: 108 -> 37 MB
+  os.environ.setdefault("NO_MEMORY_PLANNER", "1")
+  os.environ.setdefault("DSP_GRAPH_REUSE", "1")
   if os.environ.get("HMX"):
     os.environ.setdefault("DSP_GRAPH_VTCM_KB", str(max(0, int(os.environ.get("DSP_VTCM_TOTAL_KB", "8192")) - int(os.environ.get("HMX_VTCM_KB", "256")) - 72)))
   import numpy as np, onnx
@@ -154,6 +178,7 @@ def main() -> None:
     outs = [r[vo.name] for vo in model.graph.output] if isinstance(r, dict) else [r]
     holder["y"] = (outs[0] if len(outs) == 1 else Tensor.cat(*[o.cast(dtypes.float32).flatten() for o in outs])).contiguous().realize()
   calls, bufs = dsp_graph.capture(fn)
+  if os.environ.get("DSP_GRAPH_SINK", "1") != "0": calls = sink_calls(calls, bufs)
   calls = keep_attention_vtcm(calls, bufs)
   ops_dsp.DSPCompiler.compile = real_compile
   y = holder["y"]

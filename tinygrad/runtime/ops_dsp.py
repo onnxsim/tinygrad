@@ -2628,7 +2628,7 @@ class DSPRenderer(ClangRenderer):
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
-    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__msda_call(") for u in uops): prefix.append(_msda_helpers())
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and "__msda_call(" in u.arg for u in uops): prefix.append(_msda_helpers())
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)

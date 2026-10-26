@@ -73,6 +73,8 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
   body = src.split("/* DSP boilerplate */")[0]
   m = re.search(rf"\bdata{j}_\d+\b", body)
   if m is None: return False
+  # a hand kernel can declare the parameters it reads and writes only as whole HVX vectors (/* vtcm-params: 1,2 */ in its call)
+  if (d := re.search(r"/\* vtcm-params: ([\d,]+) \*/", body)) is not None and j in {int(x) for x in d.group(1).split(",")}: return True
   name, hmx, seen = m.group(0), "__hmx_" in body, False
   for o in re.finditer(rf"\b{name}\b", body):
     pre = body[max(0, o.start() - 48):o.start()]
@@ -188,10 +190,14 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     uses: dict[int, list[int]] = {}
     whole: set[int] = set()
     narrow: set[int] = set()
+    weight: dict[int, int] = {}
     for n, (_, src, ids, outs, _) in enumerate(calls):
+      declared = re.search(r"/\* vtcm-params: ([\d,]+) \*/", src)
       for j, b in enumerate(ids):
         r = rid[id(base[b])]
         uses.setdefault(r, []).append(n)
+        # a parameter a hand kernel declares (MSDA's value maps) is gathered from many times per call: worth 16 plain uses
+        weight[r] = weight.get(r, 0) + (16 if declared and j in {int(x) for x in declared.group(1).split(",")} else 1)
         if j in outs and views[b].offset == 0 and views[b].nbytes == base[b].nbytes: whole.add(r)
         if not _vtcm_access_ok(src, j): narrow.add(r)
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
@@ -199,7 +205,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
             _rnd(regions[r].nbytes) <= vkb * 1024]
     vplaced: list[tuple[int, int, int, int]] = []
     # most uses per byte-call of VTCM held first: a small buffer read twice 200 calls apart holds its bytes the whole time
-    for r in sorted(cand, key=lambda r: (-len(uses[r]) / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)), uses[r][0])):
+    # declared hand-kernel parameters first (their gathers gain the most), then the rest by uses per byte-call held
+    for r in sorted(cand, key=lambda r: (weight[r] < 16, -weight[r] / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)), uses[r][0])):
       size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
       busy = sorted((o, o + sz) for o, sz, f2, l2 in vplaced if not (l2 < f or l < f2))
       off = 0
