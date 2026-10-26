@@ -179,7 +179,7 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       placed.append((off, size, f, l)); reg_off[r] = off; arena = max(arena, off + size)
   # DSP_GRAPH_VTCM_KB (HMX programs): intermediates in VTCM. The skel acquires that much VTCM past the HMX tile pool (HMX_VTCM_KB),
   # which no kernel touches, so a region there survives every call between its first and last use -- the schedule-level fact a
-  # kernel can't see on its own. Regions are placed by liveness (first fit), most calls per byte first; only regions some one
+  # kernel can't see on its own. Regions are placed by liveness (first fit), most calls per byte-call held first; only regions some one
   # call writes whole (VTCM isn't zeroed, and a partly written region may rely on the zeros of a fresh allocation) and every
   # kernel reads and writes as whole HVX vectors (_vtcm_access_ok), never weights, inputs or the output
   vtcm_off: dict[int, int] = {}
@@ -198,7 +198,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     cand = [r for r in uses if r in whole and r not in narrow and r not in pinned and id(regions[r]) not in blob_off and
             _rnd(regions[r].nbytes) <= vkb * 1024]
     vplaced: list[tuple[int, int, int, int]] = []
-    for r in sorted(cand, key=lambda r: (-len(uses[r]) / regions[r].nbytes, uses[r][0])):
+    # most uses per byte-call of VTCM held first: a small buffer read twice 200 calls apart holds its bytes the whole time
+    for r in sorted(cand, key=lambda r: (-len(uses[r]) / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)), uses[r][0])):
       size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
       busy = sorted((o, o + sz) for o, sz, f2, l2 in vplaced if not (l2 < f or l < f2))
       off = 0

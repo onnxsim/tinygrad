@@ -440,6 +440,7 @@ def _interleave4_stack(ctx, x:UOp) -> str|None:
 # helpers (v68/v69 have no vector float <-> int convert, so LLVM scalarizes __builtin_convertvector / truncf per lane).
 # Small bool vectors stay scalar: LLVM's Hexagon backend can't select some of those ("v2i32 = bitcast (V2Q ...)").
 HVX_REVEC_CMP = getenv("HVX_REVEC_CMP", 0)
+HVX_SPLAT_WHERE = getenv("HVX_SPLAT_WHERE", 1)
 _CMP = {Ops.CMPLT: "<", Ops.CMPNE: "!=", Ops.CMPEQ: "=="}
 def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP)
 def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and n % 32 == 0
@@ -794,6 +795,13 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
+  # a select whose condition is one scalar in every lane (a concat's source by row) is one whole-vector select: scalar condition,
+  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69)
+  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and _is32(s0.dtype) and \
+      all(s.op is Ops.WHERE and s._shape == () and s.dtype == s0.dtype and s.src[0] is s0.src[0] for s in srcs) and \
+      _vec_column_ok(tuple(s.src[1] for s in srcs)) and _vec_column_ok(tuple(s.src[2] for s in srcs)):
+    return UOp(Ops.CUSTOMI, x.dtype, (s0.src[0], UOp.stack(*[s.src[1] for s in srcs]), UOp.stack(*[s.src[2] for s in srcs])),
+               "({0}?{1}:{2})")
   if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n)): return None
   # a splat of one scalar op (a per-sample weight broadcast over the channel lanes) stays that scalar op and one vsplat: as a
   # vector op it does the same work on splatted operands, and pulls the scalar compares / selects under it into vectors too

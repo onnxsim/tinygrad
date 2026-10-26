@@ -978,8 +978,28 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   # TRANSPOSE_CONTIGUOUS: the transposed copy is realized. As a view, a consumer that wants the transposed layout (attention's
   # K^T feeding Q @ K^T) reads the source with the transposed strides, so its vector lanes become strided gathers
   def Transpose(x:Tensor, perm:list[int]|None=None):
-    ret = x.permute(order=perm or list(range(x.ndim)[::-1]))
-    return ret.contiguous() if getenv("TRANSPOSE_CONTIGUOUS") else ret
+    perm = perm or list(range(x.ndim)[::-1])
+    ret = x.permute(order=perm)
+    if not getenv("TRANSPOSE_CONTIGUOUS"): return ret
+    if str(x.device).startswith("DSP") and getenv("TRANSPOSE_SPLIT", 1) and (sp := _transpose_split(x, perm)) is not None: return sp
+    return ret.contiguous()
+  def _transpose_split(x:Tensor, perm:list[int]) -> Tensor|None:
+    # a transposing copy whose two swapped axes (the input's last, the one that becomes the output's last) are multiples of 32
+    # takes 32 x 32 blocks (heuristic HVX_TRANSPOSE, renderer HVX_TRANSPOSE_NET: 0.3 ms for 6 x 256 x 384 floats on the V69).
+    # One that isn't (BEVFormer's camera maps, 6 x 256 x 375 -> 6 x 375 x 256: 6.2 ms) is split along it: the multiple-of-32
+    # part and the rest
+    a, b = x.ndim - 1, perm[-1]
+    if a == b or not all(isinstance(x.shape[i], int) for i in (a, b)) or (x.shape[a] % 32 == 0) == (x.shape[b] % 32 == 0): return None
+    sa = a if x.shape[a] % 32 else b
+    n, main = x.shape[sa], x.shape[sa] // 32 * 32
+    if main < 64: return None
+    # each part realized (lazily the scheduler fused them back into one kernel over the whole axis), then concatenated: a
+    # contiguous copy along the output's last axis (a slice assign into one buffer rewrote the whole buffer per part)
+    # The rest is the last 32 (overlapping the first part: a whole block too), of which the concat keeps its last n - main
+    def part(lo:int, hi:int) -> Tensor: return x.shrink(tuple((lo, hi) if i == sa else None for i in range(x.ndim))).permute(order=perm).contiguous()
+    j = perm.index(sa)
+    tail = part(n - 32, n).shrink(tuple((32 - (n - main), 32) if i == j else None for i in range(x.ndim)))
+    return part(0, main).cat(tail, dim=j).contiguous()
 
   def Squeeze(data:Tensor, axes:list[int]|None=None):
     return data.squeeze() if axes is None else functools.reduce(lambda d, dim: d.squeeze(dim), sorted(axes, reverse=True), data)
