@@ -310,13 +310,14 @@ def add_reg_stage(ctx:tuple[Iterator[int], dict], idx:UOp, x:UOp):
     n, lane = prod(x.max_shape), UOp.const(0, dtypes.weakint)
     for r in ext: lane = lane * r.src[0] + r
     buf = UOp.placeholder((n * prod([r.src[0].arg for r in ext]),), x.dtype, slot=next(ctx[0]), addrspace=AddrSpace.REG)
-    # its innermost axes upcast up to STAGE_LANES lanes, the rest loops around them: what doesn't depend on those loops is computed
-    # once, outside (the generated MSDA's floors per point, not per tap: 256 lanes in one go spilled HVX registers)
+    # its innermost axes upcast up to STAGE_LANES (128) lanes, the rest loops around them: what doesn't depend on those loops is
+    # computed once, outside (the generated MSDA's floors per point, not per tap: 256 lanes in one go spilled HVX registers; the
+    # decoder's 4 x 32 in one go: 0.58 -> 0.50 ms a call vs as a loop around 32 lanes)
     zero = {r:r.const_like(0) for r in own}
     def stride(r:UOp) -> int: return x.src[1].substitute({**zero, r:r.const_like(1)}).simplify().arg
     up, lanes = {}, 1
     for r in sorted(own, key=stride):
-      if lanes * r.src[0].arg > getenv("STAGE_LANES", 64) and lanes > 1: break
+      if lanes * r.src[0].arg > getenv("STAGE_LANES", 128) and lanes > 1: break
       up[r], lanes = r.replace(arg=r.arg[:-1]+(AxisType.UPCAST,)), lanes * r.src[0].arg
     ctx[1][x] = (buf.after(buf.index(lane * n + x.src[1]).store(x.src[0]).end(*own).substitute(up)), lane * n)
   st, base = ctx[1][x]

@@ -94,16 +94,16 @@ class TestStage(unittest.TestCase):
     self.assertRegex(src, r"\*\(\(int32\*\)\(\(buf\d+\+0\)\)\) =")
 
   def test_table_loop_outside_lanes(self):
-    # a table of more than STAGE_LANES (64) entries: its innermost axes are the vector lanes and a loop goes around them; what
+    # a table of more than STAGE_LANES (128) entries: its innermost axes are the vector lanes and a loop goes around them; what
     # doesn't depend on that loop's axis is computed once, outside it. Gated, the whole loop moves into the IF (sink_into_ifs)
-    a, X, vis = Tensor.empty(8, 64), Tensor.empty(8, 4, 64, 32), Tensor.empty(8, dtype=dtypes.uint8)
-    tab = ((a.exp2().reshape(8, 1, 64) + Tensor.arange(4).reshape(1, 4, 1)) * 0.5).stage(2)               # (8, 4, 64): 4 x 64
+    a, X, vis = Tensor.empty(8, 128), Tensor.empty(8, 4, 128, 32), Tensor.empty(8, dtype=dtypes.uint8)
+    tab = ((a.exp2().reshape(8, 1, 128) + Tensor.arange(4).reshape(1, 4, 1)) * 0.5).stage(2)               # (8, 4, 128): 4 x 128
     src = dsp_sources((vis != 0).reshape(8, 1, 1, 1).where(tab.unsqueeze(-1) * X, 0.0).sum((1, 2)))[0]
     body = src[src.index("if ("):]
     loop = re.search(r"for \(int (Lidx\d+) = 0; \1 < 4; \1\+\+\) \{", body)
     self.assertIsNotNone(loop)
     self.assertNotIn("exp2", body[loop.end():body.index("for (int Ridx")])      # (v65 render: the exp2 is a polynomial, outside the loop)
-    self.assertRegex(body[loop.end():], r"\*\(\(float64\*\)\(\(buf\d+\+\(Lidx\d+<<6\)\)\)\) =")
+    self.assertRegex(body[loop.end():], r"\*\(\(float128\*\)\(\(buf\d+\+\(Lidx\d+<<7\)\)\)\) =")
     self.assertEqual(src.count("if ("), 1)
 
   def test_norm_add_col(self):
