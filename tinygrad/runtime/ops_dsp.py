@@ -828,8 +828,9 @@ def hvx_revectorize(x:UOp) -> UOp|None:
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
   # a select whose condition is one scalar in every lane (a concat's source by row) is one whole-vector select: scalar condition,
-  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69)
-  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and _is32(s0.dtype) and \
+  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69). In fp16 too: BEVFormer's encoder pads
+  # its (1, 128) can-bus row to 64 rows for the HMX, lane by lane 0.68 ms on the V69
+  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and (_is32(s0.dtype) or s0.dtype in (dtypes.half, dtypes.int16)) and \
       all(s.op is Ops.WHERE and s._shape == () and s.dtype == s0.dtype and s.src[0] is s0.src[0] for s in srcs) and \
       _vec_column_ok(tuple(s.src[1] for s in srcs)) and _vec_column_ok(tuple(s.src[2] for s in srcs)):
     return UOp(Ops.CUSTOMI, x.dtype, (s0.src[0], UOp.stack(*[s.src[1] for s in srcs]), UOp.stack(*[s.src[2] for s in srcs])),

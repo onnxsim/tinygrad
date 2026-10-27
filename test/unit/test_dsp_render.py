@@ -69,6 +69,13 @@ class TestDSPRender(unittest.TestCase):
     self.assertNotRegex(src, r"\bfloat(64|32|16|8|4)_u\b", "a gathered row was split into narrower unaligned loads")
     self.assertIn("float128", src)
 
+  def test_splat_where_fp16(self):
+    # a row pad of fp16 (BEVFormer's can-bus row padded to 64 rows for the HMX): the select's condition is the row, one scalar for
+    # all 128 lanes, so it is one whole-vector select; per lane it was 128 scalar fp16 selects per row (0.68 ms on the V69)
+    src = dsp_source(Tensor.empty(1, 128, dtype=dtypes.half).pad(((0, 63), (0, 0))).contiguous())
+    self.assertIn("((Lidx0<1)?val0:", src)
+    self.assertNotIn("val0[1]", src)
+
   def test_revec_cmp_floor_cast_where(self):
     # HVX_REVEC_CMP: floor (TRUNC + compare + select), float -> int32 and a bounds-gated select become vector code (the integer
     # trunc / f2i helpers and an int-mask bit select) instead of one scalar statement per lane; off, they stay per lane
