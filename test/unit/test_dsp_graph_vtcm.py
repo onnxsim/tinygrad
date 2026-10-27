@@ -200,6 +200,49 @@ class TestHoist(unittest.TestCase):
              ("tail", "plain", [id(b["x"]), id(b["i"])], {0}), ("PV", "/* hmx-tile: 1 */ __hmx_", [id(b["o"]), id(b["p"])], {0})]
     self.assertEqual([c[0] for c in pull_raw_tile_readers(calls, bufs)], ["exp", "PV", "other", "tail"])
 
+class TestFp16Weights(unittest.TestCase):
+  def test_fp16_matmul_weights(self):
+    # a float weight used only as a MatMul / Gemm (transB=0) B is stored in fp16 behind a Cast; one used otherwise is kept
+    sys_path = str(pathlib.Path(__file__).resolve().parents[2] / "examples")
+    import sys
+    if sys_path not in sys.path: sys.path.insert(0, sys_path)
+    import numpy as np
+    from onnx import parser, numpy_helper, TensorProto
+    from dsp_graph_onnx import fp16_matmul_weights
+    model = parser.parse_model("""<ir_version: 8, opset_import: ["" : 17]> g (float[4, 8] x) => (float[4, 8] y) {
+      a = MatMul(x, w)
+      b = Gemm(a, v)
+      c = Add(b, u)
+      y = MatMul(c, u)
+    }""")
+    rng = np.random.default_rng(0)
+    for n in "wvu": model.graph.initializer.append(numpy_helper.from_array(rng.standard_normal((8, 8)).astype(np.float32), n))
+    self.assertEqual(fp16_matmul_weights(model), 2)
+    init = {t.name: t for t in model.graph.initializer}
+    self.assertEqual(sorted(init), ["u", "v__fp16", "w__fp16"])
+    self.assertEqual(init["w__fp16"].data_type, TensorProto.FLOAT16)
+    casts = [n for n in model.graph.node if n.op_type == "Cast"]
+    self.assertEqual(sorted((n.input[0], n.output[0]) for n in casts), [("v__fp16", "v"), ("w__fp16", "w")])
+    self.assertEqual(list(model.graph.node).index(casts[-1]), 1)   # ahead of every use
+
+class TestHmxOverlap(unittest.TestCase):
+  def test_pairs(self):
+    # an HMX call runs beside a threaded call it doesn't depend on (either side of it); a call in between that the moved one
+    # depends on stops it; the moved call's first-touched buffers cost their bytes x the calls moved over (the budget)
+    b = {n: FakeBuf(4096) for n in "xwqmkst"}
+    rid = {id(t): i for i, t in enumerate(b.values())}
+    views, base = {id(t): t for t in b.values()}, {id(t): t for t in b.values()}
+    H, T = "__hmx_call_start();", "threaded"
+    calls = [("cast", T, [id(b["m"]), id(b["x"])], {0}, 4),           # 0: m = f(x)
+             ("proj", H, [id(b["q"]), id(b["x"]), id(b["w"])], {0}, 0),  # 1: q = x w (independent of 0)
+             ("e", T, [id(b["k"]), id(b["q"])], {0}, 4),               # 2: k = f(q)
+             ("S", H, [id(b["s"]), id(b["k"])], {0}, 0),               # 3: s = g(k): depends on 2
+             ("t", T, [id(b["t"]), id(b["m"])], {0}, 4)]               # 4: t = f(m): independent of 3, moves up to it
+    sizes = [4096] * len(b)
+    self.assertEqual(g.hmx_overlap_pairs(calls, views, base, rid, sizes, budget=0), {})
+    pairs = g.hmx_overlap_pairs(calls, views, base, rid, sizes, budget=4096)
+    self.assertEqual(pairs, {0: (0, 1), 3: (4, 3)})
+
 class TestCoreParam(unittest.TestCase):
   def test_core_position(self):
     # the threaded kernel's core id goes where its signature declares it (a buffer index skipped: declared before the last buffer)

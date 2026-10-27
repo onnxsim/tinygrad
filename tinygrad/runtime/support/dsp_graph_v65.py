@@ -102,6 +102,43 @@ def _core_param(src:str, nbufs:int) -> int:
   params = [p.strip() for p in m.group(1).split(",")]
   return next((i for i, p in enumerate(params) if p.startswith("const int")), nbufs)
 
+def hmx_overlap_pairs(calls, views:dict, base:dict, rid:dict, sizes:list[int], window:int=16, budget:int=0,
+                      debug=False) -> dict[int, tuple[int, int]]:
+  """DSP_GRAPH_HMX_OVERLAP: HMX call h and a threaded HVX call t that run together: the pool's helpers take t's slices while the
+  graph thread runs h, then joins t's remaining slices. An HMX kernel runs on one thread, so the other three HVX contexts sat
+  idle through it. The later of the two moves up to the earlier one's place, so it must be independent (no byte range one
+  writes and the other touches) of every call in between; pairs don't nest. Moving a call up makes the buffers it is the first
+  to touch live from there: such a byte x call cost above `budget` is no pair (S^T of the next head beside this head's max:
+  every head's 1.8 MB S^T alive twice as long, out of the VTCM arena, decoder 27.8 -> 31.9 ms). Off by default: BEVFormer's
+  decoder on the V69 with its weight casts gone, 27.3 ms -> 27.2 (budget 1 MB x call, noise) / 28.4 (4 MB). -> {where: (t, h)}"""
+  acc = [[(rid[id(base[b])], views[b].offset, views[b].offset + views[b].nbytes, j in outs) for j, b in enumerate(ids)]
+         for _, _, ids, outs, _ in calls]
+  first: dict[int, int] = {}
+  for n, a in enumerate(acc):
+    for r, *_ in a: first.setdefault(r, n)
+  written = {r for a in acc for r, _, _, w in a if w}  # (weights are never placed: no cost)
+  def dep(a:int, b:int) -> bool:
+    return any(r1 == r2 and lo1 < hi2 and lo2 < hi1 and (w1 or w2) for r1, lo1, hi1, w1 in acc[a] for r2, lo2, hi2, w2 in acc[b])
+  # the split hand attention passes S through the HMX tile pool between its calls (examples/dsp_graph_onnx.py keep_attention_vtcm)
+  def hidden(n:int) -> bool: return calls[n][0].startswith(("hmx_attn_s_", "attn_sm_", "hmx_attn_pv_"))
+  def is_t(n:int) -> bool: return bool(calls[n][4]) and "__hmx_" not in calls[n][1] and not hidden(n)
+  def cost(e:int, m:int) -> int: return sum(sizes[r] * (first[r] - e) for r in {r for r, *_ in acc[m]} if e < first[r] and r in written)
+  pairs: dict[int, tuple[int, int]] = {}
+  done = -1  # pairs don't nest: every call up to here is settled
+  for h in range(len(calls)):
+    if h <= done or "__hmx_" not in calls[h][1] or hidden(h): continue
+    best = None
+    for t in range(max(done + 1, h - window), min(len(calls), h + window + 1)):
+      if t == h or not is_t(t): continue
+      e, m = min(t, h), max(t, h)
+      if any(hidden(x) for x in range(e, m + 1)) or any(dep(m, x) for x in range(e, m)): continue
+      if (c := cost(e, m)) <= budget and (best is None or (c, abs(t - h)) < best[0]): best = ((c, abs(t - h)), e, m, t)
+      if debug: print(f"overlap? {calls[t][0]} ({t}) + {calls[h][0]} ({h}): cost {c}")
+    if best is not None:
+      _, e, m, t = best
+      pairs[e], done = (t, h), m
+  return pairs
+
 def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict:
   """calls/bufs from dsp_graph.capture; inputs: the graph's input Buffers in order, output: its output Buffer"""
   o = pathlib.Path(outdir)
@@ -142,6 +179,13 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
   for name, src, _, _, nthreads in calls:
     if nthreads and "__hmx_" in src: raise ValueError(f"{name}: an HMX kernel can't run on the DSP_THREADS pool")
   out_view = output
+  dbg = bool(os.environ.get("DSP_GRAPH_HMX_OVERLAP_DEBUG"))
+  pairs = hmx_overlap_pairs(calls, views, base, rid, [_rnd(r.nbytes) for r in regions],
+                            budget=int(os.environ.get("DSP_GRAPH_HMX_OVERLAP_BUDGET", 1 << 20)), debug=dbg)\
+    if hmx and os.environ.get("DSP_GRAPH_HMX_OVERLAP", "0") != "0" else {}
+  ran_at = {(t if h == e else h): e for e, (t, h) in pairs.items()}  # the moved call's buffers are live from where it runs
+  if dbg:
+    for e, (t, h) in pairs.items(): print(f"overlap @{e}: {calls[t][0]} ({t}) + {calls[h][0]} ({h})")
   # DSP_GRAPH_REUSE: the regions that aren't weights, inputs or the output share one arena, placed by liveness (first fit over
   # the call range each is used in), so a region freed by its last use is reused. One region per buffer was 85 MB of scratch
   # for BEVFormer's encoder layer (180 MB for its decoder), and a kernel writing fresh memory paid for it in TLB / cache misses
@@ -150,7 +194,9 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
   if os.environ.get("DSP_GRAPH_REUSE", "0") != "0":
     live: dict[int, list[int]] = {}
     for n, (_, _, ids, _, _) in enumerate(calls):
-      for b in ids: live.setdefault(rid[id(base[b])], [n, n])[1] = n
+      for b in ids:
+        lv = live.setdefault(rid[id(base[b])], [ran_at.get(n, n), n])
+        lv[0], lv[1] = min(lv[0], ran_at.get(n, n)), max(lv[1], n)
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
     placed: list[tuple[int, int, int, int]] = []  # (offset, size, first call, last call)
     for r in sorted((r for r in live if id(regions[r]) not in blob_off and r not in pinned), key=lambda r: live[r][0]):
@@ -190,11 +236,13 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       for j, b in enumerate(ids):
         r = rid[id(base[b])]
         uses.setdefault(r, []).append(n)
+        if n in ran_at: uses[r].append(ran_at[n])
         # a parameter a hand kernel declares (MSDA's value maps) is gathered from many times per call: worth 16 plain uses
         weight[r] = weight.get(r, 0) + (16 if j in heavy else 1)
         if j in outs and views[b].offset == 0 and views[b].nbytes == base[b].nbytes: whole.add(r)
         if j in _listed(src, "hmx-tile"): rawt.add(r)
         if not _vtcm_access_ok(src, j): narrow.add(r)
+    for u in uses.values(): u.sort()
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
     cand = [r for r in uses if (r in whole or res.get(r, 0) > 0) and res.get(r, 0) >= 0 and r not in narrow and r not in pinned and
             id(regions[r]) not in blob_off and _rnd(regions[r].nbytes) <= vkb * 1024]
@@ -290,9 +338,15 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       a = [f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids]
       a.insert(_core_param(src, len(ids)), "core")
       thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[key]}({', '.join(a)}); }}")
-      cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
+      if n in ran_at: cases.append(f"  case {n}: break;  /* {name}: run with call {ran_at[n]} */")
+      else: cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
+    elif n in pairs or n in ran_at:
+      thunks.append(f"static void g_h{n}(unsigned char** R) {{ {knames[key]}({args}); }}")
+      cases.append(f"  case {n}: break;  /* {name}: run with call {pairs[n][0] if n in pairs else ran_at[n]} */")
     elif "__hmx_" in src: cases.append(f"  case {n}: g_hmx_lock(); {knames[key]}({args}); g_hmx_unlock(); break;  /* {name} */")
     else: cases.append(f"  case {n}: {knames[key]}({args}); break;  /* {name} */")
+  for e, (t, hh) in pairs.items():
+    cases[e] = f"  case {e}: G_PARALLEL_HMX(g_t{t}, R, {calls[t][4]}, g_h{hh}); break;  /* {calls[t][0]} ({t}) + {calls[hh][0]} ({hh}) */"
   h = [f"/* generated by tinygrad/runtime/support/dsp_graph_v65.py: {len(calls)} calls, {len(knames)} kernels, {len(regions)} regions */",
        f"#define G_NCALLS {len(calls)}", f"#define G_NREG {len(regions)}", f"#define G_BLOB_BYTES {len(blob)}",
        f"#define G_NIN {len(inputs)}", f"#define G_OUT_REG {rid[out_id]}", f"#define G_OUT_OFF {out_view.offset}",
@@ -322,6 +376,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
        *[f"void {k}();" for k in knames.values()],
        *([f"#define G_PERF_VOTE {int(os.environ['DSP_V65_PERF_VOTE'])}"] if int(os.environ.get("DSP_V65_PERF_VOTE", "0")) else []),
        "#ifndef G_PARALLEL\n#define G_PARALLEL(f, R, n) for (int _c = 0; _c < (n); _c++) f(R, _c)\n#endif",
+       # (an HMX call h that runs while the pool takes f's slices; in turn without the skel's pool)
+       "#ifndef G_PARALLEL_HMX\n#define G_PARALLEL_HMX(f, R, n, h) do { G_PARALLEL(f, R, n); g_hmx_lock(); h(R); g_hmx_unlock(); } while (0)\n#endif",
        *thunks,
        "static void g_call(int i, unsigned char** R) {", "  switch (i) {", *cases, "  }", "}"]
   (o / "graph.h").write_text("\n".join(h) + "\n")
@@ -329,7 +385,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
   return {"calls": len(calls), "kernels": len(knames), "regions": len(regions), "blob": len(blob), "hmx": hmx,
           "threaded_calls": sum(1 for c in calls if c[4]), "input_bytes": [x.nbytes for x in inputs], "output_bytes": out_view.nbytes,
           "scratch": sum(_rnd(r.nbytes) for n, r in enumerate(regions) if id(r) not in blob_off and n not in reg_off and n not in vtcm_off) + arena,
-          "vtcm_regions": len(vtcm_off), "vtcm_bytes": vtcm_bytes}
+          "vtcm_regions": len(vtcm_off), "vtcm_bytes": vtcm_bytes,
+          "hmx_overlap": len(pairs)}
 
 def _input_blob(xs:list[bytes]) -> bytes:
   return b"".join(x + bytes(-len(x) % ALIGN) for x in xs)  # inputs packed back to back, each 128-byte aligned

@@ -38,6 +38,35 @@ def pretranspose_gemm_weights(model) -> int:
   onnx.checker.check_model(model)
   return done
 
+def fp16_matmul_weights(model) -> int:
+  """With GEMM_FP16 every MatMul / Gemm runs its B in fp16 (nn/onnx.py _matmul_fp16): a float initializer used only as such a B is
+  stored in fp16, behind a Cast to float that _matmul_fp16 sees through. Same numerics (round to nearest even either way), and no
+  cast kernel per Gemm and run (BEVFormer's decoder: 58 casts of 64K-128K weights, ~15-25 us each on the V69). -> the number
+  stored"""
+  import numpy as np
+  from onnx import helper, numpy_helper, TensorProto
+  init = {t.name: t for t in model.graph.initializer}
+  uses: dict[str, list] = {}
+  for n in model.graph.node:
+    for k, i in enumerate(n.input): uses.setdefault(i, []).append((n, k))
+  outs = {o.name for o in model.graph.output}
+  def b_only(n, k) -> bool:
+    # (a transposed B is cast before the transpose: _matmul_fp16 sees a permute, not the cast)
+    return k == 1 and (n.op_type == "MatMul" or (n.op_type == "Gemm" and not any(a.name == "transB" and a.i for a in n.attribute)))
+  casts, done = [], 0
+  for name, t in init.items():
+    if t.data_type != TensorProto.FLOAT or len(t.dims) != 2 or name in outs or not uses.get(name) or not all(b_only(*u) for u in uses[name]):
+      continue
+    h = numpy_helper.from_array(numpy_helper.to_array(t).astype(np.float16), name + "__fp16")
+    t.CopyFrom(h)
+    casts.append(helper.make_node("Cast", [h.name], [name], to=TensorProto.FLOAT, name=name + "__cast"))
+    done += 1
+  if casts:
+    nodes = casts + list(model.graph.node)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+  return done
+
 def constants_to_initializers(model) -> int:
   """Constant nodes -> initializers, so they are realized (and their python values read, see main) before the capture: a
   Constant node's output is made inside it, where a value the runner reads on the host comes back as zeros. -> the number moved"""
@@ -201,6 +230,9 @@ def main() -> None:
     changed = True
   if n := constants_to_initializers(model):
     print(f"{n} Constant nodes made initializers", file=sys.stderr)
+    changed = True
+  if os.environ.get("GEMM_FP16") and os.environ.get("GEMM_FP16_WEIGHTS", "1") != "0" and (n := fp16_matmul_weights(model)):
+    print(f"{n} MatMul / Gemm weights stored in fp16", file=sys.stderr)
     changed = True
   if changed:
     onnx.save(model, out / "model.onnx")
