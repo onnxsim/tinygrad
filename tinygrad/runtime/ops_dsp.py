@@ -1256,8 +1256,10 @@ static inline void __hmx_prefetch_panel(const __fp16* r0, const __fp16* r1, int 
 #ifndef HMX_REF
   unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
   if (stride >= 65536u) return;
-  for (int r = 0; r < rows; r += 240)
-    __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (64u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
+  /* (one box where it fits: an l2fetch issued while another is in flight replaces it -- a 256-row panel as 240 + 16 rows
+   * fetched 16) */
+  for (int r = 0; r < rows; r += 255)
+    __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (64u << 8) | (unsigned)(rows - r < 255 ? rows - r : 255));
 #else
   (void)r0; (void)r1; (void)rows;
 #endif
@@ -1286,6 +1288,12 @@ static inline void __hmx_prefetch_rows(const __fp16* r0, const __fp16* r1, int b
 #ifndef HMX_REF
   unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
   int lines = (bytes + 127) / 128;
+  /* the 32 rows one contiguous block: one l2fetch box. An l2fetch issued while another is in flight replaces it, so the row by
+   * row boxes below fetched little more than the last row (BEVFormer's 2528-row value projection, A from DDR: 0.5 -> 0.18 ms) */
+  if (stride == (unsigned)bytes && 32 * lines <= 255) {
+    __builtin_HEXAGON_Y4_l2fetch((void*)r0, (128u << 16) | (128u << 8) | (unsigned)(32 * lines));
+    return;
+  }
   for (int i = 0; i < 32; i++)
     for (int l = 0; l < lines; l += 240) {
       unsigned h = (unsigned)(lines - l < 240 ? lines - l : 240);
@@ -2409,6 +2417,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
                   f"{'(' + on + ')+2<' + str(int(outer.vmax)+1) + ' ? ((' + on + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
             return (f" _{x} = __hmx_{acc}({o}({on})%2*{st}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
                     f"{o}({on})%2*{st}", 2 * st)
+          elif deps == {outer} and x == "a" and 2 * st <= n and getenv("HMX_A_DBL", 1):
+            # A's two slot sets alternate by row tile: packing row tile n+1 doesn't overwrite the tiles row tile n's last
+            # products may still be reading
+            base, cond, used = f"{o}({on})%2*{st}", f"({iname})==0", 2 * st
           elif deps == {outer} and kt <= n: base, cond, used = f"{off}", f"({iname})==0", st
           elif not deps and kt <= n: base, cond, used = f"{off}", f"({on})==0 && ({iname})==0", st
           else: return None
@@ -2416,8 +2428,22 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           # the whole K panel, on its first fill: A = 32 rows x K columns, B = K rows x 32 columns
           pf = (f" if (({kr})==0) __hmx_prefetch_rows({p0}, {p1}, {64*kt});" if x == "a" else
                 f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});")
-          return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}",
-                  base, used)
+          pack = pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')
+          if x == "a" and deps == {outer} and kt > 1 and getenv("HMX_PF_A_NEXT", 1):
+            # and the next row tile's panel, right after this one's (which it replaces: one l2fetch at a time -- this row tile's
+            # came in as the previous one's "next"), streaming in while this row tile's products run
+            nx = f"({p0})+32*(({p1})-({p0}))"
+            pf += f" if (({kr})==0 && ({on})+1<{int(outer.vmax)+1}) __hmx_prefetch_rows({nx}, {nx}+(({p1})-({p0})), {64*kt});"
+          if x == "a" and e is not None and kt % 2 == 0 and getenv("HMX_PACK_K2", 1) and _hmx_kpairable(r, e.src[1], ranges):
+            # A's K tiles k, k+1 (k even) from the same aligned 128-byte row lines: one vshuff per row pair for both, no unaligned
+            # loads (per K tile it was two rotated loads and a shuffle). With A's slot sets alternating (HMX_A_DBL): 0.8 of the
+            # BEVFormer decoder's 34.2 ms on the V69
+            pk = "".join(f" __hmx_pack2x2(_a+{64*q}, _a+{1024+64*q}, {ptr[2*q]}, {ptr[2*q+1]});" for q in range(16))
+            # rows at one stride: the block helper, eight row loads in flight before their shuffles (one at a time, each load's
+            # latency was exposed: ~30 ns per row pair from L2, ~7 from VTCM)
+            if _hmx_uniform_rows(r, ranges): pk = f" __hmx_pack2x2_blk(_a, _a+1024, {ptr[0]}, {ptr[1]});"
+            pack = " if ((" + kr + ")%2==0) {{" + pk + " }}"
+          return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack} }}}}", base, used)
         eb_acc = "cb"
         rawb = _hmx_raw_b(rb, e.src[1], loops, ranges) if e is not None else None
         if rawb is None and _hmx_raw_param(_hmx_param(rb[0][0].src[0])): raise RuntimeError("HMX raw-tile B operand without a K loop")
@@ -2661,6 +2687,13 @@ def _hmx_pairable(rows, outer:UOp, ranges:list[UOp]) -> bool:
     return _hmx_const_delta(g, ranges)
   stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, outer: env[outer] + 1}))
   return stride is not None and stride % 64 == 0 and nxt == 32
+
+def _hmx_kpairable(rows, kr:UOp, ranges:list[UOp]) -> bool:
+  # A's next K tile is its next 32 columns on the same rows, and the even K tiles start on a 128-byte line (row 0 and the row
+  # stride both multiples of 64 elements; buffers are 128-byte aligned): K tiles k, k+1 share each aligned row line
+  if not _hmx_pairable(rows, kr, ranges): return False
+  i0 = rows[0][0].src[0].src[1]
+  return _hmx_const_delta(lambda env: None if (v:=_hmx_eval(i0, {**env, kr: 0})) is None else v % 64, ranges) == 0
 
 def _hmx_quad_rows(rows, n:UOp, ranges:list[UOp]) -> bool:
   # 32-byte row windows whose row stride is a multiple of 128 bytes and whose next N tile (loop n) is the next 32 bytes: tiles

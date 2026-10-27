@@ -296,7 +296,10 @@ class TestDSPHmx(unittest.TestCase):
 
   def test_rows_packed_with_hvx(self):
     kernel = self.src(64, 64, 64).split("__attribute__((noinline)) void", 1)[1]
-    self.assertEqual(kernel.count("__hmx_pack2("), 32)  # 16 row pairs of A + 16 of B per K block
+    self.assertEqual(kernel.count("__hmx_pack2("), 16)  # 16 row pairs of B per K block
+    # A's two K blocks together from whole 128-byte row lines (HMX_PACK_K2), its slot sets alternating by row tile (HMX_A_DBL)
+    self.assertEqual(kernel.count("__hmx_pack2x2_blk(_a, _a+1024, "), 1)
+    self.assertIn("_a = __hmx_ca((Lidx1)%2*2+(Ridx0));", kernel)
 
   def test_interchange_and_paired_b(self):
     # N has more tiles than M: the N-tile loop goes outermost, A stays in loop-indexed VTCM slots, and B tiles n, n+1 are
@@ -305,8 +308,9 @@ class TestDSPHmx(unittest.TestCase):
     self.assertLess(kernel.index("for (int Lidx2"), kernel.index("for (int Lidx1"))
     self.assertIn("_a = __hmx_ca((Lidx1)*18+(Ridx0)); if ((Lidx2)==0)", kernel)
     self.assertIn("_b = __hmx_cb((Lidx2)%2*18+(Ridx0)); if ((Lidx1)==0 && (Lidx2)%2==0)", kernel)
-    # uniform row strides: one batched pack of the whole pair (16 row pairs of each tile), not 16 calls
-    self.assertEqual(kernel.count("__hmx_pack2x2_blk("), 1)
+    # uniform row strides: one batched pack of the whole pair (16 row pairs of each tile), not 16 calls -- for B's N tiles and
+    # A's K tiles
+    self.assertEqual(kernel.count("__hmx_pack2x2_blk("), 2)
     # B pairs stream from DDR: the next pair's 128-byte panel is L2-prefetched while this one packs
     self.assertIn("(Lidx2)+2<8 ? ((Lidx2)==0 ? 1 : 2) : 0", kernel)
 
@@ -324,7 +328,7 @@ class TestDSPHmx(unittest.TestCase):
     # compute n and n+1 (B's next slot) and write full 128-byte rows; the first outer pass, which packs B tile n+1 only in
     # iteration n+1, stores tile by tile
     kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
-    self.assertIn("__hmx_mac_span(__hmx_ca(0), __hmx_cb((Lidx2)*1+1), 1);", kernel)
+    self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)%2*1), __hmx_cb((Lidx2)*1+1), 1);", kernel)  # (A: two slots by row tile)
     self.assertIn("__hmx_store_d(1)" if ops_dsp.HMX_DEFER else "__hmx_store2()", kernel)
     self.assertIn("__hmx_pend(2," if ops_dsp.HMX_DEFER else "__hmx_outp(", kernel)
     self.assertIn("if ((Lidx1)>0) { if ((Lidx2)%2==0 && (Lidx2)+1<30)", kernel)
@@ -378,7 +382,9 @@ class TestDSPHmx(unittest.TestCase):
     ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = 4096, 1792, 128
     try: kernel = self.src(384, 576, 64).split("__attribute__((noinline)) void", 1)[1]
     finally: ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = old
-    self.assertIn("_b = __hmx_ca(32+(Lidx2)*32+(Ridx0))", kernel)  # after A (18 slots, rounded to 32), 32 per panel
+    # after A's two slot sets (18 slots each at a window-safe stride of 32), 32 per panel
+    self.assertIn("_a = __hmx_ca((Lidx1)%2*32+(Ridx0))", kernel)
+    self.assertIn("_b = __hmx_ca(64+(Lidx2)*32+(Ridx0))", kernel)
     self.assertNotIn("__hmx_lookup(", kernel)
     self.assertEqual(kernel.count("__hmx_mac_span("), 4)  # inner-paired output (test_output_pairing_inner)
 
