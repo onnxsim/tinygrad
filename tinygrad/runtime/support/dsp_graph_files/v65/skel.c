@@ -32,6 +32,7 @@ static unsigned char* g_blob;
  * HMX ones (fp16 casts of a Gemm's operands) ran ~70x slower and wrote NaN on the phone */
 unsigned char* __hmx_vtcm;
 unsigned int __hmx_gen;
+unsigned int __hmx_vtcm_size;  /* bytes from __hmx_vtcm this run holds: the tile pool + the regions placed in VTCM */
 static char g_hmx_power_ctx;
 static int g_hmx_powered;
 static hmx_rt_t g_hmx_rt;
@@ -302,6 +303,7 @@ int tg_graph_run(remote_handle64 h, int start, int count, int threads, int flags
     gv = g_gvtcm_ddr;
   }
   __hmx_vtcm = g_hmx_rt.vtcm; __hmx_gen++;
+  __hmx_vtcm_size = G_VTCM_KB * 1024 + (gv && gv != g_gvtcm_ddr ? G_GVTCM_BYTES : 0);
   for (int i = 0; i < G_NREG; i++) if (G_REG_VTCM[i] >= 0) g_R[i] = gv + G_REG_VTCM[i];
 #endif
   memset(t, 0, tLen * sizeof(uint64));

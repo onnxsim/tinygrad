@@ -132,33 +132,6 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
   hmx = any("__hmx_" in src for _, src, *_ in calls)
   for name, src, _, _, nthreads in calls:
     if nthreads and "__hmx_" in src: raise ValueError(f"{name}: an HMX kernel can't run on the DSP_THREADS pool")
-  for n, (name, src, ids, _, nthreads) in enumerate(calls):
-    if src not in knames:
-      kn = knames[src] = f"k{len(knames)}"
-      body = src.split("/* DSP boilerplate */")[0]
-      # a tiny kernel may come without the noinline attribute (a one-element int64 fill: `void E(long* restrict data0_1)`)
-      m = re.search(r"noinline\)\) void\s+(\w+)\(", body) or re.search(r"^void\s+(\w+)\(", body, re.M)
-      if m is None: raise ValueError(f"no kernel function in {name}")
-      text = re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1)
-      if vg.get(src): text = vg[src].replace("kK", kn)
-      (o / f"{kn}.c").write_text(text)
-    args = ", ".join(f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids)
-    if vg.get(src):
-      tb = ids[2]
-      slot = vtabs.setdefault((rid[id(base[tb])], views[tb].offset), len(vtabs))
-      if nthreads:
-        thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({args}, core, G_VTAB({slot}), G_VSLOT); }}")
-        cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} (vgather) */")
-      else: cases.append(f"  case {n}: {knames[src]}({args}, G_VTAB({slot}), G_VSLOT); break;  /* {name} (vgather) */")
-    elif nthreads:
-      # the core id goes where the kernel declares it: usually last, but a kernel whose buffer indices skip one (eight per-head
-      # inputs numbered 0-7 and 9) declares it before the last buffer
-      a = [f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids]
-      a.insert(_core_param(src, len(ids)), "core")
-      thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[src]}({', '.join(a)}); }}")
-      cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
-    elif "__hmx_" in src: cases.append(f"  case {n}: g_hmx_lock(); {knames[src]}({args}); g_hmx_unlock(); break;  /* {name} */")
-    else: cases.append(f"  case {n}: {knames[src]}({args}); break;  /* {name} */")
   out_view = output
   # DSP_GRAPH_REUSE: the regions that aren't weights, inputs or the output share one arena, placed by liveness (first fit over
   # the call range each is used in), so a region freed by its last use is reused. One region per buffer was 85 MB of scratch
@@ -198,25 +171,31 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
         uses.setdefault(r, []).append(n)
         # a parameter a hand kernel declares (MSDA's value maps) is gathered from many times per call: worth 16 plain uses
         weight[r] = weight.get(r, 0) + (16 if declared and j in {int(x) for x in declared.group(1).split(",")} else 1)
-        if j in outs and views[b].offset == 0 and views[b].nbytes == base[b].nbytes: whole.add(r)
+        # (a raw-tile buffer's marker tail is never written)
+        if j in outs and views[b].offset == 0 and views[b].nbytes in (base[b].nbytes, base[b].nbytes - 2000 * (base[b].nbytes % 2048 == 2000)):
+          whole.add(r)
         if not _vtcm_access_ok(src, j): narrow.add(r)
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
     cand = [r for r in uses if r in whole and r not in narrow and r not in pinned and id(regions[r]) not in blob_off and
             _rnd(regions[r].nbytes) <= vkb * 1024]
     vplaced: dict[int, tuple[int, int, int, int]] = {}  # region -> (offset, size, first call, last call)
-    def fit(size:int, f:int, l:int, skip=()) -> int|None:
+    # raw-tile buffers (ops_dsp __hmx_store_raw: 1024 k + 1000 fp16 elements) at 2 KB: the HMX reads and writes them in place
+    def align(r:int) -> int: return 2048 if regions[r].nbytes % 2048 == 2000 else ALIGN
+    def fit(size:int, f:int, l:int, skip=(), al:int=ALIGN) -> int|None:
       busy = sorted((o, o + sz) for r2, (o, sz, f2, l2) in vplaced.items() if r2 not in skip and not (l2 < f or l < f2))
       off = 0
       for lo, hi in busy:
         if off + size <= lo: break
-        off = max(off, hi)
+        off = -(-max(off, hi) // al) * al
       return off if off + size <= vkb * 1024 else None
     def traffic(r): return weight[r] * regions[r].nbytes
     # most uses per byte-call of VTCM held first: a small buffer read twice 200 calls apart holds its bytes the whole time
     # declared hand-kernel parameters first (their gathers gain the most), then the rest by uses per byte-call held
-    for r in sorted(cand, key=lambda r: (weight[r] < 16, -weight[r] / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)), uses[r][0])):
+    # raw-tile buffers before everything (the HMX reads them in place only from VTCM; from DDR each tile is copied in)
+    for r in sorted(cand, key=lambda r: (align(r) != 2048, weight[r] < 16, -weight[r] / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)),
+                                         uses[r][0])):
       size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
-      if (off := fit(size, f, l)) is not None: vplaced[r] = (off, size, f, l)
+      if (off := fit(size, f, l, al=align(r))) is not None: vplaced[r] = (off, size, f, l)
     # then each region left out, most traffic (uses x bytes) first, may take the place of overlapping ones that carry less in all:
     # short-lived buffers placed first can crowd out a bigger one that more kernels read (BEVFormer's per-head S^T: written by
     # the HMX, read by the max, exp'd in place, read by P @ V, crowded out by the V projection's transients around it)
@@ -225,7 +204,7 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
       over = {x: v for x, v in vplaced.items() if not (v[3] < f or l < v[2])}
       best: tuple[int, int, list[int]]|None = None
-      for off in sorted({0} | {o + sz for o, sz, _, _ in over.values()}):
+      for off in sorted({0} | {-(-(o + sz) // align(r)) * align(r) for o, sz, _, _ in over.values()}):
         if off + size > vkb * 1024: break
         hit = [x for x, (o, sz, _, _) in over.items() if o < off + size and off < o + sz]
         cost = sum(map(traffic, hit))
@@ -241,6 +220,41 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
           if not (v[3] < f or l < v[2]): print(f"   R{x} {v} traffic={traffic(x)}")
     for r, (off, size, _, _) in vplaced.items(): vtcm_off[r], vtcm_bytes = off, max(vtcm_bytes, off + size)
     for r in vtcm_off: reg_off.pop(r, None)
+  for n, (name, src, ids, _, nthreads) in enumerate(calls):
+    # the parameters this call has in VTCM: their software prefetches (dcfetch, an L2 fetch) dropped -- VTCM isn't behind L2, and
+    # the generated attention's exp over VTCM tiles ran 0.165 ms per head with them, 0.12 without (DSP_GRAPH_VTCM_NOFETCH)
+    nofetch = os.environ.get("DSP_GRAPH_VTCM_NOFETCH", "1") != "0"
+    vset = frozenset(j for j, b in enumerate(ids) if rid[id(base[b])] in vtcm_off) if nofetch else frozenset()
+    key = (src, vset)
+    if key not in knames:
+      kn = knames[key] = f"k{len(knames)}"
+      body = src.split("/* DSP boilerplate */")[0]
+      # a tiny kernel may come without the noinline attribute (a one-element int64 fill: `void E(long* restrict data0_1)`)
+      m = re.search(r"noinline\)\) void\s+(\w+)\(", body) or re.search(r"^void\s+(\w+)\(", body, re.M)
+      if m is None: raise ValueError(f"no kernel function in {name}")
+      text = re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1)
+      if vg.get(src): text = vg[src].replace("kK", kn)
+      if vset:
+        for j in vset: text = re.sub(rf"__builtin_HEXAGON_Y2_dcfetch\(\(char\*\)(\(?)data{j}_", rf"__tg_nofetch((char*)\1data{j}_", text)
+        text = "#define __tg_nofetch(p) ((void)0)\n" + text
+      (o / f"{kn}.c").write_text(text)
+    args = ", ".join(f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids)
+    if vg.get(src):
+      tb = ids[2]
+      slot = vtabs.setdefault((rid[id(base[tb])], views[tb].offset), len(vtabs))
+      if nthreads:
+        thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[key]}({args}, core, G_VTAB({slot}), G_VSLOT); }}")
+        cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} (vgather) */")
+      else: cases.append(f"  case {n}: {knames[key]}({args}, G_VTAB({slot}), G_VSLOT); break;  /* {name} (vgather) */")
+    elif nthreads:
+      # the core id goes where the kernel declares it: usually last, but a kernel whose buffer indices skip one (eight per-head
+      # inputs numbered 0-7 and 9) declares it before the last buffer
+      a = [f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids]
+      a.insert(_core_param(src, len(ids)), "core")
+      thunks.append(f"static void g_t{n}(unsigned char** R, int core) {{ {knames[key]}({', '.join(a)}); }}")
+      cases.append(f"  case {n}: G_PARALLEL(g_t{n}, R, {nthreads}); break;  /* {name} */")
+    elif "__hmx_" in src: cases.append(f"  case {n}: g_hmx_lock(); {knames[key]}({args}); g_hmx_unlock(); break;  /* {name} */")
+    else: cases.append(f"  case {n}: {knames[key]}({args}); break;  /* {name} */")
   h = [f"/* generated by tinygrad/runtime/support/dsp_graph_v65.py: {len(calls)} calls, {len(knames)} kernels, {len(regions)} regions */",
        f"#define G_NCALLS {len(calls)}", f"#define G_NREG {len(regions)}", f"#define G_BLOB_BYTES {len(blob)}",
        f"#define G_NIN {len(inputs)}", f"#define G_OUT_REG {rid[out_id]}", f"#define G_OUT_OFF {out_view.offset}",

@@ -269,7 +269,7 @@ class TestDSPHmx(unittest.TestCase):
     # (B's two N tiles cached by the inner loop: the paired output's two spans, and the single tile's in its two branches)
     self.assertEqual(kernel.count("__hmx_mac_span("), 4)
     self.assertLess(loop, kernel.index("__hmx_mac_span("))
-    self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store()"))
+    self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store_d(0)" if ops_dsp.HMX_DEFER else "__hmx_store()"))
     # no 2 KB tile values, no per-K accumulator round trip
     self.assertNotIn("__WMMA_32_32_32_half_half(", kernel)
     self.assertNotIn("__fp161024", kernel)
@@ -296,8 +296,8 @@ class TestDSPHmx(unittest.TestCase):
     kernel = self.src(128, 576, 384).split("__attribute__((noinline)) void", 1)[1]
     self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18), 18);", kernel)
     self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18+18), 18);", kernel)  # tile n+1
-    self.assertIn("__hmx_store2()", kernel)
-    self.assertIn("__hmx_outp(", kernel)
+    self.assertIn("__hmx_store_d(1)" if ops_dsp.HMX_DEFER else "__hmx_store2()", kernel)
+    self.assertIn("__hmx_pend(2," if ops_dsp.HMX_DEFER else "__hmx_outp(", kernel)
 
   def test_output_pairing_inner(self):
     # every B tile cached and indexed by the inner tile loop (attention's S^T = K Q^T, one K tile, M = N): even inner tiles
@@ -305,9 +305,34 @@ class TestDSPHmx(unittest.TestCase):
     # iteration n+1, stores tile by tile
     kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
     self.assertIn("__hmx_mac_span(__hmx_ca(0), __hmx_cb((Lidx2)*1+1), 1);", kernel)
-    self.assertIn("__hmx_store2()", kernel)
-    self.assertIn("__hmx_outp(", kernel)
+    self.assertIn("__hmx_store_d(1)" if ops_dsp.HMX_DEFER else "__hmx_store2()", kernel)
+    self.assertIn("__hmx_pend(2," if ops_dsp.HMX_DEFER else "__hmx_outp(", kernel)
     self.assertIn("if ((Lidx1)>0) { if ((Lidx2)%2==0 && (Lidx2)+1<30)", kernel)
+
+  def test_raw_tile_buffers(self):
+    # a fp16 buffer of 1024 k + 1000 elements holds raw HMX tiles (nn/onnx.py's attention S^T and P): tinygrad's row-major (rows,
+    # LD) view is only how it indexes them. The product goes out tile by tile at its raw place, (column tile x row tiles + row
+    # tile) x 1024, and a raw B operand is read in place, its K panel being consecutive tiles
+    hm = tc.hexagon_hmx + tc.hexagon_v65
+    sb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
+    sb[:64 * 96].reshape(64, 96).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
+    kernel = dsp_source(sb, hm).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_store_raw((__fp16*)data0_7144 + ((_o / 3072) + (_o % 96) / 32 * 2) * 1024);", kernel)
+    self.assertNotIn("__hmx_out2(", kernel)
+    eb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
+    pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb[:64 * 96].reshape(64, 96), dtype=dtypes.half)
+    kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_rawb = (__fp16*)data2_7144;", kernel)
+    self.assertRegex(kernel, r"__hmx_mac_span_raw\(__hmx_ca\(0\), __hmx_rawb\+\(Lidx\d\)\*2048, 2\);")
+    self.assertNotIn("__hmx_pack2(_b", kernel)
+
+  def test_deferred_output(self):
+    # HMX_DEFER: a paired output tile goes to the free VTCM slot pair and is converted to rows after the next one's load pair
+    self.assertTrue(ops_dsp.HMX_DEFER)
+    kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_store_d(1);", kernel)
+    self.assertIn("__hmx_pend(2, _p, _q);", kernel)
+    self.assertTrue(kernel.rstrip().endswith("__hmx_flush();\n}") or "__hmx_flush();\n}" in kernel)
 
   def test_large_vtcm_pool(self):
     # HMX_VTCM_KB > 256: A and B share one pool of loop-indexed slots, B after A's from a 32-slot boundary, K panels at a

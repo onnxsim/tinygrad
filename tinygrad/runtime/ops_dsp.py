@@ -1152,6 +1152,76 @@ static inline void __hmx_deal2(__fp16* d, const __fp16* o) {
   __asm__ volatile("vmem(%0+#0) = %1" :: "r"(d + 64), "v"(__builtin_HEXAGON_V6_vdealh_128B(((const __hmx_v*)o)[1])) : "memory");
 }
 #endif
+/* deferred output (HMX_DEFER): a tile (pair) is stored to one of two VTCM slot pairs and converted to its rows (HVX) only after the
+ * next tile's load pair is issued, so the conversion runs while the HMX computes instead of waiting on each store; the last
+ * pending tile is converted by __hmx_flush() at the end of the call */
+static int __hmx_ob, __hmx_pn;
+static const __fp16 *__hmx_pp, *__hmx_pq;
+static __fp16* __hmx_pr[32];
+#ifdef HMX_REF
+static __fp16 __hmx_rd[4][1024] __attribute__((aligned(128)));
+static inline const __fp16* __hmx_store_d(int k) {
+  const __fp16* o = __hmx_store();
+  for (int i = 0; i < 1024; i++) __hmx_rd[2 * __hmx_ob + k][i] = o[i];
+  return __hmx_rd[2 * __hmx_ob + k];
+}
+#else
+static inline const __fp16* __hmx_store_d(int k) {  /* VTCM @8 KB / 12 KB (the plain stores' slots) or @16 KB / 20 KB */
+  unsigned char* o = __hmx_vtcm + (__hmx_ob ? 16384 : 8192) + 4096 * k;
+  __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(o), "r"(0) : "memory");
+  return (const __fp16*)o;
+}
+#endif
+static inline void __hmx_flush(void) {
+  if (__hmx_pn == 2) for (int q = 0; q < 16; q++) __hmx_outp(__hmx_pr[2 * q], __hmx_pr[2 * q + 1], __hmx_pp + 64 * q, __hmx_pq + 64 * q);
+  else if (__hmx_pn == 1) for (int q = 0; q < 16; q++) __hmx_out2(__hmx_pr[2 * q], __hmx_pr[2 * q + 1], __hmx_pp + 64 * q);
+  __hmx_pn = 0;
+}
+static inline void __hmx_pend(int n, const __fp16* p, const __fp16* q) { __hmx_pn = n; __hmx_pp = p; __hmx_pq = q; __hmx_ob ^= 1; }
+/* raw-tile buffers (a fp16 PARAM of 1024 k + _HMX_RAW_TAIL elements, nn/onnx.py's attention S^T and P): tinygrad indexes them
+ * as a row-major (rows, LD) matrix, the HMX kernels write and read them as raw tiles -- tile (row tile a, column tile b) at
+ * (b * rows / 32 + a) * 1024, in the HMX's own layout (row pairs interleaved), so neither side converts. __hmx_rawb: the raw B
+ * operand's base, set at the start of the call */
+static __fp16* __hmx_rawb;
+static inline void __hmx_tcopy(__fp16* d, const __fp16* s, int nt) {
+  for (int i = 0; i < 16 * nt; i++) ((__hmx_v*)d)[i] = ((const __hmx_v*)s)[i];
+}
+#ifdef HMX_REF
+static inline void __hmx_store_raw(__fp16* d) { const __fp16* o = __hmx_store(); for (int i = 0; i < 1024; i++) d[i] = o[i]; }
+static inline void __hmx_mac_span_raw(__fp16* a, __fp16* b, int kt) { __hmx_mac_span(a, b, kt); }
+#else
+extern unsigned int __hmx_vtcm_size __attribute__((weak));
+static inline int __hmx_vt(const void* p, unsigned n) {  /* p .. p + n in the VTCM this run holds, 2 KB aligned */
+  unsigned o = (unsigned)p - (unsigned)__hmx_vtcm;
+  return &__hmx_vtcm_size != 0 && ((unsigned)p & 2047u) == 0 && o < __hmx_vtcm_size && n <= __hmx_vtcm_size - o;
+}
+/* a raw tile out of the accumulator: straight into a VTCM destination, else through the output slot */
+static inline void __hmx_store_raw(__fp16* d) {
+  if (__hmx_vt(d, 2048)) __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(d), "r"(0) : "memory");
+  else __hmx_tcopy(d, __hmx_store(), 1);
+}
+/* kt K tiles: a from the tile cache, b raw tiles in a row -- read in place when in VTCM (load pairs split where either side
+ * crosses a 256 KB window), else copied 32 at a time into the B slots */
+static inline void __hmx_span_w(__fp16* a, __fp16* b, int kt) {
+  for (int k0 = 0; k0 < kt;) {
+    unsigned pa = (unsigned)(a + 1024 * k0), pb = (unsigned)(b + 1024 * k0);
+    int n = kt - k0 < 32 ? kt - k0 : 32, na = (int)((((pa >> 18) + 1) << 18) - pa) / 2048, nb = (int)((((pb >> 18) + 1) << 18) - pb) / 2048;
+    if (na < n) n = na;
+    if (nb < n) n = nb;
+    __asm__ volatile("{ activation.hf = mxmem(%0,%1):deep\n weight.hf = mxmem(%2,%3) }"
+                     :: "r"(pa), "r"(n * 2048 - 1), "r"(pb), "r"(n * 2048 - 1) : "memory");
+    k0 += n;
+  }
+}
+static inline void __hmx_mac_span_raw(__fp16* a, __fp16* b, int kt) {
+  if (__hmx_vt(b, 2048u * kt)) { __hmx_span_w(a, b, kt); return; }
+  for (int k0 = 0; k0 < kt; k0 += 32) {
+    int n = kt - k0 < 32 ? kt - k0 : 32;
+    __hmx_tcopy(__hmx_cb(0), b + 1024 * k0, n);
+    __hmx_span_w(a + 1024 * k0, __hmx_cb(0), n);
+  }
+}
+#endif
 /* packed tiles of read-only operands are memoized by their first row pointer (same pointer = same tile within one
  * kernel call); __hmx_call_start() invalidates at every call */
 static const void* __hmx_tag_a[__HMX_CA];
@@ -1211,6 +1281,7 @@ static inline void __hmx_prefetch_rows(const __fp16* r0, const __fp16* r1, int b
 #endif
 }
 static inline void __hmx_call_start(void) {
+  __hmx_pn = 0;
   for (int i = 0; i < __HMX_CA; i++) { __hmx_tag_a[i] = 0; __hmx_rr_a[i] = 0; }
   for (int i = 0; i < __HMX_CB; i++) { __hmx_tag_b[i] = 0; __hmx_rr_b[i] = 0; }
 }
@@ -2172,6 +2243,42 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
   return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
 
+# raw-tile buffers (see __hmx_store_raw): marked by their size, 1024 k + _HMX_RAW_TAIL fp16 elements (nn/onnx.py allocates them)
+_HMX_RAW_TAIL = 1000
+def _hmx_raw_param(p:UOp) -> bool:
+  return p.op is Ops.PARAM and p.dtype == dtypes.half and len(p.shape) == 1 and p.shape[0] % 1024 == _HMX_RAW_TAIL
+
+def _hmx_raw_geom(idx:list[UOp], p:UOp, ranges:list[UOp]):
+  # row r's index idx[r] = idx[0] + r LD, (size - tail) / LD rows: -> (LD, row tiles), else None
+  d = [_hmx_const_delta(lambda env, ii=ii: None if (a:=_hmx_eval(ii, env)) is None or (z:=_hmx_eval(idx[0], env)) is None else a - z, ranges)
+       for ii in idx]
+  if d[1] is None or d[1] <= 0 or d[1] % 32 or any(x != r * d[1] for r, x in enumerate(d)): return None
+  n = p.shape[0] - _HMX_RAW_TAIL
+  return (d[1], n // d[1] // 32) if n % (32 * d[1]) == 0 else None
+
+def _hmx_raw_b(rows, kr:UOp, loops:tuple, ranges:list[UOp]):
+  # a B operand in a raw-tile buffer, row r of K tile k and N tile n at (32 k + r) LD + 32 n with n a tile loop -> (PARAM,
+  # that loop, row tiles); None if B isn't raw-tile; RuntimeError if it is but not in that form (its natural load would be wrong)
+  p = _hmx_param(rows[0][0].src[0])
+  if not _hmx_raw_param(p): return None
+  if any(b or len(v.src[0].src) < 2 or _hmx_param(v.src[0]) is not p for v, b in rows) or \
+     (g:=_hmx_raw_geom([v.src[0].src[1] for v, _ in rows], p, ranges)) is None:
+    raise RuntimeError("HMX raw-tile B operand in an unsupported form")
+  i0 = rows[0][0].src[0].src[1]
+  for lv in loops[:2]:
+    if _hmx_const_delta(lambda env: None if (a:=_hmx_eval(i0, env)) is None else a - 32 * env[kr] * g[0] - 32 * env[lv], ranges) == 0:
+      return p, lv, g[1]
+  raise RuntimeError("HMX raw-tile B operand in an unsupported form")
+
+HMX_DEFER = getenv("HMX_DEFER", 1)
+def _hmx_deferred(mac0:str, mac1:str|None) -> str:
+  # one output tile (pair) stored to the free slot pair and left pending; the previous pending one converted after the next load
+  # pair is issued (HMX_DEFER=1: after the first, 2: after the second). Row pointers are the CUSTOM's srcs {0}..{31}
+  f, rows = " __hmx_flush();", "".join(f" __hmx_pr[{i}] = {{{i}}};" for i in range(32))
+  if mac1 is None: return f"{mac0}{f} const __fp16* _p = __hmx_store_d(0);{rows} __hmx_pend(1, _p, 0);"
+  return (f"{mac0}{f if HMX_DEFER == 1 else ''} const __fp16* _p = __hmx_store_d(0);{mac1}{f if HMX_DEFER != 1 else ''}"
+          f" const __fp16* _q = __hmx_store_d(1);{rows} __hmx_pend(2, _p, _q);")
+
 def _hmx_bail(uops, why:int):
   if getenv("HMX_DEBUG"): print(f"hmx_acc rewrite skipped (check {why})")
   return uops, False
@@ -2192,6 +2299,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
   after: dict[int, list[UOp]] = {}
   replace: dict[UOp, UOp] = {}
   swap_out: list[bool] = []  # the int8 path's loop-order choice (planned for what fits in the VTCM tile pool)
+  deferred: list[bool] = []  # an output path converts its tiles late (HMX_DEFER): flush the last one at the end of the call
   for w in uops:
     if w.op is Ops.WMMA and w.arg[0] == (32, 64, 32) and w.arg[1] == dtypes.uint8 and getenv("HMX_I8", 1):
       r = _hmx_i8_rewrite(w, uops, pos, users, drop, before, after, replace, swap_out)
@@ -2276,7 +2384,22 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}",
                   base, used)
         eb_acc = "cb"
-        if HMX_VTCM_KB > 256 and ro[0] and ro[1]:
+        rawb = _hmx_raw_b(rb, e.src[1], loops, ranges) if e is not None else None
+        if rawb is None and _hmx_raw_param(_hmx_param(rb[0][0].src[0])): raise RuntimeError("HMX raw-tile B operand without a K loop")
+        if rawb is not None:
+          # B read as raw tiles, in place (no packing): one spanning load pair per output tile from its K panel
+          if loops[4] is not None:
+            # one output-tile loop (loops = (the reduce, the tile loop)): A, indexed by K only, packed on the first tile
+            if not ro[0] or _hmx_uses(ra[0][0].src[0], inner) or kt > _HMX_CA: raise RuntimeError("HMX raw-tile B operand: A not cacheable")
+            ea = (f" _a = __hmx_ca({kr}); if (({iname})==0) {{{{{pa} }}}}", "0", kt)
+          elif not ro[1] or (ea:=exact(ra, _HMX_CA, "a", pa)) is None: raise RuntimeError("HMX raw-tile B operand: A not cacheable")
+          last_param = max(pos[x] for x in uops if x.op is Ops.PARAM)
+          after.setdefault(last_param, []).append(UOp(Ops.CUSTOM, dtypes.void, (rawb[0],), "__hmx_rawb = (__fp16*){0};"))
+          lv = on if rawb[1] is outer else iname
+          span[w] = (ea[1], f"__hmx_rawb+({lv})*{rawb[2]*1024}", kt, outer, inner, on, iname, "raw", _hmx_stride(kt), False,
+                     int(outer.vmax) + 1, False, ti)
+          ea, eb = ea[0], ""
+        elif HMX_VTCM_KB > 256 and ro[0] and ro[1]:
           # one pool (the B slots follow A's): A takes what it needs, B the rest from the next 32-slot boundary; if B doesn't
           # fit, back to the fixed split (B then goes through its tag cache)
           ea = exact(ra, _HMX_CA + _HMX_CB, "a", pa)
@@ -2286,13 +2409,15 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         else:
           ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
           eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
-        if ea and eb:
+        if w in span: pass
+        elif ea and eb:
           # K tiles stay in VTCM: no load pair per K block, one spanning pair after the loop (see the output statement)
           span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc, _hmx_stride(kt), "%2*" in eb[1], int(outer.vmax) + 1,
                      eb[1].endswith(f"({iname})*{_hmx_stride(kt)}"), ti)
           ea, eb = ea[0], eb[0]
         else: ea, eb = ea and ea[0], eb and eb[0]
-        pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
+        if w in span and span[w][7] == "raw": pa, pb = ea, ""
+        else: pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
         srcs = srcs + (e.src[1] if e is not None else outer, outer, inner)
       else:
         if ro[0]: pa = cached("a", _HMX_CA, ptr[0], "a", pa)
@@ -2320,6 +2445,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       if w not in span: return "", ()
       ab, bb, kt_, o_, i_, on_, in_, bacc = span[w][:8]
       for k_, v_ in ((on_, "{%d}" % len(srcs0)), (in_, "{%d}" % (len(srcs0)+1))): ab, bb = ab.replace(k_, v_), bb.replace(k_, v_)
+      if bacc == "raw": return f" __hmx_mac_span_raw(__hmx_ca({ab}), {bb}, {kt_});", (o_, i_)
       return f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});", (o_, i_)
     # after the loop: one store, then each accumulator-array vector = the same lanes of the output tile
     outs = []
@@ -2338,6 +2464,17 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         vt = {32: "__hmx_h32", 64: "__hmx_h64", 128: "__hmx_h128"}.get(len(lanes))
         if vt is None: return _hmx_bail(uops, 11)
         outs.append(f" *({vt}*){{{k}}} = ({vt}){{{{{','.join(f'_p[{l}]' for l in lanes)}}}}};")
+    def raw_store(rowptr:list[UOp], at:int) -> bool:
+      # the output is a raw-tile buffer: the tile goes out as it is (__hmx_store_raw), at its raw place
+      p = _hmx_param(rowptr[0])
+      if not _hmx_raw_param(p): return False
+      if any(r.op not in (Ops.INDEX, Ops.SHRINK) or len(r.src) < 2 for r in rowptr) or \
+         (g:=_hmx_raw_geom([r.src[1] for r in rowptr], p, ranges)) is None: raise RuntimeError("HMX raw-tile output in an unsupported form")
+      sm, sx = span_mac((rowptr[0], p))
+      code = (f"{{{{{sm} {{{{ int _o = (int)({{0}} - (__fp16*){{1}}); __hmx_store_raw((__fp16*){{1}} + "
+              f"((_o / {32*g[0]}) + (_o % {g[0]}) / 32 * {g[1]}) * 1024); }}}} }}}}")
+      after.setdefault(at, []).extend(([rowptr[0]] if rowptr[0] not in pos else []) + [UOp(Ops.CUSTOM, dtypes.void, (rowptr[0], p)+sx, code)])
+      return True
     def pair_inner(rowptr:list[UOp]) -> tuple[str, tuple]|None:
       # every B tile cached, indexed by the inner tile loop (attention's S^T = K Q^T: one K tile, 30 x 30 output tiles): on
       # even inner tiles compute tiles n, n+1 (B's next slot) and write full 128-byte rows (__hmx_outp); odd ones have nothing
@@ -2351,12 +2488,18 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       mac1 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}+{st_}), {kt_});"
       pp = "".join(f" __hmx_outp({{{2*q}}}, {{{2*q+1}}}, _p+{64*q}, _q+{64*q});" for q in range(16))
       one = f"{{{{{mac0} const __fp16* _p = __hmx_store();" + "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16)) + " }}"
+      if HMX_DEFER:
+        deferred.append(True)
+        two, one = _hmx_deferred(mac0, mac1), "{{" + _hmx_deferred(mac0, None) + " }}"
+        return (f"{{{{ if (({n0})>0) {{{{ if (({n1})%2==0 && ({n1})+1<{span[w][12]}) {{{{{two} }}}} else if (({n1})%2==0) {one} }}}}"
+                f" else {one} }}}}", (o_, i_))
       return (f"{{{{ if (({n0})>0) {{{{ if (({n1})%2==0 && ({n1})+1<{span[w][12]}) {{{{{mac0} const __fp16* _p = __hmx_store();{mac1}"
               f" const __fp16* _q = __hmx_store2();{pp} }}}} else if (({n1})%2==0) {one} }}}} else {one} }}}}", (o_, i_))
     if (direct:=_hmx_direct_out(uops, pos, users, end_at, stores)) is not None:
       # the accumulator array is only copied to an output buffer after the loop: write the tile rows there directly
       rowptr, gone = direct
       drop |= gone
+      if raw_store(rowptr, max(pos[g] for g in gone if g.op is Ops.STORE)): continue
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       if getenv("HMX_DEBUG"): print("outpair:", w in span, w in span and span[w][9], w in span and span[w][1], [(p.op, len(p.src)) for p in rowptr[:2]],
                                     w in span and _hmx_ptr_pairable(rowptr, span[w][3], ranges))
@@ -2371,6 +2514,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         pp = "".join(f" __hmx_outp({{{2*q}}}, {{{2*q+1}}}, _p+{64*q}, _q+{64*q});" for q in range(16))
         code = (f"{{{{ if (({n0})%2==0 && ({n0})+1<{ON}) {{{{{mac0} const __fp16* _p = __hmx_store();{mac1} const __fp16* _q = __hmx_store2();{pp} }}}}"
                 f" else if (({n0})%2==0) {{{{{mac0} const __fp16* _p = __hmx_store();{pairs} }}}} }}}}")
+        if HMX_DEFER:
+          deferred.append(True)
+          code = (f"{{{{ if (({n0})%2==0 && ({n0})+1<{ON}) {{{{{_hmx_deferred(mac0, mac1)} }}}}"
+                  f" else if (({n0})%2==0) {{{{{_hmx_deferred(mac0, None)} }}}} }}}}")
         at = max(pos[g] for g in gone if g.op is Ops.STORE)
         after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
                                         [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+(o_, i_), code)])
@@ -2394,6 +2541,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       row_of[i] = so.src[0]
     if sorted(row_of) == list(range(32)):
       rowptr = [row_of[i] for i in range(32)]
+      if raw_store(rowptr, end_at): continue
       if (pc:=pair_inner(rowptr)) is not None:
         after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+pc[1], pc[0]))
         continue
@@ -2415,6 +2563,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if u in replace: out.append(replace[u])
     elif u not in drop: out.append(u)
     out += after.get(i, [])
+  if deferred:
+    fl = UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_flush();")
+    out = out[:-1] + [fl, out[-1]] if out and out[-1].op is Ops.SINK else out + [fl]
   if loops is not None and (swap_out[0] if swap_out else loops[2]): out = _hmx_interchange(out, loops[0], loops[1])
   return out, True
 

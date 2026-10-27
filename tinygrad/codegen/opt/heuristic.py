@@ -314,6 +314,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # (reductions only: an elementwise stack of per-head outputs got 3x slower without its row upcast)
         if vector_dsp and HVX_UPCAST_CONTIG and gathers and k.reduceop is not None and not k.axes_of(AxisType.UPCAST) and \
             any(a2 != axis and _every_unit_stride(k, a2) for a2 in k.upcastable_dims): continue
+        # elementwise too when the unit-stride axis fills whole HVX vectors in every buffer (HVX_EW_NO_GATHER_UPCAST): the raw-tile
+        # attention's exp (scores broadcast-shifted by a per-query max over 480 row pairs) and that max's broadcast went scalar.
+        # Not for an axis a comparison reads (a stack of per-head outputs: a select chain on the head index, which the upcast folds)
+        if vector_dsp and HVX_UPCAST_CONTIG and gathers and k.reduceop is None and not k.axes_of(AxisType.UPCAST) and \
+            getenv("HVX_EW_NO_GATHER_UPCAST", 1) and \
+            not any(u.op in (Ops.CMPNE, Ops.CMPLT, Ops.CMPEQ) and rng in u.backward_slice for u in k.ast.toposort()) and \
+            any(a2 != axis and _every_unit_stride(k, a2) and isinstance(n2:=k.full_shape[a2], int) and
+                all(n2 * b.src[0].dtype.itemsize % 128 == 0 for b in k.bufs) for a2 in k.upcastable_dims): continue
         xb_choices.append((gathers if vector_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if vector_dsp else 0,
                            axis, upcast_amount))
     if xb_choices:

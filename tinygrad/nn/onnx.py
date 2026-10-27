@@ -1174,7 +1174,37 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # buffer, the scheduler folded the stores into one such kernel. The divide goes into the block transpose back: in the
     # store, the sums' broadcast over the 32 rows made the rows the upcast axis (strided scalar loads and stores)
     oT = Tensor.empty(H, D + 1, Mp, dtype=dtypes.float32, device=q.device)
-    for h in range(H):
+    if getenv("ATTN_RAW", 1):
+      # S^T and P^T in raw HMX tiles: no conversion either way. A buffer of Np Mp + 1000 fp16 elements (ops_dsp _HMX_RAW_TAIL) is
+      # one the HMX kernels write and read as raw tiles -- S^T's tile (key tile a, query tile b) at (b Nt + a) 1024, row pairs
+      # interleaved, as the HMX stores them and P V's spanning B load pair reads them -- while tinygrad sees a row-major (Np, Mp)
+      # matrix in both matmuls (the tensor cores apply as usual). Converting S^T's tiles to rows was ~125 us of the 180 us S^T
+      # call per head on the V69, packing P^T's back about as much of P V's. The softmax between runs on the raw tiles
+      # themselves, as R[mt, (nt, r), (c, p)] = S^T[32 nt + 2 r + p, 32 mt + c] (a flat reshape of the same memory): the max over
+      # the keys is a vector max over (nt, r) with (c, p) as lanes, then a max over p (both lanes of a pair get it); the bias is
+      # one row of tiles expanded over the queries
+      Mt, Nt = Mp // 32, Np // 32
+      def raw() -> Tensor: return Tensor.empty(Np * Mp + 1000, dtype=dtypes.half, device=q.device)
+      bias2 = bias.reshape(1, Nt, 16, 1, 2).expand(1, Nt, 16, 32, 2).reshape(1, Nt, 16, 64).contiguous()
+      for h in range(H):
+        sb, eb = raw(), raw()
+        sb[:Np * Mp].reshape(Np, Mp).assign(kp[h].matmul(qT[h], dtype=dtypes.half))
+        x = sb[:Np * Mp].reshape(Mt, Nt, 16, 64) + bias2
+        mm = x.max((1, 2), keepdim=True).contiguous()                                                          # (Mt, 1, 1, 64)
+        # the max of each lane pair, over a tile's 16 row pairs: broadcast over the key tiles only (30, which no vector width
+        # divides). Broadcast over all 480 row pairs, the DSP heuristic upcast them for its reuse (scalar loads 128 bytes apart)
+        # (three small kernels: the pair max, its lanes doubled by a vector shuffle, the broadcast copy at 64 lanes. Fused, or the
+        # pair max as a flip within pairs, the 64 lanes split into 32 x 2 and the kernel ran scalar fp16, ~0.09 ms per head)
+        m1 = mm.reshape(Mt, 32, 2).max(-1, keepdim=True).expand(Mt, 32, 2).contiguous()
+        m2 = m1.reshape(Mt, 1, 1, 64).expand(Mt, 1, 16, 64).contiguous()
+        eb[:Np * Mp].reshape(Mt, Nt, 16, 64).assign((x - m2).exp2())
+        # the sums by a reduce over P's tiles (fp32; the padding keys' P is 0), P V with V^T's 32 rows only: with the ones row the
+        # product took two M tiles, twice the spanning loads (0.12 ms per head on the V69)
+        ps = eb[:Np * Mp].reshape(Mt, Nt, 16, 64).float().sum((1, 2)).contiguous()                            # (Mt, 64)
+        oT[h, D:].assign(ps.reshape(Mt, 32, 2).sum(-1).reshape(1, Mp))                                      # sums
+        # (stored in fp16 first: the cast and the fp32 store fused into P V's output tiles took it from 0.06 to 0.29 ms per head)
+        oT[h, :D].assign(vT[h, :D].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float())  # O^T
+    for h in range(H if not getenv("ATTN_RAW", 1) else 0):
       s16 = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous()                                               # S^T (Np, Mp)
       # the shift by the max in fp16 (the exponent is rounded to fp16 for the exp anyway): in fp32 the conversions both ways
       # doubled the exp kernel (0.39 ms per head on the V69)
