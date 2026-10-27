@@ -16,6 +16,8 @@ HVX_TRANSPOSE_NET = getenv("HVX_TRANSPOSE_NET", 1)
 # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
 # between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
 HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
+# HVX_GATHER_MATH: the minimum transcendental op count for the gathering row upcast below (0: off)
+HVX_GATHER_MATH = getenv("HVX_GATHER_MATH", 3)
 
 def _unit_stride_bufs(k:Scheduler, axis:int) -> int:
   # how many buffers' indices have this axis's range as a bare term (stride 1): upcasting it gives them contiguous vector accesses
@@ -198,6 +200,25 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       k.apply_opt(Opt(OptOps.UPCAST, pair[0], 32))
       k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rb), HVX_TRANSPOSE_B))
       return apply_threads(k)
+
+  # HVX_GATHER_MATH: a float elementwise kernel heavy in transcendentals with no axis contiguous in every buffer (the decoder's
+  # reference-point update: sigmoid / clip / inverse sigmoid over 3 columns of a 900 x 10 regression, ~100 dependent scalar ops
+  # per value) is worth vectorizing even through gathers: its rows as the lanes (a divisor of the row count from 16 to 32 lanes,
+  # padded to one HVX register), each column a 32-lane gather. Left scalar, it was latency-bound on the op chains. Rendering:
+  # ops_dsp.hvx_group_stores (the scattered stores' lanes as one vector, compares included), _strided_gather (the loads). BEVFormer
+  # decoder on the V69: 27.7 -> 26.6 ms (its five reference-point kernels 1.15 -> 0.27 ms; the LOG2 helper and inline half -> float
+  # casts in that number too). Taking the 3 columns as lanes as well (90 lanes, contiguous stores) was slower: LLVM widens 90 to 128
+  # lanes, and the last layer's 10-column output computed every column's math (14 K -> 51 K cycles per chunk in hexagon-sim)
+  if is_dsp and HVX_GATHER_MATH and max_bytes is None and k.reduceop is None and not k.axes_of(AxisType.UPCAST) and \
+      all(b.src[0].dtype.itemsize == 4 for b in k.bufs) and \
+      sum(u.op in (Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT) for u in k.ast.toposort()) >= HVX_GATHER_MATH and \
+      not any(_every_unit_stride(k, a) and resolve(k.full_shape[a] >= 16) for a in k.upcastable_dims):
+    for a in sorted(k.upcastable_dims, key=lambda a: -k.full_shape[a] if isinstance(k.full_shape[a], int) else 0):
+      if not isinstance(n:=k.full_shape[a], int) or not (lanes:=[d for d in range(32, 15, -1) if n % d == 0]): continue
+      k.apply_opt(Opt(OptOps.UPCAST, a, lanes[0]))
+      # (each lane's gathered loads and scattered stores are scalar: weighed as ~8 lanes' work, a 1800-value update spreads over
+      # the pool instead of running on one thread, 72 us)
+      return apply_threads(k, weight=8)
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -442,13 +463,13 @@ def _work_per_elem(k:Scheduler) -> int:
   heavy = (Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.SQRT, Ops.SIN, Ops.FDIV)
   return max(1, sum(20 if u.op in heavy else 1 for u in k.ast.toposort() if u.op in GroupOp.ALU and dtypes.is_float(u.dtype)) // 8)
 
-def apply_threads(k:Scheduler) -> Scheduler:
+def apply_threads(k:Scheduler, weight:int=1) -> Scheduler:
   if k.ren.has_threads and k.ren.global_max is not None:
     pool = getattr(k.ren, "pool_threads", k.ren.global_max[0])
     if getattr(k.ren, "thread_work_weighted", False):
       # (a kernel left scalar or a few lanes wide does a vector's work per element: the decoder's reference-point sigmoid /
       # inverse sigmoid, 1800 values of ~70 dependent scalar ops, ran on one thread for 0.15-0.3 ms -- HVX_SCALAR_THREAD_WEIGHT)
-      w = _work_per_elem(k) * (max(1, 32 // max(1, k.upcast_size())) if getenv("HVX_SCALAR_THREAD_WEIGHT", 1) else 1)
+      w = weight * _work_per_elem(k) * (max(1, 32 // max(1, k.upcast_size())) if getenv("HVX_SCALAR_THREAD_WEIGHT", 1) else 1)
       def few(t:int) -> bool: return resolve(prod(k.full_shape) * w // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
     else:
       def few(t:int) -> bool: return resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < t)

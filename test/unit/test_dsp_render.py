@@ -275,6 +275,67 @@ class TestDSPQfMath(unittest.TestCase):
     ops_dsp.QF_MATH = False
     self.assertNotIn("__TG_EXP2", dsp_source(Tensor.empty(2048).exp()))
 
+  def test_log_is_a_vector_helper(self):
+    # LOG2 is the conversion-free helper, not xlog2's compare chain (scalar on v69: float <-> int both ways)
+    src = dsp_source(Tensor.empty(4096).log())
+    self.assertIn("__TG_LOG2(", src)
+    self.assertIn("__tg_log2_v(", src)
+    self.assertNotIn("__builtin_inff()", src.split("noinline")[-1], "a special case of xlog2 is still in the kernel")
+
+  def test_scalar_helpers_exact_on_host(self):
+    # the scalar log2 against numpy (1 ulp-level), and the inline half -> float cast bit-exact for all 65536 halves, built with the
+    # host compiler (the vector forms need HVX: checked on the phone)
+    import shutil, subprocess, tempfile, pathlib, os
+    cc = (os.environ.get("CC") or "clang").split()[0]
+    if shutil.which(cc) is None: self.skipTest("no host C compiler")
+    pre = [l for l in dsp_source(Tensor.empty(64).log()).splitlines() if l.startswith("static inline float __tg_")]
+    xs = np.concatenate([np.geomspace(1e-38, 1e38, 20000, dtype=np.float32), np.linspace(0.5, 2, 20001, dtype=np.float32),
+                         np.array([1e-40, 3e-39, 0, -0.0, -1, np.inf, np.nan], dtype=np.float32)])
+    c = "\n".join(["#include <stdio.h>", *pre, ops_dsp._H2F, "int main(void) { float x; unsigned short u;",
+      " while (scanf(\"%a\", &x) == 1) printf(\"%a\\n\", __tg_log2_s(x));",
+      " for (unsigned i = 0; i < 65536; i++) { u = i; float f = __tg_h2f(u); unsigned b; __builtin_memcpy(&b, &f, 4); printf(\"%u\\n\", b); }",
+      " return 0; }"])
+    with tempfile.TemporaryDirectory() as d:
+      (pathlib.Path(d) / "t.c").write_text(c)
+      subprocess.run([cc, "-O2", "-o", f"{d}/t", f"{d}/t.c"], check=True)
+      out = subprocess.run([f"{d}/t"], input="\n".join(float(x).hex() for x in xs), capture_output=True, text=True, check=True).stdout.split()
+    got = np.array([float.fromhex(v) if "nan" not in v and "inf" not in v else float(v) for v in out[:len(xs)]], dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"): ref = np.log2(xs.astype(np.float64)).astype(np.float32)
+    np.testing.assert_allclose(got, ref, rtol=3e-7, atol=3e-7)
+    h2f = np.array(out[len(xs):], dtype=np.uint64).astype(np.uint32)
+    ref16 = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32).view(np.uint32)
+    ok = (h2f == ref16) | (np.isnan(h2f.view(np.float32)) & np.isnan(ref16.view(np.float32)))
+    self.assertTrue(ok.all(), f"{(~ok).sum()} halves widened wrong")
+
+  def test_scalar_half_to_float_is_inline(self):
+    # a scalar half -> float cast is the inline bit widening, not clang's __extendhfsf2 call (the decoder's fp16 GEMM rows of 10
+    # widened for the bias add: 70-85 -> 39-49 us a call on the V69)
+    prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
+    try: src = dsp_source(Tensor.empty(10, dtype=dtypes.half).float() + Tensor.empty(10))
+    finally: ops_dsp.HVX_QFLOAT = prev
+    self.assertIn("__tg_h2f(__builtin_bit_cast(unsigned short, val", src)
+
+  def test_gather_math_rows_are_lanes(self):
+    # HVX_GATHER_MATH: the decoder's reference-point update (inverse sigmoid of 3 columns of a 900 x 10 regression, + sigmoid):
+    # 30 rows as the lanes through stride-10 / stride-3 gathers, the clip's compare + select as int masks, the strided stores
+    # lanes of one named vector. Off, it stays one scalar statement per value
+    from tinygrad.codegen.opt import heuristic
+    def graph(n):
+      reg, ref = Tensor.empty(n, 10), Tensor.empty(n, 3)
+      x = ref.clip(0, 1)
+      return (reg[:, 0:3] + (x.maximum(1e-5) / (1 - x).maximum(1e-5)).log()).sigmoid()
+    prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
+    old = heuristic.HVX_GATHER_MATH
+    try:
+      heuristic.HVX_GATHER_MATH = 3
+      src = dsp_source(graph(900))
+      heuristic.HVX_GATHER_MATH = 0
+      off = dsp_source(graph(1800))
+    finally: ops_dsp.HVX_QFLOAT, heuristic.HVX_GATHER_MATH = prev, old
+    for frag in ("float30 ", "__tg_log2_v(", "__hvx_m30 _m", "[29];", "static inline float30 __tg_gather30_"): self.assertIn(frag, src)
+    self.assertNotIn("float30 ", off)
+    self.assertFalse(ops_dsp._CMP_SCOPE[0], "the compare scope leaked out of the render")
+
 class TestDSPVrmpyGemv(unittest.TestCase):
   # a W8A8 decode GEMV: one uint8 activation row times int8 weights, int32 accumulation -- exactly vrmpybusv (u8 x s8 dot4)
   K, N = 576, 1536
