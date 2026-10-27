@@ -1251,57 +1251,35 @@ static inline void __hmx_prefetch_next(const __fp16* r0, const __fp16* r1) {
   (void)r0; (void)r1;
 #endif
 }
+/* one l2fetch box: `height` rows of `width` bytes at `stride` (the 64-bit form: 16-bit fields, any panel in one box). One at a
+ * time: an l2fetch issued while another is in flight replaces it -- row-by-row boxes fetched little more than the last row
+ * (BEVFormer's 2528-row value projection, A from DDR: 0.5 -> 0.18 ms per call on the V69) */
+static inline void __hmx_l2box(const void* p, unsigned stride, unsigned width, unsigned height) {
+#ifndef HMX_REF
+  if (stride >= 65536u || width >= 65536u || height >= 65536u || !height) return;
+  __builtin_HEXAGON_Y5_l2fetch((void*)p, ((long long)stride << 32) | ((long long)width << 16) | height);
+#else
+  (void)p; (void)stride; (void)width; (void)height;
+#endif
+}
 /* L2-prefetch a whole K panel of a 32-column operand: rows x 64 bytes at the row stride of r0, r1 (l2fetch height <= 255) */
 static inline void __hmx_prefetch_panel(const __fp16* r0, const __fp16* r1, int rows) {
-#ifndef HMX_REF
-  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  if (stride >= 65536u) return;
-  /* (one box where it fits: an l2fetch issued while another is in flight replaces it -- a 256-row panel as 240 + 16 rows
-   * fetched 16) */
-  for (int r = 0; r < rows; r += 255)
-    __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (64u << 8) | (unsigned)(rows - r < 255 ? rows - r : 255));
-#else
-  (void)r0; (void)r1; (void)rows;
-#endif
+  __hmx_l2box(r0, (unsigned)((const char*)r1 - (const char*)r0), 64u, (unsigned)rows);
 }
 /* the same for a pair of adjacent 32-column tiles packed together: whole 128-byte row lines. `ahead`: also fetch the next
  * pair's panel (the next 128 bytes of every row), which then streams in while this pair packs (only when the row stride
  * leaves room for it, i.e. the operand is wider than this pair) */
 static inline void __hmx_prefetch_panel2(const __fp16* r0, const __fp16* r1, int rows, int ahead) {
-#ifndef HMX_REF
   unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  if (stride >= 65536u) return;
-  if (ahead != 2)  /* 2: this pair's panel was already fetched as the previous pair's "ahead" */
-    for (int r = 0; r < rows; r += 240)
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (128u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
-  if (ahead && stride >= 256u)
-    for (int r = 0; r < rows; r += 240)
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + 128 + r * stride), (stride << 16) | (128u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
-#else
-  (void)r0; (void)r1; (void)rows; (void)ahead;
-#endif
+  int next = ahead && stride >= 256u;
+  if (ahead == 2) { if (next) __hmx_l2box((const char*)r0 + 128, stride, 128u, (unsigned)rows); }  /* this pair's came as "next" */
+  else __hmx_l2box(r0, stride, next ? 256u : 128u, (unsigned)rows);
 }
 /* L2-prefetch the K panel of a 32-row operand (A: 32 rows of K columns): each row's `bytes` contiguous bytes at the row stride
- * of r0, r1 (as 128-byte lines, <= 240 lines per l2fetch). __hmx_prefetch_panel is the 32-column (B) shape; used on A it
- * fetched 32*kt rows -- far past the operand, which faults the PD on the phone once that lands on an unmapped page. */
+ * of r0, r1. __hmx_prefetch_panel is the 32-column (B) shape; used on A it fetched 32*kt rows -- far past the operand, which
+ * faults the PD on the phone once that lands on an unmapped page. */
 static inline void __hmx_prefetch_rows(const __fp16* r0, const __fp16* r1, int bytes) {
-#ifndef HMX_REF
-  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  int lines = (bytes + 127) / 128;
-  /* the 32 rows one contiguous block: one l2fetch box. An l2fetch issued while another is in flight replaces it, so the row by
-   * row boxes below fetched little more than the last row (BEVFormer's 2528-row value projection, A from DDR: 0.5 -> 0.18 ms) */
-  if (stride == (unsigned)bytes && 32 * lines <= 255) {
-    __builtin_HEXAGON_Y4_l2fetch((void*)r0, (128u << 16) | (128u << 8) | (unsigned)(32 * lines));
-    return;
-  }
-  for (int i = 0; i < 32; i++)
-    for (int l = 0; l < lines; l += 240) {
-      unsigned h = (unsigned)(lines - l < 240 ? lines - l : 240);
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + i * stride + 128 * l), (128u << 16) | (128u << 8) | h);
-    }
-#else
-  (void)r0; (void)r1; (void)bytes;
-#endif
+  __hmx_l2box(r0, (unsigned)((const char*)r1 - (const char*)r0), (unsigned)bytes, 32u);
 }
 static inline void __hmx_call_start(void) {
   __hmx_pn = 0;

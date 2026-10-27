@@ -1209,6 +1209,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
         # spanning loads (0.12 ms per head on the V69). In fp16 over runs of up to 16 row pairs, then fp32 over the runs: summed
         # in fp32 throughout, LLVM's widening of each vector to a qf32 pair, its lane shuffle back and the conversions after every
         # add were 7 packets per row pair (49 us per head; an fp16 add is one, as in the max)
+        if getenv("ATTN_SUM_HMX", 1):
+          # the sums by the HMX too, as V^T's row of ones (a second M tile per output tile): no second pass over P
+          y = vT[h].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float()
+          oT[h].assign(y[:D + 1])                                                                             # O^T | sums
+          continue
         e = eb[:Np * Mp].reshape(Mt, Nt * 16, 64)
         e = e[:, :N // 2] if nb else e
         g = max(d for d in range(1, 17) if e.shape[1] % d == 0) if getenv("ATTN_SUM16", 1) else 1
