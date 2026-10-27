@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, os, mmap, math, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
+import ctypes, os, itertools, mmap, math, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct, re
 assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
@@ -414,6 +414,54 @@ def _splat_of_loaded_lane(ctx, x:UOp) -> str|None:
   if not _loaded_unchanged(ctx, v:=s.src[0], x): return None
   return f"(({ctx.render_type(x)})((({ctx.render_dtype(s.dtype)}*){ctx[v.src[0]]})[{lane}]))"
 
+def _splat_scalar(ctx, x:UOp) -> str|None:
+  # the scalar a float32 vector splat repeats (a loaded vector's lane reloaded from memory, as _splat_of_loaded_lane does), or None
+  if x.op is not Ops.STACK or len(x.src) < 2 or any(s is not x.src[0] for s in x.src) or (s:=x.src[0])._shape != () or s.dtype != dtypes.float32:
+    return None
+  if s.op is Ops.INDEX and len(s.src) == 2 and (lane:=_lane(s.src[1])) is not None and _loaded_unchanged(ctx, v:=s.src[0], x):
+    return f"(((float*){ctx[v.src[0]]})[{lane}])"
+  return ctx[s]
+
+# a reciprocal of a splat of lane k of a vector v is a splat of lane k of v's reciprocal (one vector helper, which clang computes
+# once for every lane: it is pure), else a splat of one scalar reciprocal: the vector helper per splat did the same work n times.
+# The attention's softmax normalization divides each column of a 32x32 transposed tile by its row sum: 32 vector reciprocals per
+# tile were 72% of E_30_2_4_32_32 (hexagon-sim 195K cycles per slice; 59K with one, 90K with 32 scalar divides). HVX_SPLAT_RECIP=0
+def _splat_recip_on() -> bool: return bool(getenv("HVX_SPLAT_RECIP", 1))
+def _recip_of_splat(ctx, x:UOp, st:UOp) -> str|None:
+  if not (HVX_QFLOAT and _splat_recip_on() and x.dtype == dtypes.float32 and (sc:=_splat_scalar(ctx, st)) is not None): return None
+  return f"(({ctx.render_type(x)})(1.0f/{sc}))"
+
+def _hoist_splat_recip(uops:list[UOp]) -> list[UOp]:
+  # RECIPROCAL(splat(v[k])) -> splat(R[k]), a / splat(v[k]) -> a * splat(R[k]), with R = RECIPROCAL(v) once, right after v (v: a
+  # float32 vector as wide as the splat)
+  if not (HVX_QFLOAT and QF_MATH and _splat_recip_on()): return uops
+  recips: dict[UOp, UOp] = {}
+  sub: dict[UOp, list[UOp]] = {}
+  for u in uops:
+    if u.dtype != dtypes.float32 or not ((u.op is Ops.RECIPROCAL and len(u.src) == 1) or (u.op is Ops.FDIV and len(u.src) == 2)): continue
+    st = u.src[-1]
+    if not (st.op is Ops.STACK and len(st.src) > 1 and all(x is st.src[0] for x in st.src) and (s:=st.src[0]).op is Ops.INDEX and
+            len(s.src) == 2 and _lane(s.src[1]) is not None and (v:=s.src[0]).dtype == dtypes.float32 and v.max_numel() == u.max_numel()):
+      continue
+    r = recips.setdefault(v, UOp(Ops.RECIPROCAL, v.dtype, (v,)))
+    lane = UOp(Ops.INDEX, s.dtype, (r, s.src[1]))
+    splat = UOp(Ops.STACK, st.dtype, (lane,) * len(st.src))
+    sub[u] = [lane, splat] if u.op is Ops.RECIPROCAL else [lane, splat, UOp(Ops.MUL, u.dtype, (u.src[0], splat))]
+  if not sub: return uops
+  out: list[UOp] = []
+  done: dict[UOp, UOp] = {}
+  for u in uops:
+    if u in sub:
+      chain = sub[u]
+      if u.op is Ops.FDIV: chain[-1] = chain[-1].replace(src=(done.get(u.src[0], u.src[0]), chain[1]))
+      out.extend(chain)
+      done[u] = chain[-1]
+    else:
+      done[u] = n = u.replace(src=tuple(done.get(x, x) for x in u.src))
+      out.append(n)
+      if u in recips: out.append(recips[u].replace(src=(n,)))
+  return out
+
 def _lane_of_loaded(ctx, x:UOp) -> str|None:
   # v65 (DSP_V65_HW): one scalar lane of a loaded vector, used on its own (a table index, say), is a scalar reload from memory:
   # extracting lanes of an HVX register one by one costs far more than the scalar loads it saves
@@ -440,8 +488,164 @@ def _subline_prefetch_on() -> bool: return bool(getenv("HVX_PREFETCH_SUBLINE", 1
 def _subline_prefetch(ctx, bidx:UOp, x:UOp) -> str|None:
   nbytes = x.max_numel()*x.dtype.itemsize
   if not _subline_prefetch_on() or HVX_PREFETCH_STRIDES <= 0 or nbytes >= 64 or bidx.addrspace is not AddrSpace.GLOBAL: return None
+  if _l2_streamed(ctx, bidx): return None
   if (dist:=_prefetch_distance(ctx, bidx, x.dtype.itemsize)) == HVX_PREFETCH: return None  # not a strided reduction walk
   return f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{dist}), {ctx.render_access(bidx)})"
+
+# ***** L2 stream prefetch (v68+) *****
+# A kernel's DDR input streams, per thread slice, as l2fetch boxes. The loads of one buffer are a stream. At the top of a loop
+# L whose K iterations cover about HVX_L2STREAM_KB of it, every K-th iteration fetches the box of iterations [i, i+2K): this
+# chunk (in L2 already, but for the first) and the next. A second l2fetch replaces one in flight, so one stream per loop.
+# The box is the exact footprint of those iterations (an l2fetch past a buffer can fault the PD): a stream qualifies when the
+# inner loops' footprint is one 2-D box that loop L moves by whole rows (form "rows") or by its width (form "cols").
+HVX_L2STREAM_KB = getenv("HVX_L2STREAM_KB", 16)  # 0: off
+def _l2stream_kb() -> int: return HVX_L2STREAM_KB if HVX_QFLOAT else 0  # measured on the V69 only
+def _l2stream_dcfetch() -> bool: return bool(getenv("HVX_L2STREAM_DC", 0))  # also keep the per-load dcfetches of a planned stream
+
+def _l2_eval(u:UOp, env:dict, memo:dict):
+  if (r:=memo.get(u, memo)) is not memo: return r
+  if u in env: r = env[u]
+  elif u.op is Ops.CONST: r = u.arg if isinstance(u.arg, int) else None
+  elif u.op is Ops.CAST: r = _l2_eval(u.src[0], env, memo)
+  elif u.op in _HMX_EVAL and len(u.src) == 2:
+    a, b = _l2_eval(u.src[0], env, memo), _l2_eval(u.src[1], env, memo)
+    r = None if a is None or b is None or (u.op in (Ops.CDIV, Ops.CMOD) and b == 0) else _HMX_EVAL[u.op](a, b)
+  else: r = None
+  memo[u] = r
+  return r
+
+_L2_C = {Ops.ADD: "+", Ops.SUB: "-", Ops.MUL: "*", Ops.SHL: "<<", Ops.SHR: ">>", Ops.AND: "&", Ops.OR: "|", Ops.XOR: "^", Ops.CDIV: "/",
+         Ops.CMOD: "%"}
+def _l2_cexpr(ctx, u:UOp, sub:dict) -> str|None:
+  # an int index expression in C, the ranges in sub replaced (outer ranges and scalar params by their names)
+  if u in sub: return sub[u]
+  if u.op is Ops.CONST: return str(u.arg) if isinstance(u.arg, int) else None
+  if u.op is Ops.CAST: return _l2_cexpr(ctx, u.src[0], sub)
+  if u.op in (Ops.RANGE, Ops.PARAM): return ctx.r.get(u)
+  if u.op in _L2_C and len(u.src) == 2:
+    a, b = _l2_cexpr(ctx, u.src[0], sub), _l2_cexpr(ctx, u.src[1], sub)
+    return None if a is None or b is None else f"({a}{_L2_C[u.op]}{b})"
+  return None
+
+def _l2_box(iv:list[tuple[int, int]]) -> tuple[int, int, int, int]|None:
+  # byte intervals [a, b) -> (origin, width, stride, height) when their union is `height` rows of `width` bytes at `stride`
+  rows: list[list[int]] = []
+  for a, b in sorted(iv):
+    if rows and a <= rows[-1][1]: rows[-1][1] = max(rows[-1][1], b)
+    else: rows.append([a, b])
+  w = rows[0][1] - rows[0][0]
+  if any(b - a != w for a, b in rows): return None
+  s = rows[1][0] - rows[0][0] if len(rows) > 1 else w
+  if any(rows[k+1][0] - rows[k][0] != s for k in range(len(rows) - 1)): return None
+  return rows[0][0], w, s, len(rows)
+
+def _l2_plan(uops:list[UOp]) -> dict[UOp, list[tuple]]:
+  # RANGE -> the streams prefetched at the top of its body (see _l2_stream)
+  if _l2stream_kb() <= 0: return {}
+  # HMX / hand-kernel helpers move their own data (and l2fetch it): leave those kernels alone. A register transpose is fine
+  if any(u.op is Ops.WMMA or (u.op in (Ops.CUSTOM, Ops.CUSTOMI) and re.search(r"__(hmx|msda|dw_|rowcopy|softmax|attn)", str(u.arg)))
+         for u in uops): return {}
+  enclosing: dict[UOp, list[UOp]] = {}
+  groups: dict[UOp, list[UOp]] = {}
+  open_: list[UOp] = []
+  ifs = 0
+  for u in uops:
+    if u.op is Ops.RANGE: open_.append(u)
+    elif u.op is Ops.END and len(u.src) > 1 and u.src[1] in open_: open_.remove(u.src[1])
+    elif u.op is Ops.IF: ifs += 1
+    elif u.op is Ops.ENDIF: ifs -= 1
+    elif ((u.op is Ops.LOAD and len(u.src) == 1) or (u.op is Ops.STORE and getenv("HVX_L2STREAM_ST", 0))) and \
+         (b:=u.src[0]).addrspace is AddrSpace.GLOBAL and ((b.op is Ops.INDEX and len(b.src) == 2) or (b.op is Ops.SHRINK and len(b.src) == 3)):
+      # an ungated scalar / vector load. HVX_L2STREAM_ST=1: stores too (a box of the output lines before they are written: slower,
+      # enc3's E_625_2_4_128 63 -> 90 us per call on the V69, enc3 38.3 -> 39.4 ms)
+      v = u if u.op is Ops.LOAD else u.src[1]
+      if ifs or _gathered(b) or b.src[0].op is not Ops.PARAM or v.max_numel() * v.dtype.itemsize < getenv("HVX_L2STREAM_MINB", 1): continue
+      enclosing[u] = list(open_)
+      groups.setdefault(b.src[0], []).append(u)
+  # one box in flight per thread (a second l2fetch replaces it): the stream that reads the most bytes, if that is 4 KB or more
+  # (a bias row re-read per output row stays in L2 anyway)
+  tgt = _l2stream_kb() * 1024
+  st = [x for p, loads in groups.items() if (x:=_l2_stream(p, loads, enclosing, tgt)) is not None and x[1][-1] >= 4096]
+  return {(b:=max(st, key=lambda x: x[1][-1]))[0]: [b[1]]} if st else {}
+
+def _l2_stream(p:UOp, loads:list[UOp], enclosing:dict, target:int):
+  # -> (L, (param, reference index, box origin - reference address, form, width, stride, height, step of L, K, iterations of L,
+  # inner ranges, bytes per thread slice)) or None. Bytes throughout; the reference is the first load's index with the inner loops at 0. The innermost
+  # loop that qualifies, unless one chunk takes all of it: then the next loop out that does, for bigger boxes
+  isz, idxs = p.dtype.itemsize, [x.src[0].src[1] for x in loads]
+  nbs = [v.max_numel() * v.dtype.itemsize for x in loads for v in [x if x.op is Ops.LOAD else x.src[1]]]
+  common = [r for r in enclosing[loads[0]] if all(r in enclosing[x] for x in loads)]
+  leaves = {u for i in idxs for u in i.toposort() if u.op in (Ops.RANGE, Ops.PARAM)}
+  if any(u.op is Ops.RANGE and u not in common for u in leaves): return None
+  found = None
+  for li in range(len(common) - 1, -1, -1):
+    L, n = common[li], int(common[li].vmax) + 1
+    inner = [r for r in common[li+1:] if r in leaves]
+    if n < 2 or L not in leaves: continue
+    if prod(int(r.vmax) + 1 for r in inner) * len(loads) > 8192: return found
+    def footprint(env):
+      ref, iv = _l2_eval(idxs[0], {**env, **{r: 0 for r in inner}}, {}), []
+      for combo in itertools.product(*[range(int(r.vmax) + 1) for r in inner]):
+        e, m = {**env, **dict(zip(inner, combo))}, {}
+        for i, nb in zip(idxs, nbs):
+          if (a:=_l2_eval(i, e, m)) is None: return None
+          iv.append((a * isz, a * isz + nb))
+      return None if ref is None or (box:=_l2_box(iv)) is None else (box[0] - ref * isz, *box[1:], ref * isz)
+    shapes, steps = set(), set()
+    for lo in (0, max(0, n - 2)):
+      base = {u: (0 if lo == 0 else int(u.vmax)) for u in leaves if u not in inner and u is not L}
+      f0, f1 = footprint({**base, L: lo}), footprint({**base, L: lo + 1})
+      if f0 is None or f1 is None: return found
+      shapes |= {f0[:4], f1[:4]}
+      steps.add(f1[4] - f0[4])
+    if len(shapes) != 1 or len(steps) != 1: return found
+    (off, w, s, h), step = shapes.pop(), steps.pop()
+    # the reference must move by the same step on every iteration of L (no div / mod of L in the index)
+    z = {u: 0 for u in leaves}
+    if any(_l2_eval(idxs[0], {**z, L: k}, {}) * isz != k * step + _l2_eval(idxs[0], z, {}) * isz for k in range(n)): return found
+    # a contiguous stream of whole vectors is left to their dcfetches (HVX_PREFETCH bytes ahead): boxes of it were slower (the
+    # decoder's fp32 -> fp16 casts E_450_4_128 43 -> 53 us per call on the V69, KB=16); HVX_L2STREAM_SEQ=1 boxes it anyway
+    if h == 1 and step == w and min(nbs) >= 128 and HVX_PREFETCH > 0 and not getenv("HVX_L2STREAM_SEQ", 0) and loads[0].op is Ops.LOAD:
+      return found
+    if h == 1 and step >= w: form = "rows"
+    elif h > 1 and step == w: form = "cols"
+    else: continue  # the next loop out may move the whole footprint as one box
+    k = max(1, -(-target // (w * h)))
+    if form == "rows" and (step >= 65536 or w >= 65536): return found
+    if form == "cols" and (s >= 65536 or h >= 65536 or min(2 * k, n) * w >= 65536): return found
+    total = w * h * n * prod(int(r.vmax) + 1 for r in common[:li] if r in leaves)
+    # a whole loop in one box that is issued per iteration of an outer loop must still be a worthwhile box (BEVFormer's
+    # E_6_375_2_4_3_32: a 384-byte box per row, 2250 per call, 0.79 -> 1.03 ms on the V69)
+    if k >= n and n * w * h < 4096 and any(int(r.vmax) > 0 for r in common[:li]): continue
+    found = L, (p, idxs[0], off, form, w, s if form == "cols" else step, h, step, k, n, inner, total)
+    if k < n: return found
+  return found
+
+def _l2_streamed(ctx, bidx:UOp) -> bool:
+  # a load of a planned stream drops its dcfetches (unless HVX_L2STREAM_DC)
+  return not _l2stream_dcfetch() and len(bidx.src) > 1 and any(s[0] is bidx.src[0] for v in getattr(ctx, "_l2", {}).values() for s in v)
+
+def _l2_for(ctx, x:UOp) -> str|None:
+  # a planned loop, strip-mined: an outer loop over chunks of K iterations issues the box, the inner loop runs the chunk. A branch
+  # inside the hot loop instead cost more than the fetch saved (the decoder's r_900_32 row sums 55 -> 105 us per call on the V69,
+  # 60K -> 144K cycles on hexagon-sim, the same with the l2fetch replaced by a nop)
+  if x.dtype == dtypes.void or not (plan:=getattr(ctx, "_l2", {}).get(x)): return None
+  p, idx, off, form, w, s, h, _, k, n, inner, _ = plan[0]
+  i, c = ctx[x], f"{ctx[x]}_c"
+  if (e:=_l2_cexpr(ctx, idx, {**{r: "0" for r in inner}, x: "_o"})) is None or p not in ctx.r: return None
+  wd, ht = (str(w), "_n") if form == "rows" else (f"_n*{w}", str(h))
+  # the first chunk fetches itself and the next; later ones only the next, [c+K, c+2K): their own came as the one before's next
+  o = f"{c} ? {c}+{k} : 0" if getenv("HVX_L2STREAM_NEXT", 1) else c
+  end = f"{c}+{k}" if n % k == 0 else f"({c}+{k} < {n} ? {c}+{k} : {n})"
+  return (f"for (int {c} = 0; {c} < {n}; {c} += {k}) {{\n  {{ int _o = {o}, _n = {c}+{2*k} < {n} ? {c}+{2*k} : {n}; _n -= _o; "
+          f"if (_n > 0) __tg_l2box((const char*)({ctx.r[p]}+{e})+{off}, {s}u, {wd}, {ht}); }}\n"
+          f"for ({ctx.render_dtype(x.dtype)} {i} = {c}; {i} < {end}; {i}++) {{")
+
+_L2BOX = """/* one l2fetch box: `height` rows of `width` bytes at `stride` (the 64-bit form, 16-bit fields): _l2_plan in ops_dsp.py */
+static inline void __tg_l2box(const char* p, unsigned stride, unsigned width, unsigned height) {
+  if (stride >= 65536u || width >= 65536u || height >= 65536u || !height || !width) return;
+  __builtin_HEXAGON_Y5_l2fetch((void*)p, ((long long)stride << 32) | ((long long)width << 16) | height);
+}"""
 
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
@@ -537,6 +741,12 @@ def _cmp_helpers(uops:list[UOp]) -> list[str]:
   return out
 
 dsp_string = PatternMatcher([
+  (UPat(Ops.RECIPROCAL, src=(UPat(Ops.STACK, name="st"),), name="x"), _recip_of_splat),
+  (UPat(Ops.FDIV, src=(UPat.var("a"), UPat(Ops.STACK, name="st")), name="x"), lambda ctx,x,a,st:
+   f"({ctx[a]}*{r})" if (r:=_recip_of_splat(ctx, x, st)) is not None else None),
+  # a loop with an L2 stream prefetch (_l2_plan): strip-mined, the box issued per chunk (_l2_for); its END closes both loops
+  (UPat(Ops.RANGE, name="x"), _l2_for),
+  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE, name="r"))), lambda ctx,r: "}}" if r in getattr(ctx, "_l2", {}) and r.dtype != dtypes.void else None),
   # HVX_REVEC_CMP (see _cmp_vec_op): vector compares as int masks narrowed to 0/1 bytes, WHERE as a mask bit select, bool ->
   # float as the mask AND 1.0f's bits, TRUNC / float -> int32 through the exact integer helpers
   (UPat(tuple(_CMP), dtype=dtypes.bool, name="x"), lambda ctx,x: f"__builtin_convertvector({_mask(ctx, x, n)} & 1, {ctx.render_type(x)})"
@@ -595,10 +805,12 @@ dsp_string = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{_prefetch_distance(ctx, bidx, x.dtype.itemsize)+o}), "
                  for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
-   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL and not _gathered(bidx) else None),
+   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL and not _gathered(bidx)
+   and not _l2_streamed(ctx, bidx) else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
-   if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
+   if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL and not _l2_streamed(ctx, bidx)
+   else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), _subline_prefetch),
   (UPat(Ops.INDEX, src=(UPat(Ops.LOAD), UPat()), name="x"), _lane_of_loaded),
 ])
@@ -2877,7 +3089,8 @@ class DSPRenderer(ClangRenderer):
   def render(self, uops:list[UOp]) -> str:
     self._hmx_acc = False
     if self.hmx_acc: uops, self._hmx_acc = _hmx_acc_rewrite(uops)
-    uops = _transpose_groups(self, uops)
+    uops = _transpose_groups(self, _hoist_splat_recip(uops))
+    self._l2 = _l2_plan(uops)
     # _lane_window: uop positions and (position, buffer) of every store
     self._pos = {u:i for i,u in enumerate(uops)}
     self._stores = [(i, _hmx_param(u.src[0])) for i,u in enumerate(uops) if u.op is Ops.STORE]
@@ -2934,6 +3147,7 @@ class DSPRenderer(ClangRenderer):
     prefix += _cmp_helpers(uops)
     prefix += [_transpose_helper(t, n) for t, n in sorted(getattr(self, '_tr_types', ()))]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
+    if getattr(self, '_l2', None): prefix.append(_L2BOX)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and "__msda_call(" in u.arg for u in uops): prefix.append(_msda_helpers())
