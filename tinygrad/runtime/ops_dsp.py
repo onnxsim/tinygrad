@@ -443,6 +443,12 @@ def _subline_prefetch(ctx, bidx:UOp, x:UOp) -> str|None:
   if (dist:=_prefetch_distance(ctx, bidx, x.dtype.itemsize)) == HVX_PREFETCH: return None  # not a strided reduction walk
   return f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{dist}), {ctx.render_access(bidx)})"
 
+_SF_BARRIER = ("typedef float __hvx_f __attribute__((ext_vector_type(32)));\n"
+               "static inline __hvx_f __hvx_sfbar(__hvx_f a) { __asm__(\"\" : \"+v\"(a)); return a; }")
+def _sf_bits(ctx, x:UOp) -> str|None:
+  if not HVX_QFLOAT or x._shape is None or not _hvx_chunkable(n:=x.max_numel()) or n < 16: return None
+  return f"__builtin_bit_cast({ctx.render_type(x)}, ({ctx.render_type(x.src[0])}){_hvx_chunked(n, lambda a: f'__hvx_sfbar({a})', [ctx[x.src[0]]])})"
+
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
 
@@ -536,6 +542,61 @@ def _cmp_helpers(uops:list[UOp]) -> list[str]:
             f" {m} s = ({m})u >> 31; return (r ^ s) - s; }}"]
   return out
 
+# ***** qf32 accumulators (HVX_QACC=1, or a kernel with register tables) *****
+# a 32-lane float accumulator updated as acc + (products / sums) is kept in qf32 between steps: its updates are qf32 multiplies and
+# adds (Q6_Vqf32_vmpy_VsfVsf / vadd_Vqf32Vqf32), its final reads one conversion to sf. As float C, LLVM converted every product and
+# partial sum back to sf (vX.sf = vX.qf32): 6 HVX ops a multiply-add instead of 4
+_QACC = ("typedef int __hvx_v __attribute__((vector_size(128)));\n"
+         "#define __QB(x) __builtin_bit_cast(__hvx_v, (x))\n"
+         "#define __QMUL(a, b) __builtin_HEXAGON_V6_vmpy_qf32_sf_128B(__QB(a), __QB(b))\n"
+         "#define __QADD(a, b) __builtin_HEXAGON_V6_vadd_qf32_128B((a), (b))\n"
+         "#define __QIN(a) __builtin_HEXAGON_V6_vadd_sf_128B(__QB(a), __builtin_HEXAGON_V6_vd0_128B())\n"
+         "#define __QSF(a) __builtin_HEXAGON_V6_vconv_sf_qf32_128B(__QB(a))")
+
+def _is_zero(u:UOp) -> bool:
+  while u.op in (Ops.CAST, Ops.STACK) and (u.op is Ops.CAST or all(x is u.src[0] for x in u.src)): u = u.src[0]
+  return u.op is Ops.CONST and u.arg == 0
+
+def _qacc_find(uops:list[UOp], users:dict[UOp, list[UOp]]) -> tuple[set[UOp], set[UOp]]:
+  # (update stores, final loads) of the register accumulators that qualify
+  stores: dict[UOp, list[UOp]] = {}
+  loads: dict[UOp, list[UOp]] = {}
+  for u in uops:
+    if u.op is Ops.STORE: stores.setdefault(_hmx_param(u.src[0]), []).append(u)
+    elif u.op is Ops.LOAD: loads.setdefault(_hmx_param(u.src[0]), []).append(u)
+  upd, fin = set(), set()
+  for b, sts in stores.items():
+    if b.op is not Ops.BUFFER or b.addrspace is not AddrSpace.REG or b.dtype != dtypes.float32: continue
+    if any(st.src[1].dtype != dtypes.float32 or st.src[1]._shape is None or st.src[1].max_numel() != 32 or len(st.src) != 2 for st in sts): continue
+    u_sts, ok = [], True
+    for st in sts:
+      v = st.src[1]
+      if _is_zero(v): continue
+      if v.op is Ops.ADD and (l:=next((x for x in v.src if x.op is Ops.LOAD and x.src[0] is st.src[0] and users.get(x) == [v]), None)) is not None \
+         and users.get(v) == [st]: u_sts.append((st, l))
+      else: ok = False
+    if not ok or not u_sts: continue
+    upd |= {st for st,_ in u_sts}
+    fin |= set(loads.get(b, [])) - {l for _,l in u_sts}
+  return upd, fin
+
+def _qacc_store(ctx, x:UOp) -> str|None:
+  if x not in getattr(ctx, "_qacc_upd", ()): return None
+  v = x.src[1]
+  l = next(s for s in v.src if s.op is Ops.LOAD and s.src[0] is x.src[0])
+  def q(u:UOp) -> str:
+    # u in qf32: products and sums only this update uses stay qf32
+    if ctx._users.get(u, []) and len(ctx._users[u]) == 1 and u.dtype == dtypes.float32 and u._shape is not None and u.max_numel() == 32:
+      if u.op is Ops.MUL: return f"__QMUL({ctx[u.src[0]]}, {ctx[u.src[1]]})"
+      if u.op is Ops.ADD: return f"__QADD({q(u.src[0])}, {q(u.src[1])})"
+    return f"__QIN({ctx[u]})"
+  o = v.src[1] if v.src[0] is l else v.src[0]
+  return f"{ctx.render_access(x.src[0])} = __builtin_bit_cast({ctx.render_type(v)}, __QADD(__QB({ctx[l]}), {q(o)}));"
+
+def _qacc_load(ctx, x:UOp) -> str|None:
+  if x not in getattr(ctx, "_qacc_fin", ()): return None
+  return f"__builtin_bit_cast({ctx.render_type(x)}, __QSF({ctx.render_access(x.src[0])}))"
+
 dsp_string = PatternMatcher([
   # HVX_REVEC_CMP (see _cmp_vec_op): vector compares as int masks narrowed to 0/1 bytes, WHERE as a mask bit select, bool ->
   # float as the mask AND 1.0f's bits, TRUNC / float -> int32 through the exact integer helpers
@@ -557,6 +618,11 @@ dsp_string = PatternMatcher([
   # a float MAX of vectors (see hvx_revectorize): HVX's native sf / hf max. It is IEEE maxNum (a NaN operand yields the other
   # operand) where the scalar form keeps tinygrad's (a<b)?b:a -- they only differ on NaN
   (UPat(Ops.MAX, dtype=(dtypes.float32, dtypes.half), name="x"), lambda ctx,x: _vec_fmax(ctx, x)),
+  (UPat(Ops.STORE, name="x"), _qacc_store),
+  (UPat(Ops.LOAD, src=(UPat(),), name="x"), _qacc_load),
+  # a float vector's bits (HVX_REVEC_BITCAST): forced to IEEE sf first -- a qf32 value's bits are not its float's, and the rounding
+  # adds before it (t + 1.5 2^23) only round in sf
+  (UPat(Ops.BITCAST, dtype=(dtypes.int32, dtypes.uint32), src=(UPat(dtype=dtypes.float32),), name="x"), lambda ctx,x: _sf_bits(ctx, x)),
   (UPat(Ops.CONST, (dtypes.int8, dtypes.uint8), name="x"), lambda ctx,x: str(x.val)),
   (UPat(Ops.MUL, dtypes.float32, name="x"), lambda ctx,x:
    f"__hvx_{x.op.name.lower()}_f{x.max_numel()}({', '.join(ctx[s] for s in x.src)})" if _qf_vec(x) else None),
@@ -784,19 +850,35 @@ HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops
 _QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT}
 
 def _vec_ops() -> set: return HVX_VEC_OPS | _QF_VEC_OPS if QF_MATH else HVX_VEC_OPS
+# HVX_REVEC_BITCAST=1: a same-width bitcast (float32 <-> int32 lanes) re-vectorizes too -- the generated MSDA's row index goes
+# float -> int through the mantissa (MSDA_STAGE builds it as a vector table)
+def _revec_bitcast() -> bool: return bool(getenv("HVX_REVEC_BITCAST", 0))
+def _vec_bitcast(u:UOp) -> bool:
+  return _revec_bitcast() and u.op is Ops.BITCAST and u.dtype.itemsize == u.src[0].dtype.itemsize == 4
 
 def _lane(u:UOp) -> int|None:
   if u.op is Ops.CAST: u = u.src[0]
   return u.arg if u.op is Ops.CONST and isinstance(u.arg, int) else None
+
+def _norm_add_col(col:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  # (HVX_REVEC_BITCAST) lanes x + c next to lanes where c = 0 folded away (a per-map offset of 0 for map 0): those as x + 0 too
+  if not _revec_bitcast() or len(col) < 2 or col[0]._shape != (): return col
+  adds = [c.op is Ops.ADD and c.src[1].op is Ops.CONST for c in col]
+  if all(adds) or not any(adds) or col[0].dtype not in (dtypes.int32, dtypes.float32): return col
+  return tuple(c if a else UOp(Ops.ADD, c.dtype, (c, c.const_like(0))) for c, a in zip(col, adds))
 
 def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
   # a column (the j-th operand of every lane) can become one vector operand if it's a splat, constants, consecutive lanes
   # of one vector, or (recursively) the same vectorizable op in every lane. Anything else -- e.g. a per-lane mix of
   # compare/cast/mul -- stays a scalar constructor: LLVM's Hexagon backend crashes selecting some of those once they're
   # wrapped in a vector op ("Cannot select v2i32 = bitcast (V2Q ...)"), and there's nothing to gain vectorizing them.
+  col = _norm_add_col(col)
   c0 = col[0]
   if c0._shape != () or depth > 32 or (c0.dtype == dtypes.bool and not _bool_lanes_ok(len(col))): return False
   if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
+  # (HVX_REVEC_BITCAST) a few distinct loaded scalars across the lanes (the temporal attention's per-map reference points under its maps x
+  # taps x points lanes): one vector built from them
+  if _revec_bitcast() and all(c.op is Ops.LOAD for c in col) and c0.dtype.itemsize == 4 and len(set(col)) <= 4: return True
   if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
     # consecutive lanes of one vector, or of several vectors one after another (a row loaded as two 64-byte halves):
     # the vector operand is then that lane constructor, which clang lowers to shuffles
@@ -807,7 +889,7 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     if HVX_LANE_GATHER and _lane_gather(col) is not None: return True
     return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
                                                                        ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
-  if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col))) and \
+  if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col)) or _vec_bitcast(c0)) and \
      all(c.op is c0.op and c.dtype == c0.dtype and c.arg == c0.arg and len(c.src) == len(c0.src) for c in col):
     return all(_vec_column_ok(tuple(c.src[j] for c in col), depth+1) for j in range(len(c0.src)))
   return False
@@ -817,7 +899,7 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
 def _hvx_qfloat() -> bool: return HVX_QFLOAT
 
 def hvx_revectorize(x:UOp) -> UOp|None:
-  srcs, n = x.src, len(x.src)
+  srcs, n = _norm_add_col(x.src), len(x.src)
   if n < 2 or x.dtype == dtypes.void: return None
   # v65 has integer HVX only. Keeping float lanes in an ext_vector_type makes LLVM lower unsupported vector-float
   # arithmetic incorrectly (e.g. the openpilot stem 1x1 convolution); let it render scalar lane expressions instead.
@@ -834,7 +916,7 @@ def hvx_revectorize(x:UOp) -> UOp|None:
       _vec_column_ok(tuple(s.src[1] for s in srcs)) and _vec_column_ok(tuple(s.src[2] for s in srcs)):
     return UOp(Ops.CUSTOMI, x.dtype, (s0.src[0], UOp.stack(*[s.src[1] for s in srcs]), UOp.stack(*[s.src[2] for s in srcs])),
                "({0}?{1}:{2})")
-  if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n)): return None
+  if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n) or _vec_bitcast(s0)): return None
   # a splat of one scalar op (a per-sample weight broadcast over the channel lanes) stays that scalar op and one vsplat: as a
   # vector op it does the same work on splatted operands, and pulls the scalar compares / selects under it into vectors too
   if _revec_cmp() and all(s is s0 for s in srcs): return None
@@ -2885,6 +2967,9 @@ class DSPRenderer(ClangRenderer):
     for u in uops:
       for s in u.src: self._users.setdefault(s, []).append(u)
     self._scopes = [i for i,u in enumerate(uops) if u.op in (Ops.RANGE, Ops.END, Ops.IF, Ops.ENDIF)]
+    from tinygrad.codegen import _staged_buf
+    self._qacc_upd, self._qacc_fin = _qacc_find(uops, self._users) if HVX_QFLOAT and \
+      (q:=getenv("HVX_QACC", -1)) and (q > 0 or any(u.op is Ops.BUFFER and _staged_buf(u) for u in uops)) else (set(), set())
     src = self.render_kernel(*self._render(uops), uops)
     return src
 
@@ -2932,6 +3017,9 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     prefix += _cmp_helpers(uops)
+    if self._qacc_upd: prefix.append(_QACC)
+    if HVX_QFLOAT and any(u.op is Ops.BITCAST and u.dtype in (dtypes.int32, dtypes.uint32) and u.src[0].dtype == dtypes.float32 and
+                          u._shape is not None and u.max_numel() >= 16 and _hvx_chunkable(u.max_numel()) for u in uops): prefix.append(_SF_BARRIER)
     prefix += [_transpose_helper(t, n) for t, n in sorted(getattr(self, '_tr_types', ()))]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)

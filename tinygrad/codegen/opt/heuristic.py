@@ -1,7 +1,7 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, tc
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, GroupOp, resolve, AxisType
 from tinygrad.dtype import dtypes
 from tinygrad.codegen.late.coalesce import image_valid_dims
@@ -70,6 +70,11 @@ def _odd_upcasts(k, axis:int, cap:int) -> list[int]:
   n = int(k.full_shape[axis])
   if not HVX_UPCAST_ODD or any(n % w == 0 for w in (32, 64, 128) if w <= cap) or not _every_unit_stride(k, axis): return []
   return [d for d in range(min(cap, n), 32, -1) if n % d == 0][:1]
+
+def _reads_stage(k:Scheduler, axis:int) -> bool:
+  # the axis indexes a register table (Tensor.stage)
+  return any(b.src[0].op is Ops.STAGE and b.src[0].arg.addrspace is AddrSpace.REG and k.rngs[axis] in b.src[1].backward_slice_with_self
+             for b in k.bufs)
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
@@ -364,7 +369,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   try:
     # scalar float on v65: accumulators x unrolled taps must stay near the 32-register file, or the loop body is spills
     scalar_cap = getenv("DSP_SCALAR_UNROLL", 16) if dsp_scalar_float else None
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64) and \
+    # a loop over a register table's entries (Tensor.stage) reads them as scalars: unrolled, the reads became one vector load and a
+    # lane extraction per entry (STAGE_UNROLL entries per step)
+    if k.unrollable_dims and _reads_stage(k, k.unrollable_dims[-1]):
+      if (su:=getenv("STAGE_UNROLL", 1)) > 1 and k.full_shape[k.unrollable_dims[-1]] % su == 0:
+        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, su))
+    elif k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64) and \
         (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
