@@ -1121,11 +1121,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
         return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
       return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
-    # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: the whole attention as one fused HMX call (HMX_ATTN=0: off;
-    # 3: generated, head by head)
-    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1) == 3:
+    # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: generated kernels head by head (HMX_ATTN=3, the default:
+    # BEVFormer's decoder 36.6 ms on the V69, the hand kernels' 37.9), the hand attention kernels (1, 2) or off (0)
+    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 3) == 3:
       return _attn_heads(ent[5], ent[6], b, ent[3], ent[4])
-    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 1):
+    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 3):
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
     else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
@@ -1189,18 +1189,30 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       for h in range(H):
         sb, eb = raw(), raw()
         sb[:Np * Mp].reshape(Np, Mp).assign(kp[h].matmul(qT[h], dtype=dtypes.half))
-        x = sb[:Np * Mp].reshape(Mt, Nt, 16, 64) + bias2
-        mm = x.max((1, 2), keepdim=True).contiguous()                                                          # (Mt, 1, 1, 64)
+        # N even (BEVFormer's 900): no bias. The keys below N are the first N / 2 row pairs, so the max and the sums reduce over
+        # those only, and the max is clamped at -15: the padding keys' scores are 0 (zero rows of K), their exp at most 2^15 (no
+        # inf), times V^T's zero columns in P V. The bias tiles were a DDR load next to each VTCM one, in the max and in the exp.
+        # (Underflows only where every score of a query is below -29 in log2 units, all of its probabilities < 2^-14)
+        nb = N % 2 == 0 and getenv("ATTN_NOBIAS", 1)
+        s = sb[:Np * Mp].reshape(Mt, Nt, 16, 64)
+        x = s if nb else s + bias2
+        mm = (s.reshape(Mt, Nt * 16, 64)[:, :N // 2] if nb else x).reshape(Mt, -1, 64).max(1, keepdim=True).contiguous()  # (Mt, 1, 64)
         # the max of each lane pair, over a tile's 16 row pairs: broadcast over the key tiles only (30, which no vector width
         # divides). Broadcast over all 480 row pairs, the DSP heuristic upcast them for its reuse (scalar loads 128 bytes apart)
         # (three small kernels: the pair max, its lanes doubled by a vector shuffle, the broadcast copy at 64 lanes. Fused, or the
         # pair max as a flip within pairs, the 64 lanes split into 32 x 2 and the kernel ran scalar fp16, ~0.09 ms per head)
-        m1 = mm.reshape(Mt, 32, 2).max(-1, keepdim=True).expand(Mt, 32, 2).contiguous()
+        m1 = mm.reshape(Mt, 32, 2).max(-1, keepdim=True)
+        m1 = (m1.maximum(-15) if nb else m1).expand(Mt, 32, 2).contiguous()
         m2 = m1.reshape(Mt, 1, 1, 64).expand(Mt, 1, 16, 64).contiguous()
         eb[:Np * Mp].reshape(Mt, Nt, 16, 64).assign((x - m2).exp2())
-        # the sums by a reduce over P's tiles (fp32; the padding keys' P is 0), P V with V^T's 32 rows only: with the ones row the
-        # product took two M tiles, twice the spanning loads (0.12 ms per head on the V69)
-        ps = eb[:Np * Mp].reshape(Mt, Nt, 16, 64).float().sum((1, 2)).contiguous()                            # (Mt, 64)
+        # the sums by a reduce over P's tiles, P V with V^T's 32 rows only: with the ones row the product took two M tiles, twice the
+        # spanning loads (0.12 ms per head on the V69). In fp16 over runs of up to 16 row pairs, then fp32 over the runs: summed
+        # in fp32 throughout, LLVM's widening of each vector to a qf32 pair, its lane shuffle back and the conversions after every
+        # add were 7 packets per row pair (49 us per head; an fp16 add is one, as in the max)
+        e = eb[:Np * Mp].reshape(Mt, Nt * 16, 64)
+        e = e[:, :N // 2] if nb else e
+        g = max(d for d in range(1, 17) if e.shape[1] % d == 0) if getenv("ATTN_SUM16", 1) else 1
+        ps = e.reshape(Mt, -1, g, 64).sum(2, dtype=dtypes.half).float().sum(1).contiguous()                   # (Mt, 64)
         oT[h, D:].assign(ps.reshape(Mt, 32, 2).sum(-1).reshape(1, Mp))                                      # sums
         # (stored in fp16 first: the cast and the fp32 store fused into P V's output tiles took it from 0.06 to 0.29 ms per head)
         oT[h, :D].assign(vT[h, :D].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float())  # O^T
@@ -1221,7 +1233,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
     """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, N), v (..., Np, 32) half (q and v
     zero-padded to whole tiles, k^T as it is): the hand attention kernels in test/external/dsp/hand/attn. HMX_ATTN=1: one fused HMX call (its softmax on the
-    graph thread); 2 (default): per head an HMX call for S, the softmax on the DSP_THREADS pool on the same VTCM tiles, an HMX
+    graph thread); 2: per head an HMX call for S, the softmax on the DSP_THREADS pool on the same VTCM tiles, an HMX
     call for P @ V"""
     from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
     *bs, Mp, _ = q16.shape

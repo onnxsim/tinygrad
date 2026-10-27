@@ -149,6 +149,21 @@ class TestDSPHalf(unittest.TestCase):
     self.assertNotIn("__fp16", src)
     self.assertIn("float", src)
 
+  def test_fp16_exp_four_vectors(self):
+    # an fp16 exp2 (the qf16 polynomial, ~20 dependent ops per vector) runs four vectors' chains at once: 128 lanes, then 2 more
+    # (HVX_EW_EXP_LANES=256; the attention's exp over raw tiles 117 -> 74 us per head on the V69)
+    x, m = Tensor.empty(30, 30, 1024, dtype=dtypes.half), Tensor.empty(30, 1, 1024, dtype=dtypes.half)
+    self.assertRegex(dsp_source((x - m).exp2()), r"void E_\w*_128_2\(")
+
+  def test_thread_balance_slices(self):
+    # 30 rows of vectors on a pool of 4: 15 slices over the 4 threads (94%), not 3 threads (75%) -- HVX_THREAD_BALANCE
+    R = ops_dsp.MockDSPRenderer
+    old = R.has_threads, R.pool_threads, R.global_max
+    R.has_threads, R.pool_threads, R.global_max = True, 4, property(lambda self: (32, 0, 0))
+    try: src = dsp_source(Tensor.empty(30, 450, 64, dtype=dtypes.half).max(1))
+    finally: R.has_threads, R.pool_threads, R.global_max = old
+    self.assertIn("void r_2_15_64_450(", src)
+
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
@@ -161,6 +176,11 @@ class TestDSPQfloat(unittest.TestCase):
     src = dsp_source((a - b) * (c + d))
     self.assertIn("__hvx_mul_f", src)
     self.assertIn('__asm__("" : "+v"', src)
+
+  def test_widened_half_times_constant_is_renormalized(self):
+    # half widened to float is qf32 in LLVM's hands, so even a multiply by a constant goes through the sf barrier helper (a
+    # MatMul -> scale -> head transpose: the scale fused into the fp16 product's cast back was cos 0.007 on the V69 phone)
+    self.assertIn("__hvx_mul_f", dsp_source(Tensor.empty(4096, dtype=dtypes.half).float() * 0.25))
 
   def test_plain_arithmetic_is_left_to_llvm(self):
     # a multiply with a loaded operand, and adds of products, are accurate as LLVM lowers them: no helper
@@ -317,7 +337,9 @@ class TestDSPHmx(unittest.TestCase):
     sb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
     sb[:64 * 96].reshape(64, 96).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
     kernel = dsp_source(sb, hm).split("__attribute__((noinline)) void", 1)[1]
-    self.assertIn("__hmx_store_raw((__fp16*)data0_7144 + ((_o / 3072) + (_o % 96) / 32 * 2) * 1024);", kernel)
+    # (row tile Lidx1, column tile Lidx2 of 2 x 3: the place linear in the loops, the VTCM test once per call)
+    self.assertIn("__hmx_rawo = __hmx_vt(data0_7144, 12288u);", kernel)
+    self.assertIn("__hmx_store_rawo((__fp16*)data0_7144 + 0+(Lidx1)*1024+(Lidx2)*2048);", kernel)
     self.assertNotIn("__hmx_out2(", kernel)
     eb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
     pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb[:64 * 96].reshape(64, 96), dtype=dtypes.half)
@@ -325,6 +347,20 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("__hmx_rawb = (__fp16*)data2_7144;", kernel)
     self.assertRegex(kernel, r"__hmx_mac_span_raw\(__hmx_ca\(0\), __hmx_rawb\+\(Lidx\d\)\*2048, 2\);")
     self.assertNotIn("__hmx_pack2(_b", kernel)
+    # A (one row of tiles, packed on the first output tile) L2-prefetched there; the output tile converted after the next one's
+    # load pair (HMX_DEFER)
+    self.assertRegex(kernel, r"if \(\(Ridx0\)==0\) __hmx_prefetch_rows\(")
+    self.assertIn("__hmx_pend(1, _p, 0);" if ops_dsp.HMX_DEFER else "__hmx_store();", kernel)
+
+  def test_raw_lin(self):
+    # a raw output tile's place from its first row's index: 32 LD a + 32 b -> (b row tiles + a) 1024, per loop
+    from tinygrad.uop.ops import UOp
+    a, b = UOp.range(4, 0), UOp.range(3, 1)
+    i0 = a * (32 * 96) + b * 32
+    base, coef = ops_dsp._hmx_raw_lin(i0, (96, 4), [a, b])
+    self.assertEqual((base, dict(coef)), (0, {a: 1024, b: 4 * 1024}))
+    self.assertIsNone(ops_dsp._hmx_raw_lin(a * (32 * 96) + b * 48, (96, 4), [a, b]))   # b's step not a whole column tile
+    self.assertIsNone(ops_dsp._hmx_raw_lin(a * (32 * 96) + b * 64, (96, 4), [a, b]))   # columns carry into the next row tile
 
   def test_deferred_output(self):
     # HMX_DEFER: a paired output tile goes to the free VTCM slot pair and is converted to rows after the next one's load pair
@@ -372,8 +408,9 @@ class TestDSPHmx(unittest.TestCase):
     kernel = self.src(64, 32, 96).split("__attribute__((noinline)) void", 1)[1]
     self.assertNotIn("for (int Ridx", kernel)
     self.assertEqual(kernel.count("__hmx_begin();"), 1)
-    self.assertLess(kernel.index("__hmx_begin();"), kernel.index("__hmx_store()"))
-    self.assertIn("__hmx_out2(", kernel)
+    st = "__hmx_store_d(0)" if ops_dsp.HMX_DEFER else "__hmx_store()"  # (deferred: rows converted at the next tile / the flush)
+    self.assertLess(kernel.index("__hmx_begin();"), kernel.index(st))
+    self.assertIn("__hmx_pr[0] = " if ops_dsp.HMX_DEFER else "__hmx_out2(", kernel)
     self.assertNotIn("*(__hmx_h128*)", kernel)  # no 128-lane store over 32-element rows
 
   def test_a_panel_prefetch_is_rows(self):

@@ -403,6 +403,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], odd[0] if odd and odd[0] > splits else splits))
       break
 
+  # on the DSP, an fp16 elementwise kernel with an exp2 (the qf16 polynomial: ~20 dependent ops per vector) at 128 lanes keeps
+  # two vectors' chains in flight, one HVX op per packet. HVX_EW_EXP_LANES widens it: 256, four (the attention's exp over raw
+  # tiles, 117 -> 74 us per head on the V69; 512 took 93)
+  if is_dsp and (wl:=getenv("HVX_EW_EXP_LANES", 256)) > 128 and not k.axes_of(AxisType.REDUCE) and k.upcast_size() == 128 and \
+      all(b.src[0].dtype.itemsize == 2 for b in k.bufs) and any(u.op is Ops.EXP2 for u in k.ast.backward_slice):
+    for axis in k.upcastable_dims[::-1]:
+      if k.full_shape[axis] % (wl // 128) == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, axis, wl // 128))
+        break
+
   # **** local groups ****
 
   if k.ren.has_local:
@@ -440,10 +450,18 @@ def apply_threads(k:Scheduler) -> Scheduler:
       def few(t:int) -> bool: return resolve(prod(k.full_shape) * w // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
     else:
       def few(t:int) -> bool: return resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
+    def balance(t:int) -> float: return t / (pool * -(-t // pool))
+    def balanced(axis:int) -> list[int]:
+      n = k.full_shape[axis]
+      return [t for t in range(pool + 1, k.ren.global_max[0] + 1) if isinstance(n, int) and n % t == 0 and balance(t) >= 0.85]
     for threads in [32,16,12,8,6,5,4,3,2]:
       # Skip if too many threads. Heuristic: use about 128K ops per thread (a renderer whose per-element cost is far higher, like
       # the DSP's scalar float, sets a lower thread_min_elems)
       if threads > pool or few(threads): continue
+      # fewer threads than the pool where more slices than threads spread better (HVX_THREAD_BALANCE): 30 rows of vectors as 15
+      # slices over 4 threads (94%) rather than 3 threads (75%) -- the attention softmax's reduces over raw tiles
+      if threads < pool and getenv("HVX_THREAD_BALANCE", 1) and k.ren.global_max[0] > pool and not few(pool) and \
+          any(balance(t) > threads / pool for a in k.axes_of(AxisType.WEAK) for t in balanced(a)): break
       for axis in k.axes_of(AxisType.WEAK):
         if k.full_shape[axis] % threads == 0:
           try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))
@@ -453,11 +471,8 @@ def apply_threads(k:Scheduler) -> Scheduler:
     # no axis divides by a pool size (625 rows = 5^4): more slices than threads, when they spread evenly enough (25 slices over 4
     # threads: 89%). BEVFormer's LayerNorm second stage ran on one thread, 0.7 ms per call
     if pool > 1 and k.ren.global_max[0] > pool and not any(o.op is OptOps.THREAD for o in k.applied_opts) and not few(pool):
-      def balance(t:int) -> float: return t / (pool * -(-t // pool))
       for axis in k.axes_of(AxisType.WEAK):
-        n = k.full_shape[axis]
-        cands = [t for t in range(pool + 1, k.ren.global_max[0] + 1) if isinstance(n, int) and n % t == 0 and balance(t) >= 0.85]
-        if cands:
+        if cands:=balanced(axis):
           try: k.apply_opt(Opt(OptOps.THREAD, axis, min(cands)))
           except KernelOptError: continue
           break
