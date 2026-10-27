@@ -97,17 +97,63 @@ class TestVtcmPlacement(unittest.TestCase):
     self.assertGreaterEqual(regs[order.index(id(a))], 0)   # (unmarked, b takes the room)
     self.assertEqual(regs[order.index(id(b))], -1)
 
+  def test_refill_after_eviction(self):
+    # DSP_GRAPH_VTCM_REFILL: a region the first-fit pass crowded out and the eviction pass passed over gets the room an eviction
+    # freed later (BEVFormer's decoder: each layer's value projection output)
+    x, w, y = FakeBuf(4096), FakeBuf(4096), FakeBuf(4096)
+    r0, r1, r2, r3 = FakeBuf(32768), FakeBuf(8192), FakeBuf(8192), FakeBuf(16384)
+    bufs = {id(t): [t, t.nbytes, None] for t in (x, w, y, r0, r1, r2, r3)}
+    e = kern("e", [VEC])
+    calls = [("h", kern("h", [VEC, VEC], hmx=True), [id(r0), id(x), id(w)], {0}, 0), ("e", e, [id(r1), id(r0)], {0}, 0),
+             ("e", e, [id(r2), id(r1)], {0}, 0), ("e", e, [id(r3), id(r2)], {0}, 0), ("e", e, [id(r1), id(r2)], {0}, 0),
+             ("e", e, [id(r2), id(r1)], {0}, 0), ("e", e, [id(y), id(r3)], {0}, 0)]
+    order = list(dict.fromkeys(i for _, _, ids, *_ in calls for i in ids))
+    def at(h, t): return [int(v) for v in re.search(r"G_REG_VTCM\[G_NREG\] = \{([^}]*)\}", h).group(1).split(",")][order.index(id(t))]
+    old = os.environ.get("DSP_GRAPH_VTCM_REFILL")
+    try:
+      os.environ["DSP_GRAPH_VTCM_REFILL"] = "0"
+      self.assertEqual(at(self.emit(calls, bufs, x, y, 48), r1), -1)
+      os.environ["DSP_GRAPH_VTCM_REFILL"] = "1"
+      self.assertGreaterEqual(at(self.emit(calls, bufs, x, y, 48), r1), 0)
+    finally:
+      if old is None: os.environ.pop("DSP_GRAPH_VTCM_REFILL")
+      else: os.environ["DSP_GRAPH_VTCM_REFILL"] = old
+
+  def test_resident_request(self):
+    # two regions live over the same calls, room for one: the plain one carries more traffic, but the model asked for the other
+    # (/* vtcm-resident: j=p */, the renderer's listing of Tensor.empty(..., resident=p)); a refusal (p < 0) keeps a region out,
+    # and a request exempts a region no single call writes whole (the model vouches for the writes covering what is read)
+    x, w, y = FakeBuf(16384), FakeBuf(16384), FakeBuf(16384)
+    a, b, c = FakeBuf(32768), FakeBuf(32768), FakeBuf(16384)
+    cv = FakeBuf(8192, base=c)
+    bufs = {id(t): [t, t.nbytes, None] for t in (x, w, y, a, b, c, cv)}
+    hmx, e = kern("h", [VEC, VEC], hmx=True), kern("e", [VEC])
+    def calls(ra:str, rc:str): return [
+      ("h", hmx, [id(a), id(x), id(w)], {0}, 0), ("e", e, [id(b), id(x)], {0}, 0),
+      ("e2", e, [id(cv), id(x)], {0}, 0),                                               # c: half of it written
+      ("e3", kern("e3", [VEC, VEC, VEC]).replace("/* DSP boilerplate", ra + rc + "/* DSP boilerplate"),
+       [id(y), id(a), id(b), id(c)], {0}, 0),
+      ("e4", e, [id(w), id(b)], {0}, 0)]                                                # b used once more
+    order = list(dict.fromkeys(id(bufs[i][0].base) for _, _, ids, *_ in calls("", "") for i in ids))
+    def at(h, t): return [int(v) for v in re.search(r"G_REG_VTCM\[G_NREG\] = \{([^}]*)\}", h).group(1).split(",")][order.index(id(t))]
+    h = self.emit(calls("", ""), bufs, x, y, 40)
+    self.assertEqual((at(h, a) >= 0, at(h, b) >= 0, at(h, c)), (False, True, -1))
+    h = self.emit(calls("/* vtcm-resident: 1=1 */ ", "/* vtcm-resident: 3=1 */ "), bufs, x, y, 56)
+    self.assertEqual((at(h, a) >= 0, at(h, b) >= 0, at(h, c) >= 0), (True, False, True))
+    h = self.emit(calls("/* vtcm-resident: 1=-1 */ ", ""), bufs, x, y, 64)
+    self.assertEqual(at(h, a), -1)
+
   def test_raw_tile_alignment_and_prefetch(self):
-    # a raw-tile buffer (1024 k + 1000 fp16 elements, written all but its marker tail) goes to a 2 KB boundary, where the HMX reads
-    # and writes it in place; the kernels' software prefetches of parameters placed in VTCM become no-ops
+    # a raw-tile buffer (listed by the renderer: /* hmx-tile: j */) goes to a 2 KB boundary, where the HMX reads and writes it in
+    # place; the kernels' software prefetches of parameters placed in VTCM become no-ops
     x, w, y, a = FakeBuf(16384), FakeBuf(16384), FakeBuf(16384), FakeBuf(16512)
-    s = FakeBuf((1024 * 8 + 1000) * 2)
+    s = FakeBuf(1024 * 8 * 2)
     sv = FakeBuf(1024 * 8 * 2, base=s)
     bufs = {id(b): [b, b.nbytes, None] for b in (x, w, y, a, s, sv)}
     pf = "(__builtin_HEXAGON_Y2_dcfetch((char*)(@+0)+2048), 0);" + VEC
     calls = [("e", kern("e", [VEC]), [id(a), id(x)], {0}, 0),
-             ("h", kern("h", [VEC, VEC], hmx=True), [id(sv), id(a), id(w)], {0}, 0),   # a stays live across s's write
-             ("e2", kern("e2", [pf, VEC]), [id(y), id(sv), id(a)], {0}, 0)]
+             ("h", "/* hmx-tile: 0 */ " + kern("h", [VEC, VEC], hmx=True), [id(sv), id(a), id(w)], {0}, 0),   # a stays live across s's write
+             ("e2", "/* hmx-tile: 1 */ " + kern("e2", [pf, VEC]), [id(y), id(sv), id(a)], {0}, 0)]
     with tempfile.TemporaryDirectory() as d:
       old = os.environ.get("DSP_GRAPH_VTCM_KB")
       os.environ["DSP_GRAPH_VTCM_KB"] = "64"
@@ -148,10 +194,10 @@ class TestHoist(unittest.TestCase):
     if sys_path not in sys.path: sys.path.insert(0, sys_path)
     from dsp_graph_onnx import pull_raw_tile_readers
     b = {n: FakeBuf(4096) for n in "ixzo"}
-    b["p"] = FakeBuf((1024 + 1000) * 2)
+    b["p"] = FakeBuf(1024 * 2)
     bufs = {id(t): [t] for t in b.values()}
     calls = [("exp", "plain", [id(b["p"]), id(b["i"])], {0}), ("other", "plain", [id(b["z"]), id(b["x"])], {0}),
-             ("tail", "plain", [id(b["x"]), id(b["i"])], {0}), ("PV", "__hmx_", [id(b["o"]), id(b["p"])], {0})]
+             ("tail", "plain", [id(b["x"]), id(b["i"])], {0}), ("PV", "/* hmx-tile: 1 */ __hmx_", [id(b["o"]), id(b["p"])], {0})]
     self.assertEqual([c[0] for c in pull_raw_tile_readers(calls, bufs)], ["exp", "PV", "other", "tail"])
 
 class TestCoreParam(unittest.TestCase):

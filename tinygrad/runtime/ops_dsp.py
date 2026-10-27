@@ -1161,8 +1161,9 @@ def hvx_revectorize(x:UOp) -> UOp|None:
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
   # a select whose condition is one scalar in every lane (a concat's source by row) is one whole-vector select: scalar condition,
-  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69)
-  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and _is32(s0.dtype) and \
+  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69). In fp16 too: BEVFormer's encoder pads
+  # its (1, 128) can-bus row to 64 rows for the HMX, lane by lane 0.68 ms on the V69
+  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and (_is32(s0.dtype) or s0.dtype in (dtypes.half, dtypes.int16)) and \
       all(s.op is Ops.WHERE and s._shape == () and s.dtype == s0.dtype and s.src[0] is s0.src[0] for s in srcs) and \
       _vec_column_ok(tuple(s.src[1] for s in srcs)) and _vec_column_ok(tuple(s.src[2] for s in srcs)):
     return UOp(Ops.CUSTOMI, x.dtype, (s0.src[0], UOp.stack(*[s.src[1] for s in srcs]), UOp.stack(*[s.src[2] for s in srcs])),
@@ -1579,7 +1580,7 @@ static inline void __hmx_flush(void) {
   __hmx_pn = 0;
 }
 static inline void __hmx_pend(int n, const __fp16* p, const __fp16* q) { __hmx_pn = n; __hmx_pp = p; __hmx_pq = q; __hmx_ob ^= 1; }
-/* raw-tile buffers (a fp16 PARAM of 1024 k + _HMX_RAW_TAIL elements, nn/onnx.py's attention S^T and P): tinygrad indexes them
+/* raw-tile buffers (a fp16 PARAM with layout "hmx_tile", nn/onnx.py's attention S^T and P): tinygrad indexes them
  * as a row-major (rows, LD) matrix, the HMX kernels write and read them as raw tiles -- tile (row tile a, column tile b) at
  * (b * rows / 32 + a) * 1024, in the HMX's own layout (row pairs interleaved), so neither side converts. __hmx_rawb: the raw B
  * operand's base, set at the start of the call */
@@ -2637,17 +2638,23 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
   return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
 
-# raw-tile buffers (see __hmx_store_raw): marked by their size, 1024 k + _HMX_RAW_TAIL fp16 elements (nn/onnx.py allocates them)
-_HMX_RAW_TAIL = 1000
+# raw-tile buffers (see __hmx_store_raw): fp16 buffers of 1024 k elements in layout HMX_TILE (Tensor.empty(..., layout=HMX_TILE),
+# nn/onnx.py's attention S^T and P). The layout rides on the buffer (ParamArg.layout), not a view: tinygrad's matmul sees a row-major
+# (rows, LD) matrix the HMX lowering redirects to the tiles, while the softmax between reads the same memory flat. (As a view, the
+# key range's %2 split by pm_split_ranges had the tensor core tile the wrong axes.) The renderer lists them for the graph emitter
+# (/* hmx-tile: j */), which places them at 2 KB in VTCM
+HMX_TILE = "hmx_tile"
 def _hmx_raw_param(p:UOp) -> bool:
-  return p.op is Ops.PARAM and p.dtype == dtypes.half and len(p.shape) == 1 and p.shape[0] % 1024 == _HMX_RAW_TAIL
+  if p.op is not Ops.PARAM or p.layout != HMX_TILE: return False
+  if p.dtype != dtypes.half or len(p.shape) != 1 or p.shape[0] % 1024: raise RuntimeError(f"{HMX_TILE} buffer must be fp16 of 1024 k elements")
+  return True
 
 def _hmx_raw_geom(idx:list[UOp], p:UOp, ranges:list[UOp]):
   # row r's index idx[r] = idx[0] + r LD, (size - tail) / LD rows: -> (LD, row tiles), else None
   d = [_hmx_const_delta(lambda env, ii=ii: None if (a:=_hmx_eval(ii, env)) is None or (z:=_hmx_eval(idx[0], env)) is None else a - z, ranges)
        for ii in idx]
   if d[1] is None or d[1] <= 0 or d[1] % 32 or any(x != r * d[1] for r, x in enumerate(d)): return None
-  n = p.shape[0] - _HMX_RAW_TAIL
+  n = p.shape[0]
   return (d[1], n // d[1] // 32) if n % (32 * d[1]) == 0 else None
 
 def _hmx_raw_b(rows, kr:UOp, loops:tuple, ranges:list[UOp]):
@@ -2920,7 +2927,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         if p not in rawo:
           rawo.add(p)
           last_param = max(pos[x] for x in uops if x.op is Ops.PARAM)
-          vt = f"const int __hmx_rv = __hmx_vt({{0}}, {2*(p.shape[0]-_HMX_RAW_TAIL)}u);"
+          vt = f"const int __hmx_rv = __hmx_vt({{0}}, {2*p.shape[0]}u);"
           after.setdefault(last_param, []).append(UOp(Ops.CUSTOM, dtypes.void, (p,), vt))
         after.setdefault(at, []).extend(([rowptr[0]] if rowptr[0] not in pos else []) +
                                         [UOp(Ops.CUSTOM, dtypes.void, (rowptr[0], p)+sx+tuple(r for r, _ in coef), code)])
@@ -3336,6 +3343,12 @@ class DSPRenderer(ClangRenderer):
     if (gs:=sorted({p.arg.slot for u in uops if u.op is Ops.LOAD and u.src and u.src[0].op in (Ops.INDEX, Ops.SHRINK) and _gathered(u.src[0])
                     for p in [u.src[0].src[0]] if p.op is Ops.PARAM and getattr(p.arg, "slot", -1) >= 0})):
       prefix.append(f"/* vtcm-gathered: {','.join(map(str, gs))} */")
+    # the raw-tile parameters, for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
+    if (rs:=sorted({u.arg.slot for u in uops if u.op is Ops.PARAM and u.layout == HMX_TILE})):
+      prefix.append(f"/* hmx-tile: {','.join(map(str, rs))} */")
+    # the parameters whose buffers the model asked to keep on chip (Tensor.empty(..., resident=p)): the emitter's VTCM priorities
+    if (rp:=sorted({(u.arg.slot, u.resident) for u in uops if u.op is Ops.PARAM and u.resident and u.arg.slot >= 0})):
+      prefix.append(f"/* vtcm-resident: {','.join(f'{j}={p}' for j, p in rp)} */")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

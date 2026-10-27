@@ -82,6 +82,7 @@ def hoist_out_of_hmx_chains(calls:list, bufs:dict) -> list:
   def hit(xs, ys): return any(a == c and lo < hi2 and lo2 < hi for a, lo, hi in xs for c, lo2, hi2 in ys)
   def writes(c): return [span(c[2][o]) for o in c[3]]
   def touches(c): return [span(b) for b in c[2]]
+  from tinygrad.runtime.support.dsp_graph_v65 import _listed
   out, i = list(calls), 0
   while i < len(out):
     c = out[i]
@@ -90,7 +91,7 @@ def hoist_out_of_hmx_chains(calls:list, bufs:dict) -> list:
       # call that depends on it directly or through another such call (S^T -> max -> exp into P -> P @ V), up to the last HMX one.
       # (followed for every HMX call, the longer chains cost BEVFormer's encoder layer 1.5 ms: other matmuls' operands out of VTCM)
       chain, j = writes(c), None
-      general = any(bufs[c[2][o]][0].base.nbytes % 2048 == 2000 for o in c[3])
+      general = bool(_listed(c[1], "hmx-tile") & set(c[3]))
       for k in range(i + 1, min(i + 32, len(out))):
         if hit(touches(out[k]), chain):
           if not general:
@@ -111,19 +112,19 @@ def hoist_out_of_hmx_chains(calls:list, bufs:dict) -> list:
   return out
 
 def pull_raw_tile_readers(calls:list, bufs:dict) -> list:
-  """Each call that reads a raw-tile buffer (ops_dsp __hmx_store_raw: 1024 k + 1000 fp16 elements, the generated attention's S^T and
+  """Each call that reads a raw-tile buffer (ops_dsp HMX_TILE, listed as /* hmx-tile: j */ in its source: the generated attention's S^T and
   P) moved up to just after the last call it depends on. Sinking put a layer's last P @ V after the other heads' tails, P then
   lived across them, didn't fit the VTCM arena, and P @ V copied its tiles in from DDR (0.3 ms instead of 0.05). -> the reordered
   calls"""
   def span(b): v = bufs[b][0]; return (id(v.base), v.offset, v.offset + v.nbytes)
-  def raw(b): return bufs[b][0].base.nbytes % 2048 == 2000
   def writes(c): return [span(c[2][o]) for o in c[3]]
   def touches(c): return [span(b) for b in c[2]]
   def hit(xs, ys): return any(a == c and lo < hi2 and lo2 < hi for a, lo, hi in xs for c, lo2, hi2 in ys)
+  from tinygrad.runtime.support.dsp_graph_v65 import _listed
   out = list(calls)
   for j in range(len(out)):
     c = out[j]
-    if not any(raw(b) for k, b in enumerate(c[2]) if k not in c[3]): continue
+    if not (_listed(c[1], "hmx-tile") - set(c[3])): continue
     # the last call c depends on: c reads what it writes, or c writes what it touches
     i = max((i for i in range(j) if hit(touches(c), writes(out[i])) or hit(writes(c), touches(out[i]))), default=-1)
     if i + 1 < j: out[i + 1:j + 1] = [c] + out[i + 1:j]

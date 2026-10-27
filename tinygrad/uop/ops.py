@@ -30,9 +30,15 @@ class ParamArg:
   axis: int|None = None
   device: str|tuple[str, ...]|None = None
   volatile: bool = False
+  # the buffer's memory layout when it isn't the row-major one its shape says, for a backend's kernels to read (DSP "hmx_tile": the
+  # HMX's raw tile order, see ops_dsp _hmx_raw_param). The schedule carries it from the BUFFER to every kernel's PARAM
+  layout: str|None = None
+  # on-chip residency the model asks for (DSP: VTCM): > 0 keep the buffer on chip over its live range, higher first; < 0 never.
+  # A request, not a guarantee: the backend's placement honors it where the buffer's accesses allow (see dsp_graph_v65 emit)
+  resident: int = 0
   def __repr__(self):
     fields = (("vmin_vmax", None), ("multiple_of", None), ("name", None), ("addrspace", AddrSpace.GLOBAL), ("axis", None), ("device", None),
-              ("volatile", False))
+              ("volatile", False), ("layout", None), ("resident", 0))
     args = [repr(self.slot), repr(self.dtype)] + [f"{k}={v!r}" for k,default in fields if (v:=getattr(self, k)) != default]
     return f"ParamArg({', '.join(args)})"
 axis_letters = {AxisType.DEVICE: "d", AxisType.GLOBAL: "g", AxisType.THREAD: "t", AxisType.LOCAL: "l", AxisType.WARP: "w", AxisType.WEAK: "L",
@@ -811,10 +817,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.without_after.op not in {Ops.BUFFER, Ops.SHRINK, Ops.BITCAST, Ops.BINARY, Ops.MSTACK, Ops.MSELECT, Ops.PARAM}: return self
     return UOp(Ops.GETADDR, src=(self,), arg=device or to_tuple(self.device)[0])
   @staticmethod
-  def new_buffer(device:str|tuple[str, ...], size:int, dtype:DType, num=None):
+  def new_buffer(device:str|tuple[str, ...], size:int, dtype:DType, num=None, layout:str|None=None, resident:int=0):
     if dtype in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {dtype}")
     slot = next(UOp.unique_num) if num is None else num
-    return UOp(Ops.BUFFER, src=(shape_to_shape_arg((size,)),), arg=ParamArg(slot, dtype, device=device))
+    return UOp(Ops.BUFFER, src=(shape_to_shape_arg((size,)),), arg=ParamArg(slot, dtype, device=device, layout=layout, resident=resident))
   @staticmethod
   def from_buffer(opaque:Buffer, device:str|tuple[str, ...]|None=None):
     if (uop:=UOp.new_buffer(device or opaque.device, opaque.size, opaque.dtype, num=-id(opaque))) not in buffers: buffers[uop] = opaque.ref(1)
@@ -858,6 +864,14 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     for x in self.src:
       if x.device is not None: return x.device
     return None
+  @property
+  def layout(self) -> str|None:
+    # a BUFFER's / PARAM's memory layout (ParamArg.layout), None for anything else
+    return self.arg.layout if self.op in (Ops.BUFFER, Ops.PARAM) and isinstance(self.arg, ParamArg) else None
+  @property
+  def resident(self) -> int:
+    # a BUFFER's / PARAM's on-chip residency request (ParamArg.resident), 0 for anything else
+    return self.arg.resident if self.op in (Ops.BUFFER, Ops.PARAM) and isinstance(self.arg, ParamArg) else 0
   @property
   def is_virtual(self) -> bool:
     # NOTE: no device means no place to store, weak means no width to store. neither can back a buffer as-is
@@ -1158,12 +1172,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # TODO: this should replace placeholder
   @staticmethod
   def param(slot:int, dtype:DType, shape:tuple[sint, ...]|None=None, device=None, vmin_vmax:tuple[PyConst, PyConst]|None=None,
-            multiple_of:int|None=None, name=None, addrspace=AddrSpace.GLOBAL, axis:int|None=None, volatile:bool=False):
+            multiple_of:int|None=None, name=None, addrspace=AddrSpace.GLOBAL, axis:int|None=None, volatile:bool=False, layout:str|None=None,
+            resident:int=0):
     if dtype in dtypes.weaks: raise RuntimeError(f"cannot create param for weak dtype {dtype}")
     if shape is not None and axis is not None and isinstance(device, tuple):
       shape = tuple(s*len(device) if i == axis else s for i,s in enumerate(shape))
     src: tuple[UOp, ...] = (UOp(Ops.NOOP) if shape is None else shape_to_shape_arg(shape),)
-    return UOp(Ops.PARAM, src=src, arg=ParamArg(slot, dtype, vmin_vmax, multiple_of, name, addrspace, axis, device, volatile))
+    return UOp(Ops.PARAM, src=src, arg=ParamArg(slot, dtype, vmin_vmax, multiple_of, name, addrspace, axis, device, volatile, layout, resident))
   def param_like(self, slot:int):
     # Variables become ALU params in the call body; the stored value (if bound) stays in the call args
     if self.is_bound_var or self.is_variable:
