@@ -110,12 +110,15 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   if getenv("DMC"): return sink
 
   # collect
-  memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp], dict[int, list[UOp]]] = defaultdict(dict)
+  memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp, UOp|None], dict[int, list[UOp]]] = defaultdict(dict)
   add_roots: dict[tuple, UOp] = {}
   for u in sink.toposort():
     # TODO: this should handle images too, it's just memory coalescing
     if u.op in {Ops.LOAD, Ops.STORE}:
-      assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
+      # a gated store (codegen GATED_REDUCE's conditional accumulate) groups with stores under the same gate and keeps it; gated
+      # loads are left alone
+      if len(u.src) != (2 if u.op is Ops.STORE else 1) and not (u.op is Ops.STORE and len(u.src) == 3): continue
+      gate = u.src[2] if u.op is Ops.STORE and len(u.src) == 3 else None
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
       # register arrays are only coalesced on the DSP, where an upcast accumulator (e.g. a vrmpy WMMA's 32 int32 lanes) is one
@@ -132,20 +135,20 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       # lanes as (a+b)+k fell into two groups, and the 128-lane row load split into misaligned pieces (1, 64, 32, ..., 1)
       if isinstance(root_src, UOp) and root_src.op is Ops.ADD:
         root_src = add_roots.setdefault(tuple(sorted(root_src.split_uop(Ops.ADD), key=lambda t: t.tuplize)), root_src)
-      memory[(u.op, buf, root_src, valid)].setdefault(arg, []).append(u)
+      memory[(u.op, buf, root_src, valid, gate)].setdefault(arg, []).append(u)
 
   # on the DSP, don't merge loads wider than the widest contiguous store group: a wider load that consumers only use in
   # narrower slices has to be split back out of the HVX register, which LLVM does through a stack round trip
   # (in bytes: an int32x32 accumulator store is one 128-byte HVX register, and so is a uint8x128 load)
   dsp_load_cap = 128
   if ctx is not None and ctx.target.device == "DSP":
-    store_runs = [len(g)*buf.dtype.itemsize for (op,buf,_,_),offsets in memory.items() if op is Ops.STORE
+    store_runs = [len(g)*buf.dtype.itemsize for (op,buf,_,_,_),offsets in memory.items() if op is Ops.STORE
                   for _,g in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]) for g in [list(g)]]
     if store_runs: dsp_load_cap = max(4, max(store_runs))
 
   # build replacements
   replacements = {}
-  for (op,buf,base,valid),offsets in memory.items():
+  for (op,buf,base,valid,gate),offsets in memory.items():
     # allowed lengths (copied in)
     lengths = []
     must_divide = True
@@ -179,7 +182,8 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
           for i,g in enumerate(grp):
             assert len(offsets[g]) == 1, f"attempting multiple stores: {len(offsets[g])}"
             datas.append(offsets[g][0].src[1])
-          store = idx.store(UOp.stack(*datas) if len(datas) > 1 else datas[0])
+          data = UOp.stack(*datas) if len(datas) > 1 else datas[0]
+          store = idx.store(data, gate) if gate is not None else idx.store(data)
           for i,g in enumerate(grp): replacements[offsets[g][0]] = store
         else:
           ld = idx.load()

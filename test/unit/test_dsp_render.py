@@ -179,6 +179,18 @@ class TestDSPHalf(unittest.TestCase):
         else: setattr(R, a, v)
     self.assertIn("void E_225_2_4(", src)
 
+  def test_gated_reduce(self):
+    # a sum over a loop of where(mask, term, 0) with the mask per loop step (BEVFormer's per-(camera, query) visibility): the
+    # accumulate is conditional and the term's loads and math are inside the if (codegen GATED_REDUCE, sink_into_ifs), its
+    # accumulate one vector add
+    m, a = Tensor.empty(6, 100, dtype=dtypes.uint8), Tensor.empty(6, 100, 8, 32)
+    k = dsp_source((m != 0).reshape(6, 100, 1, 1).where(a * a + a, 0.0).sum((0, 2))).split("/* DSP boilerplate")[0]
+    body = k.split("for (int Ridx0 = 0; Ridx0 < 6; Ridx0++) {", 1)[1]
+    self.assertRegex(body.lstrip(), r"^unsigned char val0 = [^;]*;\s*if \(\(val0!=")
+    inside = body.split("if ((val0!=", 1)[1]
+    self.assertIn("float32 val", inside)                    # the term's loads moved in
+    self.assertRegex(inside, r"\*\(\(float32\*\)\(\(buf0\+0\)\)\) = ")
+
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True

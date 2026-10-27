@@ -1,6 +1,6 @@
 from dataclasses import replace, dataclass
 import itertools, functools
-from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
+from tinygrad.helpers import getenv, DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
@@ -232,6 +232,20 @@ def merge_reduce_ends(sink:UOp):
       for e in group: subs[e] = merged
   return sink.substitute(subs) if subs else None
 
+def _uniform_gate(inp:UOp) -> tuple[UOp, UOp]|None:
+  # where(g, t, 0) with g the same for every lane (a scalar, or a vector of one scalar repeated), possibly under a horizontal sum
+  # of unrolled terms (REDUCE / PERMUTE / RESHAPE: the gate then holds for all of them) -> (g, the same without the where)
+  w = inp
+  while w.op in (Ops.REDUCE, Ops.PERMUTE, Ops.RESHAPE) and (w.op is not Ops.REDUCE or w.arg[0] is Ops.ADD): w = w.src[0]
+  if w.op is not Ops.WHERE or (z:=w.src[2]).op not in (Ops.CONST, Ops.STACK) or \
+     any(c.op is not Ops.CONST or c.arg != 0 for c in ([z] if z.op is Ops.CONST else z.src)): return None
+  g = w.src[0]
+  if g.op is Ops.STACK:
+    if not g.src or any(x is not g.src[0] for x in g.src): return None
+    g = g.src[0]
+  if g.dtype != dtypes.bool or (g._shape is not None and any(d != 1 for d in g.shape)): return None
+  return g, inp.substitute({w: w.src[1]})
+
 def reduce_ranges_to_acc(ctx:ReduceContext, r:UOp):
   acc = UOp.placeholder_like(r, ctx.acc_num, AddrSpace.REG)
   ctx.acc_num += 1
@@ -241,7 +255,11 @@ def reduce_ranges_to_acc(ctx:ReduceContext, r:UOp):
   acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
   acc_initted = acc.after(acc_init, *r.src[1:])
   inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
-  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:]).rtag("mergeable")
+  # GATED_REDUCE: a sum of where(g, t, 0) with g the same for every lane (a data-dependent mask: BEVFormer's per-(camera, query)
+  # visibility) accumulates t under g -- a gated store, an IF after linearizing, and sink_into_ifs moves t's computation into it
+  if r.arg[0] is Ops.ADD and getenv("GATED_REDUCE", 1) and (gt:=_uniform_gate(inp)) is not None:
+    acc_out = acc_initted.store(acc_initted.alu(r.arg[0], gt[1]), gt[0]).end(*r.src[1:]).rtag("mergeable")
+  else: acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:]).rtag("mergeable")
   return acc.after(acc_out)
 
 def expand_horizontal_reduce(r:UOp):
@@ -263,7 +281,8 @@ def maybe_load(u:UOp): return u.load() if u.addrspace in (AddrSpace.GLOBAL, Addr
 pm_add_loads = PatternMatcher([
   (UPat(GroupOp.Elementwise|{Ops.REDUCE,Ops.WMMA,Ops.STACK}, name="x"),
    lambda x: None if is_shape_changing_bitcast(x) else x.replace(src=tuple(map(maybe_load, x.src)))),
-  (UPat(Ops.STORE, name="x"), lambda x: x.replace(src=(x.src[0], maybe_load(x.src[1]))+x.src[2:])),
+  # (a gated store's gate too: GATED_REDUCE's gate can be a bool buffer read directly)
+  (UPat(Ops.STORE, name="x"), lambda x: x.replace(src=(x.src[0], maybe_load(x.src[1]))+tuple(map(maybe_load, x.src[2:])))),
 ])
 
 def add_local_buffer(ctx, x:UOp):
@@ -443,9 +462,67 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
     newlst.extend(ret[1])
   return newlst
 
+_SINKABLE = GroupOp.ALU | {Ops.LOAD, Ops.CAST, Ops.BITCAST, Ops.INDEX, Ops.STACK, Ops.SHRINK, Ops.CUSTOMI}
+def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
+  """move the values only an IF block uses into it: from the IF's own scope (after the innermost RANGE / IF still open at it), pure
+  ops and loads -- a load only when no store lies between it and the IF. The IF of a gated store (GATED_REDUCE) then skips its
+  value's whole computation, not just the store"""
+  # adjacent blocks under the same gate become one (a gated vector store split into per-lane stores: one IF each)
+  merged, alias = [], {}
+  for u in lst:
+    if u.op is Ops.IF and merged and merged[-1].op is Ops.ENDIF and merged[-1].src[0].src[0] is u.src[0]:
+      alias[u] = merged.pop().src[0]
+      continue
+    merged.append(u)
+  if alias:
+    def opener(i:UOp) -> UOp:
+      while i in alias: i = alias[i]
+      return i
+    lst = [UOp(Ops.ENDIF, src=(opener(u.src[0]),)) if u.op is Ops.ENDIF else u for u in merged]
+  users: dict[UOp, list[UOp]] = {}
+  for u in lst:
+    for x in u.src: users.setdefault(x, []).append(u)
+  for _ in range(sum(u.op is Ops.IF for u in lst)):
+    out, moved_any = list(lst), False
+    for i in range(len(out) - 1, -1, -1):
+      if out[i].op is not Ops.IF: continue
+      j, depth = i + 1, 0
+      while j < len(out) and not (out[j].op is Ops.ENDIF and depth == 0):
+        depth += out[j].op in (Ops.IF, Ops.RANGE)
+        depth -= out[j].op in (Ops.ENDIF, Ops.END)
+        j += 1
+      # the IF's scope begins after the innermost block still open at i
+      s, depth = i - 1, 0
+      while s >= 0:
+        if out[s].op in (Ops.END, Ops.ENDIF): depth += 1
+        elif out[s].op in (Ops.RANGE, Ops.IF):
+          if depth == 0: break
+          depth -= 1
+        s -= 1
+      inside = set(out[i + 1:j])
+      move: list[int] = []
+      store_after = False
+      for k in range(i - 1, s, -1):
+        u = out[k]
+        if u.op is Ops.STORE: store_after = True
+        if u.op not in _SINKABLE or (u.op is Ops.LOAD and store_after) or not users.get(u): continue
+        if all(x in inside for x in users[u]):
+          move.append(k)
+          inside.add(u)
+      if move:
+        mv = [out[k] for k in sorted(move)]
+        rest = [u for k, u in enumerate(out[:i + 1]) if k not in set(move)]
+        out = rest + mv + out[i + 1:]
+        moved_any = True
+        break
+    lst = out
+    if not moved_any: break
+  return lst
+
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
   lst = line_rewrite(linearize(sink), pm_linearize_cleanups)
+  if getenv("GATED_REDUCE", 1) and any(u.op is Ops.IF for u in lst): lst = sink_into_ifs(lst)
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
     if ctx.pre_regalloc_matcher is not None: lst = line_rewrite(lst, ctx.pre_regalloc_matcher, PreRegAllocContext())

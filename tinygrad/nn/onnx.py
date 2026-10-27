@@ -1806,6 +1806,20 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
     refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
     wh = Tensor([float(W), float(H)], dtype=value.dtype)
+    if vis is not None and getenv("MSDA_GATED", 1):
+      # with a visibility mask: every map in one GridSample (maps x heads as its batch) and each point's term as
+      # where(visible, term, 0), summed over maps and points -- the gate depends on (map, query) only, so the code generator
+      # makes the accumulate conditional and moves the term's whole computation (location, taps, weights) into it
+      # (codegen GATED_REDUCE). BEVFormer's cameras see 19% of the (camera, query) pairs
+      offv = off.permute(2, 0, 1, 3, 4) if NO > 1 else off[:, :, 0].reshape(1, Q, M, P, 2)                      # (NV|1, Q, M, P, 2)
+      loc = refp.reshape(NVR, Q, 1, P, 2) + offv / wh                                                            # (NV, Q, M, P, 2)
+      loc = loc.expand(NV, Q, M, P, 2)
+      X = value.reshape(NV, H * W, M, D).permute(0, 2, 3, 1).reshape(NV * M, D, H, W)
+      s = GridSample(X, (2 * loc - 1).permute(0, 2, 1, 3, 4).reshape(NV * M, Q, P, 2)).reshape(NV, M, D, Q, P)
+      a = (attw.permute(2, 1, 0, 3) if NO > 1 else attw[:, :, 0].permute(1, 0, 2).reshape(1, M, Q, P)).reshape(-1, M, 1, Q, P)
+      g = (vis != 0).reshape(NV, 1, 1, Q, 1)
+      tot = g.where(s * a, 0.0).sum((0, 4))                                                                      # (M, D, Q)
+      return tot.reshape(C, Q).T / vis.cast(value.dtype).sum(0).maximum(1.0).reshape(Q, 1)
     maps = []
     for v in range(NV):
       loc = refp[v if NVR > 1 else 0].reshape(Q, 1, P, 2) + off[:, :, v if NO > 1 else 0] / wh                 # (Q, M, P, 2)
