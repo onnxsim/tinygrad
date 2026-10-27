@@ -556,16 +556,16 @@ def _l2_plan(uops:list[UOp]) -> dict[UOp, list[tuple]]:
     elif u.op is Ops.ENDIF: ifs -= 1
     elif ((u.op is Ops.LOAD and len(u.src) == 1) or (u.op is Ops.STORE and getenv("HVX_L2STREAM_ST", 0))) and \
          (b:=u.src[0]).addrspace is AddrSpace.GLOBAL and ((b.op is Ops.INDEX and len(b.src) == 2) or (b.op is Ops.SHRINK and len(b.src) == 3)):
-      # an ungated scalar / vector load
+      # an ungated scalar / vector load. HVX_L2STREAM_ST=1: stores too (a box of the output lines before they are written: slower,
+      # enc3's E_625_2_4_128 63 -> 90 us per call on the V69, enc3 38.3 -> 39.4 ms)
       v = u if u.op is Ops.LOAD else u.src[1]
       if ifs or _gathered(b) or b.src[0].op is not Ops.PARAM or v.max_numel() * v.dtype.itemsize < getenv("HVX_L2STREAM_MINB", 1): continue
       enclosing[u] = list(open_)
       groups.setdefault(b.src[0], []).append(u)
   # one box in flight per thread (a second l2fetch replaces it): the stream that reads the most bytes, if that is 4 KB or more
   # (a bias row re-read per output row stays in L2 anyway)
-  tgt, written = _l2stream_kb() * 1024, {u.src[0].src[0] for u in uops if u.op is Ops.STORE and u.src[0].op in (Ops.INDEX, Ops.SHRINK)}
+  tgt = _l2stream_kb() * 1024
   st = [x for p, loads in groups.items() if (x:=_l2_stream(p, loads, enclosing, tgt)) is not None and x[1][-1] >= 4096]
-  if getenv("HVX_L2STREAM_ST", 0) == 2 and any(x[1][0] in written for x in st): st = [x for x in st if x[1][0] in written]
   return {(b:=max(st, key=lambda x: x[1][-1]))[0]: [b[1]]} if st else {}
 
 def _l2_stream(p:UOp, loads:list[UOp], enclosing:dict, target:int):
@@ -605,7 +605,8 @@ def _l2_stream(p:UOp, loads:list[UOp], enclosing:dict, target:int):
     if any(_l2_eval(idxs[0], {**z, L: k}, {}) * isz != k * step + _l2_eval(idxs[0], z, {}) * isz for k in range(n)): return found
     # a contiguous stream of whole vectors is left to their dcfetches (HVX_PREFETCH bytes ahead): boxes of it were slower (the
     # decoder's fp32 -> fp16 casts E_450_4_128 43 -> 53 us per call on the V69, KB=16); HVX_L2STREAM_SEQ=1 boxes it anyway
-    if h == 1 and step == w and min(nbs) >= 128 and HVX_PREFETCH > 0 and not getenv("HVX_L2STREAM_SEQ", 0): return found
+    if h == 1 and step == w and min(nbs) >= 128 and HVX_PREFETCH > 0 and not getenv("HVX_L2STREAM_SEQ", 0) and loads[0].op is Ops.LOAD:
+      return found
     if h == 1 and step >= w: form = "rows"
     elif h > 1 and step == w: form = "cols"
     else: continue  # the next loop out may move the whole footprint as one box
