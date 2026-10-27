@@ -129,6 +129,11 @@ pm_wmma_add = PatternMatcher([
   (UPat(Ops.WMMA, name="wmma") + UPat.var("add"),
    lambda add, wmma: UOp(wmma.op, src=(wmma.src[0], wmma.src[1], wmma.src[2]+add), arg=wmma.arg)),
   # push permute/reshape to the other side of the add
+  # (a bare reshape too: a v65 vrmpy tensor core's 32 lanes reshaped to the output axes were added to the loop accumulator outside
+  # the WMMA, so every K step zeroed a register, ran the vrmpy from zero and added it back, instead of one accumulating vrmpy)
+  (UPat(Ops.RESHAPE, src=(UPat(Ops.WMMA, name="wmma"), UPat()), name="reshape") + UPat.var("add"),
+    lambda wmma,reshape,add: (wmma + add.reshape(wmma.shape)).reshape(reshape.shape)
+      if wmma.arg[0] == (32, 1, 4) and add.shape == reshape.shape else None),
   (UPat(Ops.PERMUTE, src=(UPat(Ops.WMMA, name="wmma"),), name="permute") + UPat.var("add"),
     lambda wmma,permute,add: (wmma + add.permute(argsort(permute.arg))).permute(permute.arg)),
   (UPat(Ops.PERMUTE, src=(UPat(Ops.RESHAPE, src=(UPat(Ops.WMMA, name="wmma"), UPat()), name="reshape"),), name="permute") + UPat.var("add"),

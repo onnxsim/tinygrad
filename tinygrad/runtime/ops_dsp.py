@@ -4,7 +4,7 @@ assert sys.platform != 'win32'
 from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF, CompileError
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp, GroupOp, AxisType
-from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod
+from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap, prod, ContextVar
 from tinygrad.renderer.cstyle import ClangRenderer, wmma_args, _wmma_name
 from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
@@ -26,6 +26,12 @@ HVX_QFLOAT = int(getenv("HVX_QFLOAT", int(int(HVX_ARCH.lstrip("v")) >= 68)))  # 
 # HMX_RQ_FAST=1: the int8 requant keeps only the fast fixed-point path and drops the exact redo of flagged tiles (|acc| > 2^24,
 # where the fast path is not ORT-exact). Approximate, like the hand/QNN requant; faster on layers whose accumulators are large.
 HMX_RQ_FAST = int(getenv("HMX_RQ_FAST", 0))
+DSP_THREADS = getenv("DSP_THREADS", 0)
+# DSP_V65_HW=1 targets real v65 hardware (the SDM845 cDSP): HVX there is integer-only, so no float vectors, upcasts of at
+# most one 128-byte register, and half emulated in float32 (see supported_dtypes). Opt-in: the default v65 render keeps the
+# v68-style float vector forms the render tests check
+DSP_V65_HW = ContextVar("DSP_V65_HW", 0)
+def _v65_hw() -> bool: return not HVX_QFLOAT and bool(DSP_V65_HW.value)
 
 # ***** qfloat lowering (v68+) *****
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
@@ -38,9 +44,32 @@ def _computed(u:UOp) -> bool:
   while u.op in (Ops.STACK, Ops.CAST, Ops.BITCAST) and len(u.src) >= 1 and all(s is u.src[0] for s in u.src): u = u.src[0]
   return u.op in GroupOp.ALU
 
+def _hvx_chunkable(n:int) -> bool: return n % 32 == 0 or 16 <= n <= 128
+def _hvx_chunked(n:int, call, args:list[str]) -> str:
+  """call(*chunks) applied per 32-lane HVX register of n-lane vectors args -> an n-lane expression, all in registers. n not a
+  multiple of 32 (an odd-width upcast like 100 lanes, see heuristic HVX_UPCAST_ODD) is widened to 64 or 128 lanes by repeating
+  valid lanes, and the result shuffled back down to n."""
+  m = n if n % 32 == 0 else 32 if n <= 32 else 64 if n <= 64 else 128
+  def chunk(a:str, i:int) -> str:
+    if m == n == 32: return a
+    return f"__builtin_shufflevector({a}, {a}, {','.join(str(j if j < n else j % n) for j in range(32*i, 32*i+32))})"
+  parts = [call(*[chunk(a, i) for a in args]) for i in range(m // 32)]
+  while len(parts) > 1:  # concatenate registers pairwise back up to m lanes
+    w = 32 * (m // 32 // len(parts))
+    parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {','.join(map(str, range(2*w)))})" for j in range(0, len(parts), 2)]
+  # narrowed back to n lanes through a temporary: naming parts[0] twice in the shuffle would evaluate it twice
+  return parts[0] if m == n else f"({{ __auto_type _w = {parts[0]}; __builtin_shufflevector(_w, _w, {','.join(map(str, range(n)))}); }})"
+
+def _hf_widened(u:UOp) -> bool:
+  # half widened to float: LLVM converts hf to qf32 and keeps it there, so a multiply by even a constant is qf32 x sf, never
+  # renormalized (MatMul -> Mul by a scalar -> head transpose, the scale fused into the fp16 product's cast back: cos 0.007 on
+  # the V69 phone, exact in hexagon-sim)
+  while u.op is Ops.STACK and len(u.src) >= 1 and all(s is u.src[0] for s in u.src): u = u.src[0]
+  return u.op is Ops.CAST and u.dtype == dtypes.float32 and u.src[0].dtype == dtypes.half
+
 def _qf_vec(x:UOp) -> bool:
   return HVX_QFLOAT and x.op is Ops.MUL and x.dtype == dtypes.float32 and x._shape is not None and \
-    (n:=x.max_numel()) >= 32 and n % 32 == 0 and all(_computed(s) for s in x.src)
+    (n:=x.max_numel()) >= 16 and _hvx_chunkable(n) and (all(_computed(s) for s in x.src) or any(_hf_widened(s) for s in x.src))
 
 def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
   widths = sorted({x.max_numel() for x in uops if _qf_vec(x)})
@@ -49,15 +78,9 @@ def _qf_helpers(uops:list[UOp], vec_type) -> list[str]:
   # (going through `((__hvx_v*)&a)[i]` instead forces a stack round trip per register -- measured 10x slower)
   out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
          "static inline __hvx_f __hvx_mulsf(__hvx_f a, __hvx_f b) { __asm__(\"\" : \"+v\"(a)); __asm__(\"\" : \"+v\"(b)); return a*b; }"]
-  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
   for n in widths:
-    t, k = vec_type(n), n // 32
-    parts = [f"__hvx_mulsf({'a' if k == 1 else f'__builtin_shufflevector(a, a, {lanes(32*i, 32)})'}, "
-             f"{'b' if k == 1 else f'__builtin_shufflevector(b, b, {lanes(32*i, 32)})'})" for i in range(k)]
-    while len(parts) > 1:  # concatenate registers pairwise back up to n lanes
-      w = 32 * (k // len(parts))
-      parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
-    out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){parts[0]}; }}")
+    t = vec_type(n)
+    out.append(f"static inline {t} __hvx_mul_f{n}({t} a, {t} b) {{ return ({t}){_hvx_chunked(n, lambda a, b: f'__hvx_mulsf({a}, {b})', ['a', 'b'])}; }}")
   return out
 
 # ***** qfloat exp2 / reciprocal (v68+) *****
@@ -74,7 +97,7 @@ _QF_EXP2_C = [1.53592089e-4, 1.33926270e-3, 9.61838476e-3, 5.55034727e-2, 2.4022
 def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
   widths = sorted({u.max_numel() for u in uops if _hf_exp2_src(u) is not None})
   if not widths: return []
-  out = [_HF_EXP2]
+  out = [_HF_EXP2_QF16 if HVX_HF_EXP2 == 1 else _HF_EXP2]
   for n in widths:
     t, k = vtype(dtypes.half, n), n // 64
     lanes = [",".join(str(i) for i in range(64*j, 64*j+64)) for j in range(k)]
@@ -84,6 +107,11 @@ def _hf_exp2_helpers(uops:list[UOp], vtype) -> list[str]:
       parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {','.join(str(i) for i in range(2*w))})" for j in range(0, len(parts), 2)]
     out.append(f"static inline {t} __tg_exp2_h{n}({t} x) {{ return ({t}){parts[0]}; }}")
   return out
+
+def _gathered(bidx:UOp) -> bool:
+  # an address computed from a loaded value (a gather): a prefetch a fixed distance past it fetches an unrelated line (MSDA's
+  # tap rows, 128 bytes each, scattered over the value maps: twice the DDR traffic)
+  return any(u.op is Ops.LOAD for s in bidx.src[1:] for u in s.backward_slice)
 
 def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
   if not QF_MATH: return []
@@ -118,7 +146,6 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
          "static inline float __tg_sqrt_s(float x) {"
          " int b; __builtin_memcpy(&b, &x, 4); b = 0x5F3759DF - (b >> 1); float y; __builtin_memcpy(&y, &b, 4);"
          " for (int k = 0; k < 3; k++) y = y * (1.5f - 0.5f * x * y * y); return x * y; }"]
-  def lanes(lo:int, n:int) -> str: return ",".join(str(i) for i in range(lo, lo+n))
   for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL), ("sqrt", Ops.SQRT)):
     widths = sorted({n for o, n in uses if o is op})
     if not widths: continue
@@ -128,13 +155,8 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
         assoc.append(f"float: __tg_{name}_s")
         continue
       t = vtype(dtypes.float32, n)
-      if n % 32 == 0:  # whole HVX registers, split / rebuilt with shufflevector (in registers)
-        k = n // 32
-        parts = [f"__tg_{name}_v({'x' if k == 1 else f'__builtin_shufflevector(x, x, {lanes(32*i, 32)})'})" for i in range(k)]
-        while len(parts) > 1:
-          w = 32 * (k // len(parts))
-          parts = [f"__builtin_shufflevector({parts[j]}, {parts[j+1]}, {lanes(0, 2*w)})" for j in range(0, len(parts), 2)]
-        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ return ({t}){parts[0]}; }}")
+      if _hvx_chunkable(n):  # whole HVX registers (an odd width padded to 64 / 128 lanes), split / rebuilt in registers
+        out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ return ({t}){_hvx_chunked(n, lambda c: f'__tg_{name}_v({c})', ['x'])}; }}")
       else:  # other widths: per lane (scalar helper)
         out.append(f"static inline {t} __tg_{name}_f{n}({t} x) {{ {t} y; for (int i = 0; i < {n}; i++) y[i] = __tg_{name}_s(x[i]); return y; }}")
       assoc.append(f"{t}: __tg_{name}_f{n}")
@@ -183,6 +205,31 @@ static inline __hvx_h __tg_exp2_h(__hvx_h x) {
   return __builtin_bit_cast(__hvx_h, b);
 }"""
 
+# the same exp2 with the polynomial kept in qf16 (HVX_HF_EXP2=1; 2: the helper above): each step a qf16 multiply-add on a qf16
+# operand, converted to hf once at the end, and the clamp folded into the range masks -- the hand attention softmax's form
+# (test/external/dsp/hand/attn/attn_softmax.h). Converted to hf after every op it took twice the instructions: BEVFormer's
+# per-head exp over 960 x 960 fp16 scores, 0.29 ms on the V69
+_HF_EXP2_QF16 = r"""#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+typedef __fp16 __hvx_h __attribute__((ext_vector_type(64)));
+static inline HVX_Vector __tg_hsplat(float f) { union { __fp16 h; short s; } u; u.h = (__fp16)f; return Q6_Vh_vsplat_R(u.s); }
+static inline __hvx_h __tg_exp2_h(__hvx_h xh) {
+  const HVX_Vector x = __builtin_bit_cast(HVX_Vector, xh), lo = __tg_hsplat(-14.f), hi = __tg_hsplat(15.99f), sixteen = __tg_hsplat(16.f),
+                   magic = Q6_Vh_vsplat_R(0x6600), inf = Q6_Vh_vsplat_R(0x7C00), zero = Q6_V_vzero();
+  HVX_Vector xc = Q6_Vhf_vmin_VhfVhf(Q6_Vhf_vmax_VhfVhf(x, lo), hi);
+  HVX_Vector r = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(xc, magic));
+  HVX_Vector n = Q6_Vh_vsub_VhVh(r, magic);
+  HVX_Vector g = Q6_Vqf16_vsub_Vqf16Vhf(Q6_Vqf16_vsub_VhfVhf(r, magic), xc);
+  HVX_Vector p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vhf(g, __tg_hsplat(0.00961813f)), __tg_hsplat(-0.0555041f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(0.2402265f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(-0.6931472f));
+  p = Q6_Vqf16_vadd_Vqf16Vhf(Q6_Vqf16_vmpy_Vqf16Vqf16(p, g), __tg_hsplat(1.f));
+  HVX_Vector e = Q6_Vh_vadd_VhVh(Q6_Vhf_equals_Vqf16(p), Q6_Vh_vasl_VhR(n, 10));
+  e = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(lo, x), zero, e);
+  e = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(sixteen, x), e, inf);
+  return __builtin_bit_cast(__hvx_h, e);
+}"""
+
 def _hf_div(u:UOp) -> bool:
   # a vector half division (QF_MATH): a * (1 / b), the reciprocal through the float helper -- clang scalarizes a vector hf
   # division (GELU's x / (1 + 2^t): 190 ms instead of ~4). At render time: as a rewrite, the late decompositions turn it back
@@ -213,6 +260,108 @@ def _lane_slice(x:UOp) -> tuple[UOp, list[int]]|None:
   if not all(isinstance(l, int) for l in lanes) or lanes != list(range(lanes[0], lanes[0]+len(lanes))): return None
   return v, lanes
 
+def _lane_gather(srcs:tuple[UOp, ...]) -> tuple[list[UOp], list[int]]|None:
+  # STACK of constant lanes of up to 8 equal-width vectors (a per-group value repeated over the group's lanes, lane i -> i // 4;
+  # element k of 32 groups of 4 loaded as four 32-lane vectors) -> (the vectors, lanes into their concatenation): rendered as
+  # __builtin_shufflevector (pairs concatenated first), which clang lowers to HVX permutes, instead of a lane constructor
+  if len(srcs) < 2 or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in srcs): return None
+  # (one lane repeated is a splat: _splat_of_loaded_lane reloads it as a scalar for one vsplat)
+  if all(s is srcs[0] for s in srcs): return None
+  vs: list[UOp] = []
+  for s in srcs:
+    if s.src[0] not in vs: vs.append(s.src[0])
+  w = vs[0]._shape
+  if len(vs) > 8 or w is None or len(w) != 1 or any(v._shape != w for v in vs): return None
+  lanes = [_lane(s.src[1]) for s in srcs]
+  if not all(isinstance(l, int) for l in lanes): return None
+  return vs, [vs.index(s.src[0]) * w[0] + l for s, l in zip(srcs, lanes)]
+
+HVX_TRANSPOSE_NET = getenv("HVX_TRANSPOSE_NET", 1)
+def _transpose_col(x:UOp) -> tuple[list[UOp], int]|None:
+  # STACK(v_0[i], v_1[i], ..., v_{n-1}[i]) of n distinct n-lane vectors (n a power of two, >= 8): column i of the n x n block
+  # whose rows are the v_j -- what a transposing copy's stores are once both its axes are upcast (heuristic HVX_TRANSPOSE)
+  n = len(x.src)
+  if n < 8 or n & (n - 1) or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in x.src): return None
+  vs = [s.src[0] for s in x.src]
+  lanes = {_lane(s.src[1]) for s in x.src}
+  if len(lanes) != 1 or None in lanes or len(set(vs)) != n or any(v._shape != (n,) for v in vs): return None
+  return vs, lanes.pop()
+
+def _transpose_helper(t:str, n:int) -> str:
+  # the n x n transpose of rows r0..r{n-1} into o[0..n-1]: log2(n) butterfly stages of two shuffles per row pair (rows r, r+b:
+  # swap r's columns with bit b set and r+b's with it clear). A barrier per stage: without it LLVM folds each output's chain of
+  # shuffles back into one wide multi-source shuffle. Called once per block (_transpose_groups), its columns read from o
+  lines = [f"static inline void __tr{n}_{_c_ident(t)}({t}* o, {', '.join(f'{t} r{j}' for j in range(n))}) {{"]
+  b = n // 2
+  while b:
+    lo = ",".join(str(c if not c & b else n + c - b) for c in range(n))
+    hi = ",".join(str(c + b if not c & b else n + c) for c in range(n))
+    for r in range(n):
+      if r & b: continue
+      lines.append(f"  {{ {t} a = r{r}, c = r{r + b}; r{r} = __builtin_shufflevector(a, c, {lo}); r{r + b} = __builtin_shufflevector(a, c, {hi}); }}")
+    lines.append("  " + " ".join(f'__asm__("" : "+v"(r{j}));' for j in range(n)))
+    b //= 2
+  lines.append("  " + " ".join(f"o[{j}] = r{j};" for j in range(n)))
+  return "\n".join(lines + ["}"])
+
+def _c_ident(t:str) -> str: return re.sub(r"\W", "_", t)
+
+def _transpose_groups(ren, uops:list[UOp]) -> list[UOp]:
+  """the column STACKs of each block (_transpose_col, whole 128-byte rows): one statement computing the block's transpose into a
+  local array, inserted before its first column, and every column rendered as an element of it (ren._tr_cols)"""
+  ren._tr_cols, ren._tr_types = {}, set()
+  if not HVX_TRANSPOSE_NET: return uops
+  groups: dict[tuple, list[tuple[int, UOp, int]]] = {}
+  for p, u in enumerate(uops):
+    if u.op is Ops.STACK and (g := _transpose_col(u)) is not None and len(g[0]) * u.dtype.itemsize == 128:
+      groups.setdefault(tuple(g[0]), []).append((p, u, g[1]))
+  inserts: dict[int, UOp] = {}
+  for gid, (vs, cols) in enumerate(groups.items()):
+    if len(cols) < 2: continue
+    n, t = len(vs), ren._render_dtype(cols[0][1].dtype, len(vs), AddrSpace.REG)
+    ren._tr_types.add((t, n))
+    inserts[min(p for p, _, _ in cols)] = UOp(Ops.CUSTOM, dtypes.void, tuple(vs),
+      f"{t} _tr{gid}[{n}]; __tr{n}_{_c_ident(t)}(_tr{gid}, " + ", ".join(f"{{{j}}}" for j in range(n)) + ");")
+    for _, u, i in cols: ren._tr_cols[u] = f"_tr{gid}[{i}]"
+  return [x for p, u in enumerate(uops) for x in ((inserts[p], u) if p in inserts else (u,))]
+
+def _render_transpose_col(ctx, x:UOp) -> str|None: return getattr(ctx, "_tr_cols", {}).get(x)
+
+def _render_lane_gather(ctx, x:UOp) -> str|None:
+  if not HVX_LANE_GATHER or (g:=_lane_gather(x.src)) is None: return None
+  vs, lanes = g
+  w = vs[0]._shape[0]
+  def cat(a:str, b:str, n:int) -> str: return f"__builtin_shufflevector({a}, {b}, {','.join(map(str, range(2 * n)))})"
+  # concatenate pairwise (an odd one out paired with itself) down to the two operands of the final shuffle
+  srcs = [ctx[v] for v in vs]
+  while len(srcs) > 2:
+    srcs = [cat(srcs[i], srcs[i + 1] if i + 1 < len(srcs) else srcs[i], w) for i in range(0, len(srcs), 2)]
+    w *= 2
+  a, b = (srcs[0], srcs[0]) if len(srcs) == 1 else srcs
+  return f"(({ctx.render_type(x)})__builtin_shufflevector({a}, {b}, {','.join(map(str, lanes))}))"
+
+def _lane_concat(x:UOp) -> list[UOp]|None:
+  # STACK(a[0..n-1], b[0..n-1], ...) of whole equal-width vectors one after another (memory_coalescing loads a 128-lane int32 row as
+  # two 64-lane vectors) -> [a, b, ...]
+  n = len(x.src)
+  if n < 4 or any(s.op is not Ops.INDEX or len(s.src) != 2 for s in x.src): return None
+  vs, w = [], x.src[0].src[0]._shape
+  if w is None or len(w) != 1 or n % w[0] != 0 or (n // w[0]) & (n // w[0] - 1) or n // w[0] < 2: return None
+  for i in range(n // w[0]):
+    chunk = x.src[i*w[0]:(i+1)*w[0]]
+    if any(s.src[0] is not chunk[0].src[0] for s in chunk) or chunk[0].src[0]._shape != w: return None
+    if [_lane(s.src[1]) for s in chunk] != list(range(w[0])): return None
+    vs.append(chunk[0].src[0])
+  return vs
+
+def _render_lane_concat(ctx, x:UOp) -> str|None:
+  if (vs:=_lane_concat(x)) is None: return None
+  parts, w = [ctx[v] for v in vs], vs[0]._shape[0]
+  while len(parts) > 1:  # pairwise: shufflevector takes two vectors of the same width
+    parts = [f"__builtin_shufflevector({parts[i]}, {parts[i+1]}, {','.join(str(l) for l in range(2*w))})" for i in range(0, len(parts), 2)]
+    w *= 2
+  return f"(({ctx.render_type(x)}){parts[0]})"
+
 # NOTE: this just increases readability of the generated code
 def _lane_window(ctx, x:UOp) -> str|None:
   # a window of a loaded vector (an HMX epilogue's 32-lane rows of the 128-lane accumulator-array vectors): read it again from
@@ -220,6 +369,29 @@ def _lane_window(ctx, x:UOp) -> str|None:
   # (vinsert, ~6x the packets); a vector load of the window is one vmem(u). Only if nothing stores to that buffer in between
   if (sl:=_lane_slice(x)) is None or not _loaded_unchanged(ctx, v:=sl[0], x): return None
   return f"(*(({ctx.render_type(x)}*)(({ctx.render_dtype(x.src[0].dtype)}*){ctx[v.src[0]]}+{sl[1][0]})))"
+
+def _lane_join(ctx, x:UOp) -> str|None:
+  # STACK of consecutive elements of memory that came in as several narrower loads of one buffer (a 128-lane u16 load split into two
+  # 64-lane halves, say), each element a lane of one of them: as a per-lane constructor of scalar reloads, clang builds the wide
+  # vector one word at a time (vinsert; 256 scalar loads for 128 u16 lanes). One unaligned wide load of the same memory instead
+  # (only if nothing stores to that buffer in between). DSP_V65_LANE_JOIN=0 turns it off
+  if not _v65_hw() or not getenv("DSP_V65_LANE_JOIN", 1) or len(x.src) < 2: return None
+  if not all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0].op is Ops.LOAD and len(s.src[0].src) == 1 for s in x.src): return None
+  loads = list(dict.fromkeys(s.src[0] for s in x.src))
+  # each load's address is SHRINK(buffer, start, size): the same buffer, starts a constant apart
+  if len(loads) < 2 or any(v.src[0].op is not Ops.SHRINK or len(v.src[0].src) != 3 or v.src[0].src[0] is not loads[0].src[0].src[0]
+                           for v in loads): return None
+  offs = {}
+  for v in loads:
+    d = (v.src[0].src[1] - loads[0].src[0].src[1]).simplify()
+    if d.op is not Ops.CONST: return None
+    offs[v] = int(d.arg)
+  lanes = [_lane(s.src[1]) for s in x.src]
+  if any(l is None for l in lanes): return None
+  pos = [offs[s.src[0]] + l for s, l in zip(x.src, lanes)]
+  if pos != list(range(pos[0], pos[0] + len(pos))) or not all(_loaded_unchanged(ctx, v, x) for v in loads): return None
+  first = x.src[0].src[0]
+  return f"(*(({ctx.render_type(x)}_u*)(({ctx.render_dtype(x.src[0].dtype)}*){ctx[first.src[0]]}+{lanes[0]})))"
 
 def _inline_vector_load(ctx, u:UOp) -> bool:
   # a vector load used once, later in the same loop body, with no store to its buffer in between: render it at the use. Loads
@@ -242,6 +414,13 @@ def _splat_of_loaded_lane(ctx, x:UOp) -> str|None:
   if not _loaded_unchanged(ctx, v:=s.src[0], x): return None
   return f"(({ctx.render_type(x)})((({ctx.render_dtype(s.dtype)}*){ctx[v.src[0]]})[{lane}]))"
 
+def _lane_of_loaded(ctx, x:UOp) -> str|None:
+  # v65 (DSP_V65_HW): one scalar lane of a loaded vector, used on its own (a table index, say), is a scalar reload from memory:
+  # extracting lanes of an HVX register one by one costs far more than the scalar loads it saves
+  if not _v65_hw() or len(x.src) != 2 or x._shape != () or x.src[0].max_numel() <= 1 or (lane:=_lane(x.src[1])) is None: return None
+  if not _loaded_unchanged(ctx, v:=x.src[0], x): return None
+  return f"((({ctx.render_dtype(x.dtype)}*){ctx[v.src[0]]})[{lane}])"
+
 def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
   if HVX_PREFETCH_STRIDES <= 0 or len(bidx.src) < 2 or not (pos:=getattr(ctx, "_pos", None)): return HVX_PREFETCH
   idx = bidx.src[1]
@@ -253,6 +432,16 @@ def _prefetch_distance(ctx, bidx:UOp, itemsize:int) -> int:
   if d.op is not Ops.CONST: return HVX_PREFETCH
   step = int(d.arg) * itemsize
   return HVX_PREFETCH_STRIDES * step if step > 256 else HVX_PREFETCH
+
+# a sub-line load (scalar float code on v65: a float4 of 4 pixels) that walks a reduction at a large stride (a 1x1 conv over
+# NCHW channels) misses on every step, and the vector-load prefetch above skips it for being under a line. One dcfetch
+# HVX_PREFETCH_STRIDES steps ahead per load hides that. Read through a function: pattern functions snapshot module globals
+def _subline_prefetch_on() -> bool: return bool(getenv("HVX_PREFETCH_SUBLINE", 1))
+def _subline_prefetch(ctx, bidx:UOp, x:UOp) -> str|None:
+  nbytes = x.max_numel()*x.dtype.itemsize
+  if not _subline_prefetch_on() or HVX_PREFETCH_STRIDES <= 0 or nbytes >= 64 or bidx.addrspace is not AddrSpace.GLOBAL: return None
+  if (dist:=_prefetch_distance(ctx, bidx, x.dtype.itemsize)) == HVX_PREFETCH: return None  # not a strided reduction walk
+  return f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{dist}), {ctx.render_access(bidx)})"
 
 def _vec_fmax(ctx, x:UOp) -> str|None:
   return f"__builtin_elementwise_max({ctx[x.src[0]]},{ctx[x.src[1]]})" if HVX_QFLOAT and x.max_numel() > 1 else None
@@ -283,6 +472,7 @@ def _interleave4_stack(ctx, x:UOp) -> str|None:
 # helpers (v68/v69 have no vector float <-> int convert, so LLVM scalarizes __builtin_convertvector / truncf per lane).
 # Small bool vectors stay scalar: LLVM's Hexagon backend can't select some of those ("v2i32 = bitcast (V2Q ...)").
 HVX_REVEC_CMP = getenv("HVX_REVEC_CMP", 0)
+HVX_SPLAT_WHERE = getenv("HVX_SPLAT_WHERE", 1)
 _CMP = {Ops.CMPLT: "<", Ops.CMPNE: "!=", Ops.CMPEQ: "=="}
 def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP)
 def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and n % 32 == 0
@@ -374,8 +564,12 @@ dsp_string = PatternMatcher([
   # shufflevector instead of a per-lane constructor; of a loaded vector, a narrower load of the same memory (_lane_window)
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _interleave4_stack(ctx, x) if getenv("DSP_INTERLEAVE", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_window(ctx, x)),
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _lane_join(ctx, x)),
+  (UPat(Ops.STACK, name="x"), lambda ctx,x: _render_lane_concat(ctx, x) if getenv("DSP_LANE_CONCAT", 1) else None),
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
+  (UPat(Ops.STACK, name="x"), _render_transpose_col),
+  (UPat(Ops.STACK, name="x"), _render_lane_gather),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
   # vector load): reload that element as a scalar (then one vsplat) -- the lane splat clang v19 builds with vinserts
   (UPat(Ops.STACK, name="x"), lambda ctx,x: _splat_of_loaded_lane(ctx, x)),
@@ -384,10 +578,12 @@ dsp_string = PatternMatcher([
    if len(x.src) > 1 and all(s is x.src[0] for s in x.src) and x.src[0]._shape == () else None),
   # vector casts must convert per lane; a C cast between ext_vector_types is a bitcast
   # under MOCKDSP, fp16 vector casts convert lane by lane through the scalar casts (the v65 backend miscompiles the vector
-  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op
+  # conversion, and the scalar ones are covered by __extendhfsf2/__truncsfhf2 in fp16_helpers); the device keeps the vector op,
+  # and so does a v68+ capture under MOCKDSP (traced for the device, never run by the mock): with the lane loop, a Gemm's fp16
+  # operand casts on the V69 took 16 ms per 655K values and wrote garbage
   (UPat(Ops.CAST, name="x"), lambda ctx,x: (lambda src, dst, n: f"({{ {ctx.render_type(x)} _r; __typeof__({ctx[x.src[0]]}) _s = {ctx[x.src[0]]}; "
      f"for (int _i = 0; _i < {n}; _i++) _r[_i] = ({ctx.render_dtype(x.dtype)})(_s[_i]); _r; }})")(None, None, x.max_numel())
-   if getenv("MOCKDSP") and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
+   if getenv("MOCKDSP") and not HVX_QFLOAT and x.max_numel() > 1 and (x.dtype == dtypes.half or x.src[0].dtype == dtypes.half) else None),
   (UPat(Ops.CAST, name="x"), lambda ctx,x: f"__builtin_convertvector({ctx[x.src[0]]}, {ctx.render_type(x)})"
    if x.max_numel() > 1 else None),
   # software-prefetch ahead of every vector load: streaming kernels on this DSP stall on DDR latency, not ALU. dcfetch is a
@@ -399,11 +595,180 @@ dsp_string = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    "(" + "".join(f"__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{_prefetch_distance(ctx, bidx, x.dtype.itemsize)+o}), "
                  for o in range(0, max(x.max_numel()*x.dtype.itemsize, 1), 128)) + f"{ctx.render_access(bidx)})"
-   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL else None),
+   if HVX_PREFETCH > 0 and x.max_numel()*x.dtype.itemsize >= 128 and bidx.addrspace is AddrSpace.GLOBAL and not _gathered(bidx) else None),
   (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), lambda ctx,bidx,x:
    f"(__builtin_HEXAGON_Y2_dcfetch((char*){ctx[bidx]}+{HVX_PREFETCH_HALF}), {ctx.render_access(bidx)})"
    if HVX_PREFETCH_HALF > 0 and x.max_numel()*x.dtype.itemsize == 64 and bidx.addrspace is AddrSpace.GLOBAL else None),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"), _subline_prefetch),
+  (UPat(Ops.INDEX, src=(UPat(Ops.LOAD), UPat()), name="x"), _lane_of_loaded),
 ])
+
+# onnxsim::MSDA (nn/onnx.py MSDA): the hand-written multi-scale deformable attention kernel, test/external/dsp/hand/msda/msda_kernel.h,
+# inlined as the kernel's prelude (its HVX body from v68 on, its scalar body below), plus one call that fills its argument
+# struct for the one-level, MSDA_REF_PIX case and runs this thread's slice of the queries
+_MSDA_CALL = """
+static void __msda_call(float* out, const float* value, const float* loc, const float* ref, const float* attw, const unsigned char* vis,
+                        int t, int nt, int NV, int S, int H, int W, int M, int D, int P, int Q, int NO, int NVR, int R) {
+  msda_args_t a;  /* every field set (no memset: the freestanding mock link has none); only level 0 is read with L = 1 */
+  a.NV = NV; a.L = 1; a.H[0] = H; a.W[0] = W; a.start[0] = 0; a.S = S; a.M = M; a.D = D; a.P = P; a.Q = Q; a.NO = NO;
+  a.mode = MSDA_REF_PIX; a.NVR = NVR; a.RL = 1; a.R = R; a.RD = 2; a.vdtype = MSDA_F32;
+  a.value = value; a.value_u8 = 0; a.vscale = 0; a.vzp = 0; a.loc = loc; a.ref = ref; a.attw = attw; a.vis = vis; a.out = out;
+  msda_run(&a, (int)((long)Q * t / nt), (int)((long)Q * (t + 1) / nt));
+}
+"""
+# the hand row copy of nn/onnx.py _rowcopy_dsp (the zero pad of GEMM_FP16's HMX operands): out (B, rows, cols) half = the top-left
+# of each of in's B (R, C) half matrices, zero-filled; this thread's slice of the B * rows output rows, by unaligned HVX loads and
+# stores (rows are only 2-byte aligned)
+_ROWCOPY = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+static void __rowcopy(void* out, const void* in, int t, int nt, int B, int R, int C, int rows, int cols) {
+  int total = B * rows, r0 = (int)((long)total * t / nt), r1 = (int)((long)total * (t + 1) / nt), n = C < cols ? C : cols;
+  for (int i = r0; i < r1; i++) {
+    int b = i / rows, r = i % rows, m = r < R ? n : 0, j = 0;
+    const __fp16* s = (const __fp16*)in + ((long)b * R + r) * C;
+    __fp16* d = (__fp16*)out + (long)i * cols;
+    for (; j + 64 <= m; j += 64) *(HVX_UVector*)(d + j) = *(const HVX_UVector*)(s + j);
+    for (; j < m; j++) d[j] = s[j];
+    for (; j + 64 <= cols; j += 64) *(HVX_UVector*)(d + j) = Q6_V_vzero();
+    for (; j < cols; j++) d[j] = 0;
+  }
+}
+"""
+# the hand fp16 softmax of nn/onnx.py _softmax_h16_dsp (attention probabilities between two GEMM_FP16 HMX products): out (B, R2, C2)
+# half, row r < M = softmax over in[b, r, :N] of in (B, R, C) half, zero past N and in rows from M; this thread's slice of the
+# B * R2 output rows. exp in hf (qf16 arithmetic), offset to 2^7 at the row max, lanes below 2^-13 zeroed; the row sum in qf32.
+# hexagon-sim, 2 x 70 x 900 rows of logits up to +-30: max abs error 1e-3 against fp32 on the same fp16 inputs
+_SOFTMAX_H16 = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#define __SM_H(q) Q6_Vhf_equals_Vqf16(q)
+static inline HVX_Vector __sm_hsplat(float f) { union { __fp16 h; short s; } u; u.h = (__fp16)f; return Q6_Vh_vsplat_R(u.s); }
+static void __softmax_h16(void* out, const void* in, int t, int nt, int B, int R, int C, int M, int N, int R2, int C2) {
+  const HVX_Vector lo = __sm_hsplat(-13.f), dmin = __sm_hsplat(-20.f), l2e = __sm_hsplat(1.44269504f), seven = __sm_hsplat(7.f),
+                   magic = Q6_Vh_vsplat_R(0x6600), c4 = __sm_hsplat(0.00961813f), c3 = __sm_hsplat(-0.0555041f),
+                   c2 = __sm_hsplat(0.2402265f), c1 = __sm_hsplat(-0.6931472f), c0 = __sm_hsplat(1.f), one = Q6_Vh_vsplat_R(0x3C00),
+                   k2m7 = __sm_hsplat(1.f / 128.f), zero = Q6_V_vzero();
+  HVX_Vector buf[32];  /* one row, N <= 2048 */
+  __attribute__((aligned(128))) float part[32];
+  unsigned short* bu = (unsigned short*)buf;
+  int total = B * R2, r0 = (int)((long)total * t / nt), r1 = (int)((long)total * (t + 1) / nt), nv = (N + 63) / 64;
+  for (int i = r0; i < r1; i++) {
+    int b = i / R2, r = i % R2, j = 0;
+    unsigned short* d = (unsigned short*)out + (long)i * C2;
+    if (r >= M) { for (; j < C2; j++) d[j] = 0; continue; }
+    const unsigned short* s = (const unsigned short*)in + ((long)b * R + r) * C;
+    for (; j + 64 <= N; j += 64) buf[j / 64] = *(const HVX_UVector*)(s + j);
+    for (; j < nv * 64; j++) bu[j] = j < N ? s[j] : 0xF753;  /* -30000: finite, so x - max stays finite in hf */
+    HVX_Vector m = buf[0];
+    for (int k = 1; k < nv; k++) m = Q6_Vhf_vmax_VhfVhf(m, buf[k]);
+    for (int sh = 64; sh >= 2; sh >>= 1) m = Q6_Vhf_vmax_VhfVhf(m, Q6_V_vror_VR(m, sh));
+    HVX_Vector a0 = zero, a1 = zero;
+    for (int k = 0; k < nv; k++) {
+      /* e = 2^((x - max) log2(e) + 7), lanes below 2^-13 zeroed (the pad lanes among them); 2^n by the 1536.0 magic number,
+         2^-g (g = n - t) by a degree-4 polynomial, as test/external/dsp/hand/mcc/mb_hvx.h's mbv_hexp2_n */
+      HVX_Vector x = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_vmax_VhfVhf(__SM_H(Q6_Vqf16_vsub_VhfVhf(buf[k], m)), dmin), l2e)), seven));
+      HVX_VectorPred keep = Q6_Q_vcmp_gt_VhfVhf(x, lo);
+      x = Q6_Vhf_vmax_VhfVhf(x, lo);
+      HVX_Vector rr = __SM_H(Q6_Vqf16_vadd_VhfVhf(x, magic)), n = Q6_Vh_vsub_VhVh(rr, magic);
+      HVX_Vector g = __SM_H(Q6_Vqf16_vsub_VhfVhf(__SM_H(Q6_Vqf16_vsub_VhfVhf(rr, magic)), x));
+      HVX_Vector p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(g, c4)), c3));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c2));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c1));
+      p = __SM_H(Q6_Vqf16_vadd_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(p, g)), c0));
+      HVX_Vector e = Q6_V_vmux_QVV(keep, Q6_Vh_vadd_VhVh(p, Q6_Vh_vasl_VhR(n, 10)), zero);
+      buf[k] = e;
+      HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(e, one);
+      a0 = Q6_Vqf32_vadd_Vqf32Vqf32(a0, Q6_V_lo_W(w)), a1 = Q6_Vqf32_vadd_Vqf32Vqf32(a1, Q6_V_hi_W(w));
+    }
+    *(HVX_Vector*)part = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1));
+    float sum = 0.f;
+    for (int k = 0; k < 32; k++) sum += part[k];
+    const HVX_Vector inv = __sm_hsplat(128.f / sum);  /* e <= 128 and sum >= 128: P = e * (128 / sum) / 128 stays normal */
+    for (int k = 0; k < nv; k++) buf[k] = __SM_H(Q6_Vqf16_vmpy_VhfVhf(__SM_H(Q6_Vqf16_vmpy_VhfVhf(buf[k], inv)), k2m7));
+    for (j = 0; j + 64 <= C2 && j < nv * 64; j += 64) *(HVX_UVector*)(d + j) = buf[j / 64];
+    for (; j < C2; j++) d[j] = j < nv * 64 ? bu[j] : 0;
+  }
+}
+"""
+# the hand softmax over small groups of nn/onnx.py _softmax_grp_dsp (deformable attention's weights over 4 / 8 sampling points):
+# generated, the group max and sum read the R floats of each group at stride R (scalar gathers on HVX) and the exp ran 8 lanes
+# wide, one lane at a time (BEVFormer's encoder layer: ~13 ms). hexagon-sim: max abs error 6e-6 against fp64
+_SOFTMAX_GRP = """
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+typedef float __sg_f __attribute__((ext_vector_type(32)));
+typedef int __sg_i __attribute__((ext_vector_type(32)));
+static inline __sg_f __sg_mul(__sg_f a, __sg_f b) { __asm__("" : "+v"(a)); __asm__("" : "+v"(b)); return a * b; }
+static inline __sg_f __sg_exp2(__sg_f x) {  /* ops_dsp.py's __tg_exp2_v */
+  x = __builtin_elementwise_max(x, (__sg_f)(-126.0f));
+  __sg_f r = x + 12582912.0f; __asm__("" : "+v"(r));
+  __sg_i n = __builtin_bit_cast(__sg_i, r) - 0x4B400000;
+  __sg_f f = x - (r - 12582912.0f), p = 0.000153592089f * f + 0.0013392627f;
+  p = __sg_mul(p, f) + 0.00961838476f; p = __sg_mul(p, f) + 0.0555034727f; p = __sg_mul(p, f) + 0.240226448f;
+  p = __sg_mul(p, f) + 0.693147182f; p = __sg_mul(p, f) + 1.0f; __asm__("" : "+v"(p));
+  return __builtin_bit_cast(__sg_f, __builtin_bit_cast(__sg_i, p) + (n << 23));
+}
+static inline __sg_f __sg_recip(__sg_f x) {
+  __sg_f y = __builtin_bit_cast(__sg_f, 0x7EF311C7 - __builtin_bit_cast(__sg_i, x));
+  for (int k = 0; k < 3; k++) y = __sg_mul(y, 2.0f - __sg_mul(x, y));
+  return y;
+}
+static inline float __sg_exp2_s(float x) {
+  x = x < -126.0f ? -126.0f : x;
+  float r = x + 12582912.0f; int n; __builtin_memcpy(&n, &r, 4); n -= 0x4B400000;
+  float f = x - (r - 12582912.0f), p = 0.000153592089f;
+  p = p * f + 0.0013392627f; p = p * f + 0.00961838476f; p = p * f + 0.0555034727f; p = p * f + 0.240226448f;
+  p = p * f + 0.693147182f; p = p * f + 1.0f;
+  int b; __builtin_memcpy(&b, &p, 4); b += n << 23; __builtin_memcpy(&p, &b, 4); return p;
+}
+/* out[g, :] = softmax(in[g, :]) for G groups of R = 2, 4 or 8 contiguous floats, this thread's slice of the blocks of 32 groups:
+   the block's R vectors dealt (vdeal, log2 R levels) so that vector j holds one element of every group, the softmax lane-wise
+   across them, shuffled back (vshuff). in / out 128-byte aligned; the groups past the last whole block scalar, on thread 0 */
+static void __softmax_grp(float* out, const float* in, int t, int nt, int G, int R) {
+  int nb = G / 32, b0 = (int)((long)nb * t / nt), b1 = (int)((long)nb * (t + 1) / nt), lv = R == 8 ? 3 : R == 4 ? 2 : 1;
+  for (int b = b0; b < b1; b++) {
+    HVX_Vector v[8], w[8];
+    for (int k = 0; k < R; k++) v[k] = ((const HVX_Vector*)(in + (long)b * 32 * R))[k];
+    for (int l = 0; l < lv; l++) {
+      for (int i = 0; i < R / 2; i++) {
+        HVX_VectorPair d = Q6_W_vdeal_VVR(v[2 * i + 1], v[2 * i], -4);
+        w[i] = Q6_V_lo_W(d), w[R / 2 + i] = Q6_V_hi_W(d);
+      }
+      for (int k = 0; k < R; k++) v[k] = w[k];
+    }
+    __sg_f m = (__sg_f)v[0];
+    for (int k = 1; k < R; k++) m = __builtin_elementwise_max(m, (__sg_f)v[k]);
+    __sg_f s = (__sg_f)(0.0f);
+    for (int k = 0; k < R; k++) { __sg_f e = __sg_exp2(__sg_mul((__sg_f)v[k] - m, (__sg_f)(1.44269504f))); v[k] = (HVX_Vector)e; s = s + e; }
+    __sg_f inv = __sg_recip(s);
+    for (int k = 0; k < R; k++) v[k] = (HVX_Vector)__sg_mul((__sg_f)v[k], inv);
+    for (int l = 0; l < lv; l++) {
+      for (int i = 0; i < R / 2; i++) {
+        HVX_VectorPair d = Q6_W_vshuff_VVR(v[R / 2 + i], v[i], -4);
+        w[2 * i] = Q6_V_lo_W(d), w[2 * i + 1] = Q6_V_hi_W(d);
+      }
+      for (int k = 0; k < R; k++) v[k] = w[k];
+    }
+    for (int k = 0; k < R; k++) ((HVX_Vector*)(out + (long)b * 32 * R))[k] = v[k];
+  }
+  if (t != 0) return;
+  for (int g = nb * 32; g < G; g++) {
+    const float* x = in + (long)g * R; float* y = out + (long)g * R, m = x[0], s = 0.f;
+    for (int k = 1; k < R; k++) m = x[k] > m ? x[k] : m;
+    for (int k = 0; k < R; k++) { y[k] = __sg_exp2_s((x[k] - m) * 1.44269504f); s += y[k]; }
+    for (int k = 0; k < R; k++) y[k] /= s;
+  }
+}
+"""
+def _attn_helpers(hmx:bool) -> str:
+  # nn/onnx.py _hmx_attn_dsp: the hand attention kernels (softmax(q k^T) v per head on the HMX, the softmax on its VTCM tiles);
+  # the pool's softmax call gets attn_softmax.h only (a kernel mentioning the HMX runs under its lock, off the pool)
+  d = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "attn"
+  return (d / "attn_softmax.h").read_text() + ((d / "hmx_attn.h").read_text() if hmx else "")
+def _msda_helpers() -> str:
+  hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
+  return hdr.read_text() + _MSDA_CALL
 
 # ***** HVX re-vectorization *****
 # devectorizer2 splits every elementwise op into per-lane scalars and memory_coalescing only regroups the loads and
@@ -412,6 +777,7 @@ dsp_string = PatternMatcher([
 # STACK(op(a_i, b_i) for i) -> op(STACK(a_i), STACK(b_i)); STACK(v[0], ..., v[n-1]) -> v. clang lowers ext_vector_type
 # arithmetic straight to HVX under -mhvx. Compares/WHERE are left scalar: C vector compares yield same-width int masks,
 # not _Bool vectors, so they'd need mask-dtype plumbing -- MAX (the common select) is native instead.
+HVX_LANE_GATHER = getenv("HVX_LANE_GATHER", 1)
 HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
 # with qfloat (v68+) EXP2 / RECIPROCAL / float FDIV are rendered as vector helpers (_qf_math_helpers) instead of being
 # decomposed, so they re-vectorize too (added while QF_MATH is on, see _vec_ops)
@@ -437,6 +803,8 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     if any(c.op is not Ops.INDEX or len(c.src) != 2 or c.src[0]._shape is None or len(c.src[0]._shape) != 1 for c in col): return False
     lanes = [_lane(c.src[1]) for c in col]
     if None in lanes: return False
+    # any constant lanes of up to 8 equal-width vectors (_lane_gather: rendered as shuffles)
+    if HVX_LANE_GATHER and _lane_gather(col) is not None: return True
     return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
                                                                        ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
   if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col))) and \
@@ -451,11 +819,21 @@ def _hvx_qfloat() -> bool: return HVX_QFLOAT
 def hvx_revectorize(x:UOp) -> UOp|None:
   srcs, n = x.src, len(x.src)
   if n < 2 or x.dtype == dtypes.void: return None
+  # v65 has integer HVX only. Keeping float lanes in an ext_vector_type makes LLVM lower unsupported vector-float
+  # arithmetic incorrectly (e.g. the openpilot stem 1x1 convolution); let it render scalar lane expressions instead.
+  if _v65_hw() and dtypes.is_float(x.dtype): return None
   s0 = srcs[0]
   # STACK(v[0], v[1], ..., v[n-1]) of a length-n vector is v itself
   if s0.op is Ops.INDEX and len(s0.src) == 2 and s0.src[0]._shape == (n,) and \
      all(s.op is Ops.INDEX and len(s.src) == 2 and s.src[0] is s0.src[0] and _lane(s.src[1]) == i for i,s in enumerate(srcs)):
     return s0.src[0]
+  # a select whose condition is one scalar in every lane (a concat's source by row) is one whole-vector select: scalar condition,
+  # vector operands, no bool vector (per lane, a 2.3 MB concat ran at ~1 GB/s on the V69)
+  if HVX_SPLAT_WHERE and s0.op is Ops.WHERE and s0._shape == () and _is32(s0.dtype) and \
+      all(s.op is Ops.WHERE and s._shape == () and s.dtype == s0.dtype and s.src[0] is s0.src[0] for s in srcs) and \
+      _vec_column_ok(tuple(s.src[1] for s in srcs)) and _vec_column_ok(tuple(s.src[2] for s in srcs)):
+    return UOp(Ops.CUSTOMI, x.dtype, (s0.src[0], UOp.stack(*[s.src[1] for s in srcs]), UOp.stack(*[s.src[2] for s in srcs])),
+               "({0}?{1}:{2})")
   if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n)): return None
   # a splat of one scalar op (a per-sample weight broadcast over the channel lanes) stays that scalar op and one vsplat: as a
   # vector op it does the same work on splatted operands, and pulls the scalar compares / selects under it into vectors too
@@ -583,6 +961,7 @@ static inline {vt_c} __{name}({vt_a} a, {vt_b} b, {vt_c} c) {{
 # every K panel at a stride of _hmx_stride(kt) slots -- no load pair (<= 32 tiles) crosses a 256 KB window (a PD fault), so
 # whole weight matrices (fc2: 16 x 64 tiles) stay packed across a call instead of being repacked per output tile
 HMX_VTCM_KB = getenv("HMX_VTCM_KB", 256)
+HMX_PF_A_ROWS = getenv("HMX_PF_A_ROWS", 1)
 _HMX_AO = 65536  # activation staging, ahead of the operand pool in VTCM
 # _HMX_CB (128 slots of 2 KB) is reserved out of the same VTCM as the A region, and the whole
 # grant is shared rather than half of it: at the phone's 4 MB the old half-pool left 192 KB
@@ -765,12 +1144,10 @@ static inline void __hmx_out2(__fp16* d0, __fp16* d1, const __fp16* o) {
 /* row pair q of two horizontally adjacent output tiles -> two full, 128-byte aligned 64-element rows: one vdealh per tile,
  * vmux/vror to combine the halves (the hand kernel's hmx_unpack2), plain aligned stores (no predicate, no half lines) */
 static inline void __hmx_outp(__fp16* d0, __fp16* d1, const __fp16* o0, const __fp16* o1) {
-  __hmx_v x = __builtin_HEXAGON_V6_vdealh_128B(*(const __hmx_v*)o0), y = __builtin_HEXAGON_V6_vdealh_128B(*(const __hmx_v*)o1);
-  __hmx_v yr = __builtin_HEXAGON_V6_vror_128B(y, 64), xr = __builtin_HEXAGON_V6_vror_128B(x, 64);
-  __hmx_v r0, r1;
-  __asm__ volatile("q0 = vsetq(%4)\n %0 = vmux(q0,%2,%3)\n %1 = vmux(q0,%5,%6)" : "=&v"(r0), "=&v"(r1) : "v"(x), "v"(yr), "r"(64), "v"(xr), "v"(y) : "q0");
-  *(__hmx_v*)d0 = r0;
-  *(__hmx_v*)d1 = r1;
+  /* one halfword deal of the two tiles' row-pair vectors: evens (row 2q of both tiles) low, odds (row 2q+1) high */
+  __hmx_vp w = __builtin_HEXAGON_V6_vdealvdd_128B(*(const __hmx_v*)o1, *(const __hmx_v*)o0, -2);
+  *(__hmx_v*)d0 = __builtin_HEXAGON_V6_lo_128B(w);
+  *(__hmx_v*)d1 = __builtin_HEXAGON_V6_hi_128B(w);
 }
 /* output row pairs q, q+1 -> rows 2q..2q+3 in order into a 256-byte accumulator-array vector: one vdealh per register (as
  * a __builtin_shufflevector clang doesn't find that and builds it lane by lane through the stack). The stores are asm: as C
@@ -778,6 +1155,103 @@ static inline void __hmx_outp(__fp16* d0, __fp16* d1, const __fp16* o0, const __
 static inline void __hmx_deal2(__fp16* d, const __fp16* o) {
   __asm__ volatile("vmem(%0+#0) = %1" :: "r"(d), "v"(__builtin_HEXAGON_V6_vdealh_128B(((const __hmx_v*)o)[0])) : "memory");
   __asm__ volatile("vmem(%0+#0) = %1" :: "r"(d + 64), "v"(__builtin_HEXAGON_V6_vdealh_128B(((const __hmx_v*)o)[1])) : "memory");
+}
+#endif
+/* deferred output (HMX_DEFER): a tile (pair) is stored to one of two VTCM slot pairs and converted to its rows (HVX) only after the
+ * next tile's load pair is issued, so the conversion runs while the HMX computes instead of waiting on each store; the last
+ * pending tile is converted by __hmx_flush() at the end of the call */
+static int __hmx_ob, __hmx_pn;
+static const __fp16 *__hmx_pp, *__hmx_pq;
+static __fp16* __hmx_pr[32];
+#ifdef HMX_REF
+static __fp16 __hmx_rd[4][1024] __attribute__((aligned(128)));
+static inline const __fp16* __hmx_store_d(int k) {
+  const __fp16* o = __hmx_store();
+  for (int i = 0; i < 1024; i++) __hmx_rd[2 * __hmx_ob + k][i] = o[i];
+  return __hmx_rd[2 * __hmx_ob + k];
+}
+#else
+static inline const __fp16* __hmx_store_d(int k) {  /* VTCM @8 KB / 12 KB (the plain stores' slots) or @16 KB / 20 KB */
+  unsigned char* o = __hmx_vtcm + (__hmx_ob ? 16384 : 8192) + 4096 * k;
+  __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(o), "r"(0) : "memory");
+  return (const __fp16*)o;
+}
+#endif
+static inline void __hmx_flush(void) {
+#ifndef HMX_REF
+  if (__hmx_pn == 2) {
+    /* four row pairs at a time, their tile vectors loaded before any row is stored (one at a time, each store kept the next
+       loads waiting: the conversion was ~0.2 us per tile pair, longer than the products it overlaps) */
+    const __hmx_v *p = (const __hmx_v*)__hmx_pp, *q = (const __hmx_v*)__hmx_pq;
+    for (int g = 0; g < 16; g += 4) {
+      __hmx_v a0 = p[g], a1 = p[g + 1], a2 = p[g + 2], a3 = p[g + 3], b0 = q[g], b1 = q[g + 1], b2 = q[g + 2], b3 = q[g + 3];
+      __fp16 *d[8];
+      for (int i = 0; i < 8; i++) d[i] = __hmx_pr[2 * g + i];
+      __hmx_vp w0 = __builtin_HEXAGON_V6_vdealvdd_128B(b0, a0, -2), w1 = __builtin_HEXAGON_V6_vdealvdd_128B(b1, a1, -2);
+      __hmx_vp w2 = __builtin_HEXAGON_V6_vdealvdd_128B(b2, a2, -2), w3 = __builtin_HEXAGON_V6_vdealvdd_128B(b3, a3, -2);
+      *(__hmx_v*)d[0] = __builtin_HEXAGON_V6_lo_128B(w0); *(__hmx_v*)d[1] = __builtin_HEXAGON_V6_hi_128B(w0);
+      *(__hmx_v*)d[2] = __builtin_HEXAGON_V6_lo_128B(w1); *(__hmx_v*)d[3] = __builtin_HEXAGON_V6_hi_128B(w1);
+      *(__hmx_v*)d[4] = __builtin_HEXAGON_V6_lo_128B(w2); *(__hmx_v*)d[5] = __builtin_HEXAGON_V6_hi_128B(w2);
+      *(__hmx_v*)d[6] = __builtin_HEXAGON_V6_lo_128B(w3); *(__hmx_v*)d[7] = __builtin_HEXAGON_V6_hi_128B(w3);
+    }
+    __hmx_pn = 0;
+    return;
+  }
+#endif
+  if (__hmx_pn == 2) for (int q = 0; q < 16; q++) __hmx_outp(__hmx_pr[2 * q], __hmx_pr[2 * q + 1], __hmx_pp + 64 * q, __hmx_pq + 64 * q);
+  else if (__hmx_pn == 1) for (int q = 0; q < 16; q++) __hmx_out2(__hmx_pr[2 * q], __hmx_pr[2 * q + 1], __hmx_pp + 64 * q);
+  __hmx_pn = 0;
+}
+static inline void __hmx_pend(int n, const __fp16* p, const __fp16* q) { __hmx_pn = n; __hmx_pp = p; __hmx_pq = q; __hmx_ob ^= 1; }
+/* raw-tile buffers (a fp16 PARAM of 1024 k + _HMX_RAW_TAIL elements, nn/onnx.py's attention S^T and P): tinygrad indexes them
+ * as a row-major (rows, LD) matrix, the HMX kernels write and read them as raw tiles -- tile (row tile a, column tile b) at
+ * (b * rows / 32 + a) * 1024, in the HMX's own layout (row pairs interleaved), so neither side converts. __hmx_rawb: the raw B
+ * operand's base, set at the start of the call */
+static __fp16* __hmx_rawb;
+static inline void __hmx_tcopy(__fp16* d, const __fp16* s, int nt) {
+  for (int i = 0; i < 16 * nt; i++) ((__hmx_v*)d)[i] = ((const __hmx_v*)s)[i];
+}
+#ifdef HMX_REF
+static inline void __hmx_store_raw(__fp16* d) { const __fp16* o = __hmx_store(); for (int i = 0; i < 1024; i++) d[i] = o[i]; }
+static inline void __hmx_store_rawv(__fp16* d, int vt) { (void)vt; __hmx_store_raw(d); }
+static inline int __hmx_vt(const void* p, unsigned n) { (void)p; (void)n; return 0; }
+static inline void __hmx_mac_span_raw(__fp16* a, __fp16* b, int kt) { __hmx_mac_span(a, b, kt); }
+#else
+extern unsigned int __hmx_vtcm_size __attribute__((weak));
+static inline int __hmx_vt(const void* p, unsigned n) {  /* p .. p + n in the VTCM this run holds, 2 KB aligned */
+  unsigned o = (unsigned)p - (unsigned)__hmx_vtcm;
+  return &__hmx_vtcm_size != 0 && ((unsigned)p & 2047u) == 0 && o < __hmx_vtcm_size && n <= __hmx_vtcm_size - o;
+}
+/* a raw tile out of the accumulator: straight into a VTCM destination, else through the output slot */
+static inline void __hmx_store_raw(__fp16* d) {
+  if (__hmx_vt(d, 2048)) __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(d), "r"(0) : "memory");
+  else __hmx_tcopy(d, __hmx_store(), 1);
+}
+/* the same with the VTCM test done once per call (vt, a local the kernel sets: a static was reloaded after every asm store) */
+static inline void __hmx_store_rawv(__fp16* d, int vt) {
+  if (vt) __asm__ volatile("mxmem(%0,%1):after.hf = acc" :: "r"(d), "r"(0) : "memory");
+  else __hmx_tcopy(d, __hmx_store(), 1);
+}
+/* kt K tiles: a from the tile cache, b raw tiles in a row -- read in place when in VTCM (load pairs split where either side
+ * crosses a 256 KB window), else copied 32 at a time into the B slots */
+static inline void __hmx_span_w(__fp16* a, __fp16* b, int kt) {
+  for (int k0 = 0; k0 < kt;) {
+    unsigned pa = (unsigned)(a + 1024 * k0), pb = (unsigned)(b + 1024 * k0);
+    int n = kt - k0 < 32 ? kt - k0 : 32, na = (int)((((pa >> 18) + 1) << 18) - pa) / 2048, nb = (int)((((pb >> 18) + 1) << 18) - pb) / 2048;
+    if (na < n) n = na;
+    if (nb < n) n = nb;
+    __asm__ volatile("{ activation.hf = mxmem(%0,%1):deep\n weight.hf = mxmem(%2,%3) }"
+                     :: "r"(pa), "r"(n * 2048 - 1), "r"(pb), "r"(n * 2048 - 1) : "memory");
+    k0 += n;
+  }
+}
+static inline void __hmx_mac_span_raw(__fp16* a, __fp16* b, int kt) {
+  if (__hmx_vt(b, 2048u * kt)) { __hmx_span_w(a, b, kt); return; }
+  for (int k0 = 0; k0 < kt; k0 += 32) {
+    int n = kt - k0 < 32 ? kt - k0 : 32;
+    __hmx_tcopy(__hmx_cb(0), b + 1024 * k0, n);
+    __hmx_span_w(a + 1024 * k0, __hmx_cb(0), n);
+  }
 }
 #endif
 /* packed tiles of read-only operands are memoized by their first row pointer (same pointer = same tile within one
@@ -794,51 +1268,38 @@ static inline void __hmx_prefetch_next(const __fp16* r0, const __fp16* r1) {
   (void)r0; (void)r1;
 #endif
 }
+/* one l2fetch box: `height` rows of `width` bytes at `stride` (the 64-bit form: 16-bit fields, any panel in one box). One at a
+ * time: an l2fetch issued while another is in flight replaces it -- row-by-row boxes fetched little more than the last row
+ * (BEVFormer's 2528-row value projection, A from DDR: 0.5 -> 0.18 ms per call on the V69) */
+static inline void __hmx_l2box(const void* p, unsigned stride, unsigned width, unsigned height) {
+#ifndef HMX_REF
+  if (stride >= 65536u || width >= 65536u || height >= 65536u || !height) return;
+  __builtin_HEXAGON_Y5_l2fetch((void*)p, ((long long)stride << 32) | ((long long)width << 16) | height);
+#else
+  (void)p; (void)stride; (void)width; (void)height;
+#endif
+}
 /* L2-prefetch a whole K panel of a 32-column operand: rows x 64 bytes at the row stride of r0, r1 (l2fetch height <= 255) */
 static inline void __hmx_prefetch_panel(const __fp16* r0, const __fp16* r1, int rows) {
-#ifndef HMX_REF
-  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  if (stride >= 65536u) return;
-  for (int r = 0; r < rows; r += 240)
-    __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (64u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
-#else
-  (void)r0; (void)r1; (void)rows;
-#endif
+  __hmx_l2box(r0, (unsigned)((const char*)r1 - (const char*)r0), 64u, (unsigned)rows);
 }
 /* the same for a pair of adjacent 32-column tiles packed together: whole 128-byte row lines. `ahead`: also fetch the next
  * pair's panel (the next 128 bytes of every row), which then streams in while this pair packs (only when the row stride
  * leaves room for it, i.e. the operand is wider than this pair) */
 static inline void __hmx_prefetch_panel2(const __fp16* r0, const __fp16* r1, int rows, int ahead) {
-#ifndef HMX_REF
   unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  if (stride >= 65536u) return;
-  if (ahead != 2)  /* 2: this pair's panel was already fetched as the previous pair's "ahead" */
-    for (int r = 0; r < rows; r += 240)
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + r * stride), (stride << 16) | (128u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
-  if (ahead && stride >= 256u)
-    for (int r = 0; r < rows; r += 240)
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + 128 + r * stride), (stride << 16) | (128u << 8) | (unsigned)(rows - r < 240 ? rows - r : 240));
-#else
-  (void)r0; (void)r1; (void)rows; (void)ahead;
-#endif
+  int next = ahead && stride >= 256u;
+  if (ahead == 2) { if (next) __hmx_l2box((const char*)r0 + 128, stride, 128u, (unsigned)rows); }  /* this pair's came as "next" */
+  else __hmx_l2box(r0, stride, next ? 256u : 128u, (unsigned)rows);
 }
 /* L2-prefetch the K panel of a 32-row operand (A: 32 rows of K columns): each row's `bytes` contiguous bytes at the row stride
- * of r0, r1 (as 128-byte lines, <= 240 lines per l2fetch). __hmx_prefetch_panel is the 32-column (B) shape; used on A it
- * fetched 32*kt rows -- far past the operand, which faults the PD on the phone once that lands on an unmapped page. */
+ * of r0, r1. __hmx_prefetch_panel is the 32-column (B) shape; used on A it fetched 32*kt rows -- far past the operand, which
+ * faults the PD on the phone once that lands on an unmapped page. */
 static inline void __hmx_prefetch_rows(const __fp16* r0, const __fp16* r1, int bytes) {
-#ifndef HMX_REF
-  unsigned stride = (unsigned)((const char*)r1 - (const char*)r0);
-  int lines = (bytes + 127) / 128;
-  for (int i = 0; i < 32; i++)
-    for (int l = 0; l < lines; l += 240) {
-      unsigned h = (unsigned)(lines - l < 240 ? lines - l : 240);
-      __builtin_HEXAGON_Y4_l2fetch((void*)((const char*)r0 + i * stride + 128 * l), (128u << 16) | (128u << 8) | h);
-    }
-#else
-  (void)r0; (void)r1; (void)bytes;
-#endif
+  __hmx_l2box(r0, (unsigned)((const char*)r1 - (const char*)r0), (unsigned)bytes, 32u);
 }
 static inline void __hmx_call_start(void) {
+  __hmx_pn = 0;
   for (int i = 0; i < __HMX_CA; i++) { __hmx_tag_a[i] = 0; __hmx_rr_a[i] = 0; }
   for (int i = 0; i < __HMX_CB; i++) { __hmx_tag_b[i] = 0; __hmx_rr_b[i] = 0; }
 }
@@ -1698,6 +2159,71 @@ static void __hmx_qadd_chunk(unsigned char* y, const unsigned char* a, const uns
 #endif
 """
 
+
+# Depthwise conv on v65 HVX (nn/dw_v65.py): the padded image of a channel is one flat u8 signal (row stride Wp). A vrmpy lane owns 4
+# consecutive bytes, so with an unaligned 128-byte load at flat offset 128*b + s + ky*Wp + 4*g and a splat of the 4 weights
+# w[ky][4g..4g+3] it computes, in lane n, the 4-tap partial of output j = 128*b + 4*n + s; the four shifts s = 0..3 fill all
+# 128 outputs of block b. Accumulators are int32 and the sum is exact (the caller's combination of activation / weight byte planes
+# is shifted-added in int32: identical to the plain integer convolution). Output is the flat signal [Lout = nb*128] in true order.
+_DW_HVX_HELPERS = r"""#pragma clang diagnostic ignored "-Wunused-function"
+typedef int __dw_v __attribute__((__vector_size__(128)));
+typedef int __dw_vu __attribute__((__vector_size__(128), aligned(1)));
+typedef int __dw_vp __attribute__((__vector_size__(256)));
+static inline void __dw_hvx(int* restrict y, const unsigned char* restrict x0, const unsigned char* restrict x1, const int* restrict w,
+                            int nb, int Wp, int kh, int G, int P, int Q) {
+  for (int b = 0; b < nb; b++) {
+    __dw_v acc[4];
+    for (int s = 0; s < 4; s++) {
+      __dw_v tot = __builtin_HEXAGON_V6_vd0_128B();
+      for (int p = 0; p < P; p++) {
+        const unsigned char* xp = (p ? x1 : x0) + 128 * b + s;
+        __dw_v ap = __builtin_HEXAGON_V6_vd0_128B();
+        for (int q = 0; q < Q; q++) {
+          __dw_v aq = __builtin_HEXAGON_V6_vd0_128B();
+          for (int ky = 0; ky < kh; ky++)
+            for (int g = 0; g < G; g++) {
+              __dw_v a = *(const __dw_vu*)(xp + ky * Wp + 4 * g);
+              int wv = w[(q * kh + ky) * G + g];
+              if (Q == 2 && q == 0) aq = __builtin_HEXAGON_V6_vrmpyub_acc_128B(aq, a, wv);
+              else aq = __builtin_HEXAGON_V6_vrmpybusv_acc_128B(aq, a, __builtin_HEXAGON_V6_lvsplatw_128B(wv));
+            }
+          ap += q ? (aq << 8) : aq;
+        }
+        tot += p ? (ap << 8) : ap;
+      }
+      acc[s] = tot;
+    }
+    // acc[s] lane n is output 4n+s: interleave the words of the four vectors back into output order
+    __dw_vp p01 = __builtin_HEXAGON_V6_vshuffvdd_128B(acc[1], acc[0], -4);
+    __dw_vp p23 = __builtin_HEXAGON_V6_vshuffvdd_128B(acc[3], acc[2], -4);
+    __dw_vp q0 = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_lo_128B(p23), __builtin_HEXAGON_V6_lo_128B(p01), -8);
+    __dw_vp q1 = __builtin_HEXAGON_V6_vshuffvdd_128B(__builtin_HEXAGON_V6_hi_128B(p23), __builtin_HEXAGON_V6_hi_128B(p01), -8);
+    __dw_v* o = (__dw_v*)(y + 128 * b);
+    o[0] = __builtin_HEXAGON_V6_lo_128B(q0); o[1] = __builtin_HEXAGON_V6_hi_128B(q0);
+    o[2] = __builtin_HEXAGON_V6_lo_128B(q1); o[3] = __builtin_HEXAGON_V6_hi_128B(q1);
+  }
+}
+// (C, H, W) unsigned values -> flat padded byte planes [C][Lin]: every plane pre-filled with its pad value, the image rows copied to
+// rows pt.. / columns pl.. of the Hp x Wp image; the low byte and (for 16-bit values) the high byte as separate planes
+static inline void __dw_prep8(unsigned char* restrict lo, const unsigned char* restrict src, int H, int W, int Lin, int Wp, int pt, int pl, int pv) {
+  __dw_v fill = __builtin_HEXAGON_V6_lvsplatw_128B(pv * 0x01010101);
+  for (int i = 0; i < Lin; i += 128) *(__dw_vu*)(lo + i) = fill;
+  for (int y = 0; y < H; y++) {
+    unsigned char* d = lo + (pt + y) * Wp + pl; const unsigned char* r = src + y * W;
+    for (int x = 0; x < W; x++) d[x] = r[x];
+  }
+}
+static inline void __dw_prep16(unsigned char* restrict lo, unsigned char* restrict hi, const unsigned short* restrict src, int H, int W, int Lin, int Wp,
+                               int pt, int pl, int pv) {
+  __dw_v fl = __builtin_HEXAGON_V6_lvsplatw_128B((pv & 255) * 0x01010101), fh = __builtin_HEXAGON_V6_lvsplatw_128B((pv >> 8) * 0x01010101);
+  for (int i = 0; i < Lin; i += 128) { *(__dw_vu*)(lo + i) = fl; *(__dw_vu*)(hi + i) = fh; }
+  for (int y = 0; y < H; y++) {
+    unsigned char* dl = lo + (pt + y) * Wp + pl; unsigned char* dh = hi + (pt + y) * Wp + pl; const unsigned short* r = src + y * W;
+    for (int x = 0; x < W; x++) { unsigned v = r[x]; dl[x] = v; dh[x] = v >> 8; }
+  }
+}
+"""
+
 def _hmx_qadd_consts(ra:float, rb:float, fixed:float) -> tuple:
   # the fixed-point form of ORT's add (onnxsim hmx_gemm/runner/rn_load.h): v * 2^F = a*ra*2^F + b*rb*2^F + fixed*2^F from
   # 24-bit mantissas in 12-bit halves, and the window: our truncations (< 3 units) + half an ulp of each of ORT's 4 fp32 roundings
@@ -1735,6 +2261,61 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
   return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
 
+# raw-tile buffers (see __hmx_store_raw): marked by their size, 1024 k + _HMX_RAW_TAIL fp16 elements (nn/onnx.py allocates them)
+_HMX_RAW_TAIL = 1000
+def _hmx_raw_param(p:UOp) -> bool:
+  return p.op is Ops.PARAM and p.dtype == dtypes.half and len(p.shape) == 1 and p.shape[0] % 1024 == _HMX_RAW_TAIL
+
+def _hmx_raw_geom(idx:list[UOp], p:UOp, ranges:list[UOp]):
+  # row r's index idx[r] = idx[0] + r LD, (size - tail) / LD rows: -> (LD, row tiles), else None
+  d = [_hmx_const_delta(lambda env, ii=ii: None if (a:=_hmx_eval(ii, env)) is None or (z:=_hmx_eval(idx[0], env)) is None else a - z, ranges)
+       for ii in idx]
+  if d[1] is None or d[1] <= 0 or d[1] % 32 or any(x != r * d[1] for r, x in enumerate(d)): return None
+  n = p.shape[0] - _HMX_RAW_TAIL
+  return (d[1], n // d[1] // 32) if n % (32 * d[1]) == 0 else None
+
+def _hmx_raw_b(rows, kr:UOp, loops:tuple, ranges:list[UOp]):
+  # a B operand in a raw-tile buffer, row r of K tile k and N tile n at (32 k + r) LD + 32 n with n a tile loop -> (PARAM,
+  # that loop, row tiles); None if B isn't raw-tile; RuntimeError if it is but not in that form (its natural load would be wrong)
+  p = _hmx_param(rows[0][0].src[0])
+  if not _hmx_raw_param(p): return None
+  if any(b or len(v.src[0].src) < 2 or _hmx_param(v.src[0]) is not p for v, b in rows) or \
+     (g:=_hmx_raw_geom([v.src[0].src[1] for v, _ in rows], p, ranges)) is None:
+    raise RuntimeError("HMX raw-tile B operand in an unsupported form")
+  i0 = rows[0][0].src[0].src[1]
+  for lv in loops[:2]:
+    if _hmx_const_delta(lambda env: None if (a:=_hmx_eval(i0, env)) is None else a - 32 * env[kr] * g[0] - 32 * env[lv], ranges) == 0:
+      return p, lv, g[1]
+  raise RuntimeError("HMX raw-tile B operand in an unsupported form")
+
+def _hmx_raw_lin(i0:UOp, g:tuple, ranges:list[UOp]):
+  # a raw output tile's place (b rows / 32 + a) 1024 as base + sum(c r) over the loops r, from its first row's index i0 = 32 LD a
+  # + 32 b with a and b linear in the loops -> (base, [(range, c)]), None if not of that form (the store divides instead)
+  ld, rt = g
+  z = {r: 0 for r in ranges}
+  if (b0:=_hmx_eval(i0, z)) is None: return None
+  coef = []
+  for r in ranges:
+    if (d:=_hmx_eval(i0, {**z, r: 1})) is None: return None
+    if (d:=d - b0): coef.append((r, d))
+  if _hmx_const_delta(lambda env: None if (v:=_hmx_eval(i0, env)) is None else v - sum(c * env[r] for r, c in coef), ranges) != b0: return None
+  # every term within one of the two: whole row tiles (multiples of 32 LD), or column tiles that never carry into the next row
+  # tile (the column part's largest value below LD)
+  if b0 % 32 or b0 < 0: return None
+  colmax = b0 % (32 * ld) + sum(c * int(r.vmax) for r, c in coef if c % (32 * ld))
+  if any(c < 0 or c % 32 for _, c in coef) or colmax >= ld or (b0 % (32 * ld)) % 32: return None
+  out = [(r, c // (32 * ld) * 1024 if c % (32 * ld) == 0 else c // 32 * rt * 1024) for r, c in coef]
+  return (b0 // (32 * ld) * 1024 + (b0 % (32 * ld)) // 32 * rt * 1024, out)
+
+HMX_DEFER = getenv("HMX_DEFER", 1)
+def _hmx_deferred(mac0:str, mac1:str|None) -> str:
+  # one output tile (pair) stored to the free slot pair and left pending; the previous pending one converted after the next load
+  # pair is issued (HMX_DEFER=1: after the first, 2: after the second). Row pointers are the CUSTOM's srcs {0}..{31}
+  f, rows = " __hmx_flush();", "".join(f" __hmx_pr[{i}] = {{{i}}};" for i in range(32))
+  if mac1 is None: return f"{mac0}{f} const __fp16* _p = __hmx_store_d(0);{rows} __hmx_pend(1, _p, 0);"
+  return (f"{mac0}{f if HMX_DEFER == 1 else ''} const __fp16* _p = __hmx_store_d(0);{mac1}{f if HMX_DEFER != 1 else ''}"
+          f" const __fp16* _q = __hmx_store_d(1);{rows} __hmx_pend(2, _p, _q);")
+
 def _hmx_bail(uops, why:int):
   if getenv("HMX_DEBUG"): print(f"hmx_acc rewrite skipped (check {why})")
   return uops, False
@@ -1755,6 +2336,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
   after: dict[int, list[UOp]] = {}
   replace: dict[UOp, UOp] = {}
   swap_out: list[bool] = []  # the int8 path's loop-order choice (planned for what fits in the VTCM tile pool)
+  rawo: set[UOp] = set()  # raw-tile outputs whose VTCM test (__hmx_rv, a local) is set at the start of the call
+  begun: list[bool] = []
+  deferred: list[bool] = []  # an output path converts its tiles late (HMX_DEFER): flush the last one at the end of the call
   for w in uops:
     if w.op is Ops.WMMA and w.arg[0] == (32, 64, 32) and w.arg[1] == dtypes.uint8 and getenv("HMX_I8", 1):
       r = _hmx_i8_rewrite(w, uops, pos, users, drop, before, after, replace, swap_out)
@@ -1787,7 +2371,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if any(any(v not in dead and v.op not in (Ops.GROUP, Ops.END) for v in users.get(d, [])) for d in dead): return _hmx_bail(uops, 8)
     drop |= dead
     end_at = pos[e] if e is not None else max(pos[so] for so in stores)  # where the reduction is complete
-    before.setdefault(pos[e.src[1]] if e is not None else pos[w], []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_begin();"))
+    # once per call, ahead of everything (a store resets the accumulator, on the HMX and in HMX_REF alike): before every output
+    # tile it was a static's test per tile, ~2 of the ~12 scalar packets between attention S^T's tiles
+    if not begun: before.setdefault(0, []).append(UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_begin();"))
+    begun.append(True)
     rows = ra + rb
     vals = list(dict.fromkeys(v for v, _ in rows))
     if all(v.op is Ops.LOAD and len(v.src) == 1 and all(u in dead or u.op in (Ops.GROUP, Ops.END) for u in users.get(v, [])) for v in vals):
@@ -1829,6 +2416,10 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
                   f"{'(' + on + ')+2<' + str(int(outer.vmax)+1) + ' ? ((' + on + ')==0 ? 1 : 2) : 0' if getenv('HMX_PF_AHEAD', 1) else 0});")
             return (f" _{x} = __hmx_{acc}({o}({on})%2*{st}+({kr})); if (({iname})==0 && ({on})%2==0) {{{{{pf}{pk} }}}}",
                     f"{o}({on})%2*{st}", 2 * st)
+          elif deps == {outer} and x == "a" and 2 * st <= n and getenv("HMX_A_DBL", 1):
+            # A's two slot sets alternate by row tile: packing row tile n+1 doesn't overwrite the tiles row tile n's last
+            # products may still be reading
+            base, cond, used = f"{o}({on})%2*{st}", f"({iname})==0", 2 * st
           elif deps == {outer} and kt <= n: base, cond, used = f"{off}", f"({iname})==0", st
           elif not deps and kt <= n: base, cond, used = f"{off}", f"({on})==0 && ({iname})==0", st
           else: return None
@@ -1836,10 +2427,42 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
           # the whole K panel, on its first fill: A = 32 rows x K columns, B = K rows x 32 columns
           pf = (f" if (({kr})==0) __hmx_prefetch_rows({p0}, {p1}, {64*kt});" if x == "a" else
                 f" if (({kr})==0) __hmx_prefetch_panel({p0}, {p1}, {32*kt});")
-          return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')} }}}}",
-                  base, used)
+          pack = pack.replace(f' __hmx_prefetch_next({p0}, {p1});', '')
+          if x == "a" and deps == {outer} and kt > 1 and getenv("HMX_PF_A_NEXT", 1):
+            # and the next row tile's panel, right after this one's (which it replaces: one l2fetch at a time -- this row tile's
+            # came in as the previous one's "next"), streaming in while this row tile's products run
+            nx = f"({p0})+32*(({p1})-({p0}))"
+            pf += f" if (({kr})==0 && ({on})+1<{int(outer.vmax)+1}) __hmx_prefetch_rows({nx}, {nx}+(({p1})-({p0})), {64*kt});"
+          if x == "a" and e is not None and kt % 2 == 0 and getenv("HMX_PACK_K2", 1) and _hmx_kpairable(r, e.src[1], ranges):
+            # A's K tiles k, k+1 (k even) from the same aligned 128-byte row lines: one vshuff per row pair for both, no unaligned
+            # loads (per K tile it was two rotated loads and a shuffle). With A's slot sets alternating (HMX_A_DBL): 0.8 of the
+            # BEVFormer decoder's 34.2 ms on the V69
+            pk = "".join(f" __hmx_pack2x2(_a+{64*q}, _a+{1024+64*q}, {ptr[2*q]}, {ptr[2*q+1]});" for q in range(16))
+            # rows at one stride: the block helper, eight row loads in flight before their shuffles (one at a time, each load's
+            # latency was exposed: ~30 ns per row pair from L2, ~7 from VTCM)
+            if _hmx_uniform_rows(r, ranges): pk = f" __hmx_pack2x2_blk(_a, _a+1024, {ptr[0]}, {ptr[1]});"
+            pack = " if ((" + kr + ")%2==0) {{" + pk + " }}"
+          return (f" _{x} = __hmx_{acc}({base}+({kr})); if ({cond}) {{{{{pf}{pack} }}}}", base, used)
         eb_acc = "cb"
-        if HMX_VTCM_KB > 256 and ro[0] and ro[1]:
+        rawb = _hmx_raw_b(rb, e.src[1], loops, ranges) if e is not None else None
+        if rawb is None and _hmx_raw_param(_hmx_param(rb[0][0].src[0])): raise RuntimeError("HMX raw-tile B operand without a K loop")
+        if rawb is not None:
+          # B read as raw tiles, in place (no packing): one spanning load pair per output tile from its K panel
+          if loops[4] is not None:
+            # one output-tile loop (loops = (the reduce, the tile loop)): A, indexed by K only, packed on the first tile
+            if not ro[0] or _hmx_uses(ra[0][0].src[0], inner) or kt > _HMX_CA: raise RuntimeError("HMX raw-tile B operand: A not cacheable")
+            # (its whole K panel L2-prefetched on the first fill, as exact() does: without, P V's V^T rows from DDR were ~35 of its
+            # 47 us per head, one miss per 64-byte row piece)
+            pf = f" if (({kr})==0) __hmx_prefetch_rows({ptr[0]}, {ptr[1]}, {64*kt});"
+            ea = (f" _a = __hmx_ca({kr}); if (({iname})==0) {{{{{pf}{pa} }}}}", "0", kt)
+          elif not ro[1] or (ea:=exact(ra, _HMX_CA, "a", pa)) is None: raise RuntimeError("HMX raw-tile B operand: A not cacheable")
+          last_param = max(pos[x] for x in uops if x.op is Ops.PARAM)
+          after.setdefault(last_param, []).append(UOp(Ops.CUSTOM, dtypes.void, (rawb[0],), "__hmx_rawb = (__fp16*){0};"))
+          lv = on if rawb[1] is outer else iname
+          span[w] = (ea[1], f"__hmx_rawb+({lv})*{rawb[2]*1024}", kt, outer, inner, on, iname, "raw", _hmx_stride(kt), False,
+                     int(outer.vmax) + 1, False, ti)
+          ea, eb = ea[0], ""
+        elif HMX_VTCM_KB > 256 and ro[0] and ro[1]:
           # one pool (the B slots follow A's): A takes what it needs, B the rest from the next 32-slot boundary; if B doesn't
           # fit, back to the fixed split (B then goes through its tag cache)
           ea = exact(ra, _HMX_CA + _HMX_CB, "a", pa)
@@ -1849,12 +2472,15 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         else:
           ea = exact(ra, _HMX_CA, "a", pa) if ro[0] else None
           eb = exact(rb, _HMX_CB, "b", pb) if ro[1] else None
-        if ea and eb:
+        if w in span: pass
+        elif ea and eb:
           # K tiles stay in VTCM: no load pair per K block, one spanning pair after the loop (see the output statement)
-          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc, _hmx_stride(kt), "%2*" in eb[1], int(outer.vmax) + 1)
+          span[w] = (ea[1], eb[1], kt, outer, inner, on, iname, eb_acc, _hmx_stride(kt), "%2*" in eb[1], int(outer.vmax) + 1,
+                     eb[1].endswith(f"({iname})*{_hmx_stride(kt)}"), ti)
           ea, eb = ea[0], eb[0]
         else: ea, eb = ea and ea[0], eb and eb[0]
-        pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
+        if w in span and span[w][7] == "raw": pa, pb = ea, ""
+        else: pa, pb = ea or (cached("a", _HMX_CA, ptr[0], "a", pa) if ro[0] else pa), eb or (cached("b", _HMX_CB, ptr[32], "b", pb) if ro[1] else pb)
         srcs = srcs + (e.src[1] if e is not None else outer, outer, inner)
       else:
         if ro[0]: pa = cached("a", _HMX_CA, ptr[0], "a", pa)
@@ -1864,7 +2490,11 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       # the next K block of B (and of A while it's still being packed) is fetched into L2 while this one packs; the exact
       # cache paths prefetch whole panels on their first fill instead (a per-K-block l2fetch there cost ~12% of the call)
       if w not in span: pb = f" __hmx_prefetch_next({ptr[32]}, {ptr[33]});" + pb
-      pfa = f" __hmx_prefetch_next({ptr[0]}, {ptr[1]});"
+      # A: its whole K panel (32 rows x K) on the first K block. __hmx_prefetch_next fetches the tile 32 rows down -- B's next K
+      # block, but for A the next row tile, used only after the N loop: an A read once (attention's P @ V, P a 13.8 MB product
+      # packed from DDR) went at ~2 GB/s
+      pfa = (f" if (({kr})==0) __hmx_prefetch_rows({ptr[0]}, {ptr[1]}, {64*kt});" if HMX_PF_A_ROWS and e is not None and (loops is not None or any(ro)) else
+             f" __hmx_prefetch_next({ptr[0]}, {ptr[1]});")
       pa = pfa + pa if not ro[0] else pa.replace("{{ _a = _s;", "{{ _a = _s;" + pfa, 1)
     elif all(v.max_numel() == 32 for v, _ in rows):
       pa = "".join(f" *(__hmx_h64*)(_a+{64*q}) = __builtin_shufflevector({{{2*q}}},{{{2*q+1}}},{_ILV});" for q in range(16))
@@ -1878,6 +2508,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       if w not in span: return "", ()
       ab, bb, kt_, o_, i_, on_, in_, bacc = span[w][:8]
       for k_, v_ in ((on_, "{%d}" % len(srcs0)), (in_, "{%d}" % (len(srcs0)+1))): ab, bb = ab.replace(k_, v_), bb.replace(k_, v_)
+      if bacc == "raw": return f" __hmx_mac_span_raw(__hmx_ca({ab}), {bb}, {kt_});", (o_, i_)
       return f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});", (o_, i_)
     # after the loop: one store, then each accumulator-array vector = the same lanes of the output tile
     outs = []
@@ -1896,17 +2527,87 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         vt = {32: "__hmx_h32", 64: "__hmx_h64", 128: "__hmx_h128"}.get(len(lanes))
         if vt is None: return _hmx_bail(uops, 11)
         outs.append(f" *({vt}*){{{k}}} = ({vt}){{{{{','.join(f'_p[{l}]' for l in lanes)}}}}};")
+    def raw_store(rowptr:list[UOp], at:int) -> bool:
+      # the output is a raw-tile buffer: the tile goes out as it is (__hmx_store_raw), at its raw place
+      p = _hmx_param(rowptr[0])
+      if not _hmx_raw_param(p): return False
+      if any(r.op not in (Ops.INDEX, Ops.SHRINK) or len(r.src) < 2 for r in rowptr) or \
+         (g:=_hmx_raw_geom([r.src[1] for r in rowptr], p, ranges)) is None: raise RuntimeError("HMX raw-tile output in an unsupported form")
+      sm, sx = span_mac((rowptr[0], p))
+      if (lin:=_hmx_raw_lin(rowptr[0].src[1], g, ranges)) is not None:
+        # the tile's raw place straight from the loops (row tile a = i / 32 LD, column tile b = i % LD / 32, each linear in them)
+        # and the VTCM test hoisted: S^T's per-tile divides and range checks were ~25 scalar packets between the HMX's store and
+        # its next load pair, 50 us per head where the hand S loop takes 22 (BEVFormer's 30 x 30 tiles, V69)
+        base, coef = lin
+        off = "+".join([str(base)] + [f"({{{2+len(sx)+j}}})*{c}" for j, (_, c) in enumerate(coef)])
+        code = f"{{{{{sm} __hmx_store_rawv((__fp16*){{1}} + {off}, __hmx_rv); }}}}"
+        if p not in rawo:
+          rawo.add(p)
+          last_param = max(pos[x] for x in uops if x.op is Ops.PARAM)
+          vt = f"const int __hmx_rv = __hmx_vt({{0}}, {2*(p.shape[0]-_HMX_RAW_TAIL)}u);"
+          after.setdefault(last_param, []).append(UOp(Ops.CUSTOM, dtypes.void, (p,), vt))
+        after.setdefault(at, []).extend(([rowptr[0]] if rowptr[0] not in pos else []) +
+                                        [UOp(Ops.CUSTOM, dtypes.void, (rowptr[0], p)+sx+tuple(r for r, _ in coef), code)])
+        return True
+      code = (f"{{{{{sm} {{{{ int _o = (int)({{0}} - (__fp16*){{1}}); __hmx_store_raw((__fp16*){{1}} + "
+              f"((_o / {32*g[0]}) + (_o % {g[0]}) / 32 * {g[1]}) * 1024); }}}} }}}}")
+      after.setdefault(at, []).extend(([rowptr[0]] if rowptr[0] not in pos else []) + [UOp(Ops.CUSTOM, dtypes.void, (rowptr[0], p)+sx, code)])
+      return True
+    def one_tile(sm:str, pairs:str) -> str:
+      # a single output tile per spanning load pair, its rows converted after the next tile's loads are issued (HMX_DEFER): converted
+      # at once, the thread waited out each tile's products first (attention's P V, one output tile per 30 K tiles: 44 -> ~20 us)
+      if not (HMX_DEFER and sm and getenv("HMX_DEFER_ONE", 1)): return "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}"
+      deferred.append(True)
+      return "{{" + _hmx_deferred(sm, None) + " }}"
+    def pair_raw(rowptr:list[UOp]) -> tuple[str, tuple]|None:
+      # a raw-tile B (one K panel per N tile, read in place): on even N tiles compute n and n+1 (the next panel) and convert the
+      # pair into full 128-byte rows (one deal per row pair); converted alone, a tile's half rows were predicated stores, ~10 us
+      # of attention's P V per head (HMX_OUTPAIR_RAW)
+      if not (w in span and span[w][7] == "raw" and HMX_DEFER and getenv("HMX_OUTPAIR_RAW", 1)): return None
+      ab, bb, kt_, o_, i_, on_, in_ = span[w][:7]
+      if (m:=re.search(r"\)\*(\d+)$", bb)) is None: return None
+      lp, nl, NT = (o_, on_, span[w][10]) if on_ in bb else (i_, in_, span[w][12])
+      if NT < 2 or not _hmx_ptr_pairable(rowptr, lp, ranges): return None
+      n0, n1 = "{%d}" % len(rowptr), "{%d}" % (len(rowptr)+1)
+      ab, bb = ab.replace(on_, n0).replace(in_, n1), bb.replace(on_, n0).replace(in_, n1)
+      nv = n0 if nl == on_ else n1
+      mac0 = f" __hmx_mac_span_raw(__hmx_ca({ab}), {bb}, {kt_});"
+      mac1 = f" __hmx_mac_span_raw(__hmx_ca({ab}), {bb}+{m.group(1)}, {kt_});"
+      deferred.append(True)
+      return (f"{{{{ if (({nv})%2==0 && ({nv})+1<{NT}) {{{{{_hmx_deferred(mac0, mac1)} }}}}"
+              f" else if (({nv})%2==0) {{{{{_hmx_deferred(mac0, None)} }}}} }}}}", (o_, i_))
+    def pair_inner(rowptr:list[UOp]) -> tuple[str, tuple]|None:
+      # every B tile cached, indexed by the inner tile loop (attention's S^T = K Q^T: one K tile, 30 x 30 output tiles): on
+      # even inner tiles compute tiles n, n+1 (B's next slot) and write full 128-byte rows (__hmx_outp); odd ones have nothing
+      # left to do. The first outer pass packs B tile n+1 only in iteration n+1, so it stores tile by tile
+      if not (w in span and span[w][11] and bool(getenv("HMX_OUTPAIR", 1)) and _hmx_ptr_pairable(rowptr, span[w][4], ranges)):
+        return None
+      ab, bb, kt_, o_, i_, on_, in_, bacc, st_ = span[w][:9]
+      n0, n1 = "{%d}" % len(rowptr), "{%d}" % (len(rowptr)+1)
+      ab, bb = ab.replace(on_, n0).replace(in_, n1), bb.replace(on_, n0).replace(in_, n1)
+      mac0 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});"
+      mac1 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}+{st_}), {kt_});"
+      pp = "".join(f" __hmx_outp({{{2*q}}}, {{{2*q+1}}}, _p+{64*q}, _q+{64*q});" for q in range(16))
+      one = f"{{{{{mac0} const __fp16* _p = __hmx_store();" + "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16)) + " }}"
+      if HMX_DEFER:
+        deferred.append(True)
+        two, one = _hmx_deferred(mac0, mac1), "{{" + _hmx_deferred(mac0, None) + " }}"
+        return (f"{{{{ if (({n0})>0) {{{{ if (({n1})%2==0 && ({n1})+1<{span[w][12]}) {{{{{two} }}}} else if (({n1})%2==0) {one} }}}}"
+                f" else {one} }}}}", (o_, i_))
+      return (f"{{{{ if (({n0})>0) {{{{ if (({n1})%2==0 && ({n1})+1<{span[w][12]}) {{{{{mac0} const __fp16* _p = __hmx_store();{mac1}"
+              f" const __fp16* _q = __hmx_store2();{pp} }}}} else if (({n1})%2==0) {one} }}}} else {one} }}}}", (o_, i_))
     if (direct:=_hmx_direct_out(uops, pos, users, end_at, stores)) is not None:
       # the accumulator array is only copied to an output buffer after the loop: write the tile rows there directly
       rowptr, gone = direct
       drop |= gone
+      if raw_store(rowptr, max(pos[g] for g in gone if g.op is Ops.STORE)): continue
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       if getenv("HMX_DEBUG"): print("outpair:", w in span, w in span and span[w][9], w in span and span[w][1], [(p.op, len(p.src)) for p in rowptr[:2]],
                                     w in span and _hmx_ptr_pairable(rowptr, span[w][3], ranges))
       if w in span and span[w][9] and bool(getenv("HMX_OUTPAIR", 1)) and _hmx_ptr_pairable(rowptr, span[w][3], ranges):
         # B tiles n, n+1 are packed together on even n: compute both output tiles there (two spanning load pairs, two
         # stores to VTCM) and write full 128-byte rows; odd n has nothing left to do; an unpaired last tile stores alone
-        ab, bb, kt_, o_, i_, on_, in_, bacc, st_, _, ON = span[w]
+        ab, bb, kt_, o_, i_, on_, in_, bacc, st_, _, ON = span[w][:11]
         n0, n1 = "{%d}" % len(rowptr), "{%d}" % (len(rowptr)+1)
         ab, bb = ab.replace(on_, n0).replace(in_, n1), bb.replace(on_, n0).replace(in_, n1)
         mac0 = f" __hmx_mac_span(__hmx_ca({ab}), __hmx_{bacc}({bb}), {kt_});"
@@ -1914,15 +2615,24 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         pp = "".join(f" __hmx_outp({{{2*q}}}, {{{2*q+1}}}, _p+{64*q}, _q+{64*q});" for q in range(16))
         code = (f"{{{{ if (({n0})%2==0 && ({n0})+1<{ON}) {{{{{mac0} const __fp16* _p = __hmx_store();{mac1} const __fp16* _q = __hmx_store2();{pp} }}}}"
                 f" else if (({n0})%2==0) {{{{{mac0} const __fp16* _p = __hmx_store();{pairs} }}}} }}}}")
+        if HMX_DEFER:
+          deferred.append(True)
+          code = (f"{{{{ if (({n0})%2==0 && ({n0})+1<{ON}) {{{{{_hmx_deferred(mac0, mac1)} }}}}"
+                  f" else if (({n0})%2==0) {{{{{_hmx_deferred(mac0, None)} }}}} }}}}")
         at = max(pos[g] for g in gone if g.op is Ops.STORE)
         after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
                                         [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+(o_, i_), code)])
+        continue
+      if (pc:=pair_raw(rowptr) or pair_inner(rowptr)) is not None:
+        at = max(pos[g] for g in gone if g.op is Ops.STORE)
+        after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
+                                        [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+pc[1], pc[0])])
         continue
       # where the last replaced store was: every row pointer expression is rendered by then
       at = max(pos[g] for g in gone if g.op is Ops.STORE)
       sm, sx = span_mac(tuple(rowptr))
       after.setdefault(at, []).extend([u for u in dict.fromkeys(rowptr) if u not in pos] +
-                                      [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}")])
+                                      [UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, one_tile(sm, pairs))])
       continue
     row_of = {}
     for so in stores:  # stores that are exactly the tile's 32 rows (IDX(i, 0..31)): the HVX row-pair output
@@ -1932,9 +2642,13 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
       row_of[i] = so.src[0]
     if sorted(row_of) == list(range(32)):
       rowptr = [row_of[i] for i in range(32)]
+      if raw_store(rowptr, end_at): continue
+      if (pc:=pair_raw(rowptr) or pair_inner(rowptr)) is not None:
+        after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+pc[1], pc[0]))
+        continue
       pairs = "".join(f" __hmx_out2({{{2*q}}}, {{{2*q+1}}}, _p+{64*q});" for q in range(16))
       sm, sx = span_mac(tuple(rowptr))
-      after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, "{{"+sm+" const __fp16* _p = __hmx_store();"+pairs+" }}"))
+      after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(rowptr)+sx, one_tile(sm, pairs)))
       continue
     sm, sx = span_mac(tuple(so.src[0] for so in stores))
     after.setdefault(end_at, []).append(UOp(Ops.CUSTOM, dtypes.void, tuple(so.src[0] for so in stores)+sx,
@@ -1950,6 +2664,9 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
     if u in replace: out.append(replace[u])
     elif u not in drop: out.append(u)
     out += after.get(i, [])
+  if deferred:
+    fl = UOp(Ops.CUSTOM, dtypes.void, (), "__hmx_flush();")
+    out = out[:-1] + [fl, out[-1]] if out and out[-1].op is Ops.SINK else out + [fl]
   if loops is not None and (swap_out[0] if swap_out else loops[2]): out = _hmx_interchange(out, loops[0], loops[1])
   return out, True
 
@@ -1986,6 +2703,13 @@ def _hmx_pairable(rows, outer:UOp, ranges:list[UOp]) -> bool:
     return _hmx_const_delta(g, ranges)
   stride, nxt = diff(lambda env: _hmx_eval(i1, env)), diff(lambda env: _hmx_eval(i0, {**env, outer: env[outer] + 1}))
   return stride is not None and stride % 64 == 0 and nxt == 32
+
+def _hmx_kpairable(rows, kr:UOp, ranges:list[UOp]) -> bool:
+  # A's next K tile is its next 32 columns on the same rows, and the even K tiles start on a 128-byte line (row 0 and the row
+  # stride both multiples of 64 elements; buffers are 128-byte aligned): K tiles k, k+1 share each aligned row line
+  if not _hmx_pairable(rows, kr, ranges): return False
+  i0 = rows[0][0].src[0].src[1]
+  return _hmx_const_delta(lambda env: None if (v:=_hmx_eval(i0, {**env, kr: 0})) is None else v % 64, ranges) == 0
 
 def _hmx_quad_rows(rows, n:UOp, ranges:list[UOp]) -> bool:
   # 32-byte row windows whose row stride is a multiple of 128 bytes and whose next N tile (loop n) is the next 32 bytes: tiles
@@ -2102,7 +2826,23 @@ def _dsp_align(u:UOp, depth:int=0) -> int:
   return 1
 
 class DSPRenderer(ClangRenderer):
-  has_threads = False
+  # DSP_THREADS=N splits a kernel's outer global loop over a `core_id` argument, as the CPU backend does. The cDSP has
+  # several hardware threads (4 on the SDM845's v65) but one caller thread runs every kernel, and v65's float math is
+  # scalar, so this is where its parallelism is. Each output keeps its reduction order, so results are unchanged.
+  has_threads = DSP_THREADS > 1
+  # v65 float is scalar and each element costs tens to hundreds of cycles: a 64K-element kernel is worth four threads
+  thread_min_elems = 16 << 10
+  # v65: one 128-byte HVX register bounds a useful upcast (see hand_coded_optimizations)
+  @property
+  def upcast_max_bytes(self): return 128 if _v65_hw() else None
+  # the pool runs a kernel's slices strided over its DSP_THREADS threads, so a kernel may take more slices than threads: an axis
+  # no thread count divides (625 = 5^4 rows) can still be split, 25 slices over 4 threads (apply_threads)
+  # (v68+ only, like the arithmetic-weighted thread threshold: the v65 programs are tuned and checked without them)
+  @property
+  def global_max(self): return (DSP_THREADS * (1 if _v65_hw() else 8), 0, 0) if DSP_THREADS > 1 else None  # type: ignore[override]
+  pool_threads = DSP_THREADS
+  @property
+  def thread_work_weighted(self) -> bool: return not _v65_hw()  # apply_threads weighs elements by the kernel's arithmetic
   def inline_load(self, u:UOp) -> bool: return _inline_vector_load(self, u)
   buffer_suffix = " restrict __attribute__((align_value(128)))"
   kernel_typedef = "__attribute__((noinline)) void"
@@ -2137,6 +2877,7 @@ class DSPRenderer(ClangRenderer):
   def render(self, uops:list[UOp]) -> str:
     self._hmx_acc = False
     if self.hmx_acc: uops, self._hmx_acc = _hmx_acc_rewrite(uops)
+    uops = _transpose_groups(self, uops)
     # _lane_window: uop positions and (position, buffer) of every store
     self._pos = {u:i for i,u in enumerate(uops)}
     self._stores = [(i, _hmx_param(u.src[0])) for i,u in enumerate(uops) if u.op is Ops.STORE]
@@ -2191,8 +2932,16 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     prefix += _cmp_helpers(uops)
+    prefix += [_transpose_helper(t, n) for t, n in sorted(getattr(self, '_tr_types', ()))]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith(("__dw_hvx(", "__dw_prep")) for u in uops): prefix.append(_DW_HVX_HELPERS)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and "__msda_call(" in u.arg for u in uops): prefix.append(_msda_helpers())
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_attn") for u in uops): prefix.append(_attn_helpers(True))
+    elif any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__attn_sm_vtcm(") for u in uops): prefix.append(_attn_helpers(False))
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
@@ -2252,7 +3001,12 @@ class DSPRenderer(ClangRenderer):
     msrc += ["return 0; }"]
     return '\n'.join(msrc)
 
-  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
+  # with DSP_V65_HW=1, half is emulated (stored as fp16 bits, computed in float32; codegen/decomp/dtype.py): __fp16 is storage-only on
+  # Hexagon without _Float16 support (V65 HVX has no half float), and clang miscompiles it here -- vector conversions become
+  # uitofp of the raw bits (1.5h -> 15872.0f), and the scalar __extendhfsf2/__truncsfhf2 libcalls resolve to the
+  # toolchain libgcc.a's copies, which use a different calling convention. openpilot's fp16 ONNX graphs hit both.
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)+((dtypes.half,) if _v65_hw() else ())}
 
 def rpc_sc(method=0, ins=0, outs=0, fds=0): return (method << 24) | (ins << 16) | (outs << 8) | fds
 def rpc_prep_args(ins=None, outs=None, in_fds=None):
@@ -2273,27 +3027,37 @@ class DSPProgram(Program['DSPDevice']):
 
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.size)
-    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v)
+    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.alloc_size)
+    for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)):
+      struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v or 0)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
-    self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
-    return timer[0] / 1e6
+    total = 0
+    core = next((i for i,(name,*_) in enumerate(self.signature[len(bufs):], start=len(bufs)) if name == 'core_id'), None)
+    # this runner calls the kernel once per core_id, serially; a graph runner can run the slices on separate threads
+    for tid in range(global_size[0] if core is not None else 1):
+      if core is not None: struct.pack_into('i', var_vals_mv, core*8, tid)
+      self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
+      total += timer[0]
+    return total / 1e6
 
 class DSPBuffer:
-  def __init__(self, va_addr:int, size:int, share_info, offset:int=0):
+  def __init__(self, va_addr:int, size:int, share_info, offset:int=0, alloc_size:int|None=None):
     self.va_addr, self.size, self.share_info, self.offset = va_addr, size, share_info, offset
+    self.alloc_size = alloc_size if alloc_size is not None else size
 
 class DSPAllocator(Allocator['DSPDevice']):
   def _alloc(self, size:int, options:BufferSpec):
+    alloc_size = round_up(size+128, 0x1000)
     if getenv("MOCKDSP") or getenv("HEXSIM"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
     else:
-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=alloc_size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID,
+                                 flags=qcom_dsp.ION_FLAG_CACHED)
       fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
-    return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0)
+    return DSPBuffer(libc.mmap(0, alloc_size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0, alloc_size=alloc_size)
 
   @suppress_finalizing
   def _free(self, opaque:DSPBuffer, options:BufferSpec):
-    libc.munmap(opaque.va_addr, opaque.size)
+    libc.munmap(opaque.va_addr, opaque.alloc_size)
     if opaque.share_info is not None:
       os.close(opaque.share_info.fd)
       qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
@@ -2301,7 +3065,8 @@ class DSPAllocator(Allocator['DSPDevice']):
   def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
   def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
   def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
-  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset)
+  def _offset(self, buf, size:int, offset:int):
+    return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset, max(size, buf.alloc_size-offset))
 
 def _find_libgcc() -> str:
   # Every kernel this backend has ever compiled before HEXSIM/float32 support (uint8/int8/int32
@@ -2377,7 +3142,11 @@ class DSPCompiler(Compiler):
 
       self.args = f"-shared {compiler_args} -T{self.link_ld.name}"
 
-    super().__init__(None if mock else "compile_dsp")
+    # the mock (qemu) build is cached too, keyed on its flags and compiler: a recompile of a model after a small codegen change, or
+    # a second model sharing kernels, only builds the kernels whose source changed (the capture of a large model is mostly this)
+    import hashlib
+    mock_key = hashlib.sha256(f"{getenv('CC','clang')}|{self.args}|{self.libgcc}".encode()).hexdigest()[:16]
+    super().__init__(f"compile_mockdsp_{mock_key}" if mock else "compile_dsp")
 
   def __del__(self):
     if not self.mock: os.unlink(self.link_ld.name)
@@ -2531,10 +3300,12 @@ _TRUNCF = "({union{float f;unsigned u;} _v={(%s)}; int _e=(int)((_v.u>>23)&255u)
 # LLVM 19's Hexagon backend aborts ("Cannot select: v8i8 = bitcast <v8i1 HexagonISD::V2Q>") when a few scalar float compares,
 # ANDed with other bools, get packed into one small (4/8-lane) char/int vector -- a lane-stacked store of compare results,
 # e.g. a pairwise IoU test. Without HVX float (v65/v66) the compares can't be vectorized profitably anyway: an empty asm on
-# each scalar float compare result keeps it a scalar predicate and the backend never forms the v8i1.
+# each scalar float compare result keeps it a scalar predicate and the backend never forms the v8i1. The Hexagon SDK's compiler
+# aborts the same way for v69 code (BEVFormer's camera visibility, (bev_mask.sum(-1) > 0) stored as 8 uint8 lanes), so a v68+
+# capture (rendered here, under MOCKDSP) keeps the barrier too; real vector compares (HVX_REVEC_CMP) are not scalar and unaffected
 _FCMP = "({_Bool _c=(%s); __asm__(\"\" : \"+r\"(_c)); _c;})"
 def _scalar_fcmp(ctx, x:UOp) -> str|None:
-  if HVX_QFLOAT or x.max_numel() != 1 or x.src[0].max_numel() != 1 or not dtypes.is_float(x.src[0].dtype): return None
+  if x.max_numel() != 1 or x.src[0].max_numel() != 1 or not dtypes.is_float(x.src[0].dtype): return None
   return _FCMP % ctx.code_for_op[x.op](*[ctx[s] for s in x.src], x.src[0].dtype)
 mock_dsp_string = PatternMatcher([(UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="x"), _scalar_fcmp)])
 
@@ -2553,13 +3324,21 @@ class MockDSPRenderer(DSPRenderer):
     for i,b in enumerate(bufs):
       if b[1][0].addrspace == AddrSpace.GLOBAL:
         sz = b[1][0].max_numel()*b[1][0].dtype.itemsize
+        # LLVM can issue a full 128-byte HVX load for a 64-byte half vector. Keep the
+        # logical input size unchanged, but map a guarded tail so final vector loads stay valid.
+        map_sz = round_up(sz+128, 4096)
         # for loop for big reads
-        msrc.append(f"void *buf{i} = mmap2(0, {sz}, 3, 0x21, -1, 0); for(int rd = 0; rd < {sz}; rd += read(0, buf{i}+rd, {sz}-rd));")
+        msrc.append(f"void *buf{i} = mmap2(0, {map_sz}, 3, 0x21, -1, 0); for(int rd = 0; rd < {sz}; rd += read(0, buf{i}+rd, {sz}-rd));")
       else:
         msrc.append(f"{self._render_dtype(b[1][0].dtype)} val{i}; read(0, &val{i}, {b[1][0].dtype.itemsize});")
     msrc.append("unsigned int st = inscount();")
     params = [(f'(void*)buf{i}' if b[1][0].addrspace == AddrSpace.GLOBAL else f'val{i}') for i,b in enumerate(bufs)]
-    msrc.append(f"{function_name}({', '.join(params)});")
+    call = f"{function_name}({', '.join(params)});"
+    # a threaded kernel runs every core_id slice in turn (the caller's core_id value is read and ignored)
+    for i,b in enumerate(bufs):
+      if b[1][0].op is Ops.PARAM and b[1][0].addrspace != AddrSpace.GLOBAL and b[1][0].expr == 'core_id':
+        call = f"for (val{i} = 0; val{i} <= {int(b[1][0].vmax)}; val{i}++) {{ {call} }}"
+    msrc.append(call)
     msrc.append("unsigned int et = inscount() - st; write(1, &et, sizeof(et));")
     for i,b in enumerate(bufs):
       if b[1][0].addrspace == AddrSpace.GLOBAL: msrc.append(f"write(1, buf{i}, {b[1][0].max_numel()*b[1][0].dtype.itemsize});")
@@ -2575,7 +3354,7 @@ class MockDSPProgram(Program[DSPDevice]):
       os.chmod(dsp_lib.name, 0o0777)
       proc = subprocess.run(["qemu-hexagon-static", *(['-strace'] if DEBUG >= 5 else []), dsp_lib.name],
         input=b''.join([bytes(to_mv(x.va_addr, x.size)) for x in bufs] +
-                       [struct.pack(unwrap(dt.fmt), x) for x,(_,_,dt,_) in zip(vals, self.signature[len(bufs):])]),
+                       [struct.pack(unwrap(dt.fmt), x or 0) for x,(_,_,dt,_) in zip(vals, self.signature[len(bufs):])]),
         stdout=subprocess.PIPE, check=True)
     offset = 4
     for x in bufs:

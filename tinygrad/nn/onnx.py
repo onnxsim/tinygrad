@@ -5,9 +5,9 @@ from tinygrad.nn.state import TensorIO
 from tinygrad.tensor import Tensor, is_numpy_ndarray
 from tinygrad.mixin.op import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, TC_OPT
-from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
+from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, _to_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
-from tinygrad.uop.ops import sint, _broadcast_shape
+from tinygrad.uop.ops import sint, _broadcast_shape, UOp
 
 # ***** protobuf definitions ******
 class WireType(enum.IntEnum):
@@ -34,7 +34,12 @@ class OnnxDataType(enum.IntEnum):
   FLOAT = 1; UINT8 = 2; INT8 = 3; UINT16 = 4; INT16 = 5; INT32 = 6; INT64 = 7; BOOL = 9; FLOAT16 = 10; DOUBLE = 11; UINT32 = 12 # noqa: E702
   UINT64 = 13; BFLOAT16 = 16 # noqa: E702
 
-  def to_dtype(self) -> DType: return DTYPES_DICT[self.name.lower()]
+  def to_dtype(self) -> DType:
+    dt = self.to_storage_dtype()
+    # ONNX_FP16_AS_FP32=1 computes a float16 model in float32: for targets with no fp16 hardware (e.g. Hexagon v65 HVX,
+    # where every fp16 operand is a soft-float libcall), fp16 storage only costs conversions
+    return dtypes.float32 if dt == dtypes.float16 and getenv("ONNX_FP16_AS_FP32") else dt
+  def to_storage_dtype(self) -> DType: return DTYPES_DICT[self.name.lower()]
 
 # ***** onnx spec definitions *****
 class Domain(enum.Enum):
@@ -46,6 +51,7 @@ class Domain(enum.Enum):
   MICROSOFT_NCHWC = "com.microsoft.nchwc"
   MICROSOFT_EXPERIMENTAL = "com.microsoft.experimental"
   PYTORCH_ATEN = "org.pytorch.aten"
+  ONNXSIM = "onnxsim"  # onnxsim's own ops (MSDA: the hand-kernel span of bevformer_tiny/msda_hvx/export_msda_op.py in onnxsim)
   @classmethod
   def from_onnx(cls, domain: str | None) -> "Domain": return cls.ONNX if domain is None or domain == "" else cls(domain)
 
@@ -233,16 +239,19 @@ class OnnxPBParser:
       obj["data_location"] = 0
 
     # parse tensor
-    dtype = OnnxDataType(obj['data_type']).to_dtype()
+    dtype, storage_dtype = OnnxDataType(obj['data_type']).to_dtype(), OnnxDataType(obj['data_type']).to_storage_dtype()
     shape = tuple(obj['dims'])
     present_fields = [field for field in ['float_data', 'int32_data', 'int64_data', 'double_data', 'uint64_data', 'raw_data'] if field in obj]
     assert len(present_fields) == 1, f"only 1 data field is allowed from {obj=}"
     data = obj[present_fields[0]]
     if not isinstance(data, Tensor):
-      obj["parsed_tensor"] = Tensor(data, dtype=dtype).reshape(shape)
+      obj["parsed_tensor"] = Tensor(data, dtype=storage_dtype).reshape(shape).cast(dtype)
       return obj
     assert isinstance(data, Tensor) and data.dtype == dtypes.uint8, data
-    data = data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
+    if dtype != storage_dtype:
+      # promoted on the host, so the device graph holds float32 weights and has no conversion kernel
+      data = Tensor(data.bitcast(storage_dtype).numpy().astype(_to_np_dtype(dtype))).reshape(shape).to(Device.DEFAULT)
+    else: data = data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
     # const folding
     if shape == ():
       if data.dtype == dtypes.float16 and sys.version_info < (3, 12): data = data.cast(dtypes.float32)
@@ -362,6 +371,31 @@ required_input_python_consts: dict[str, tuple[int, ...]] = {
 def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
   return t.data().tobytes() if t.dtype == dtypes.uint8 else t.tolist()
 
+# GEMM_FP16 products on the DSP and the hand softmax's results, by the id of the fp32 tensor the ONNX graph sees (with the
+# tensor itself, to tell a reused id): the padded fp16 product a softmax can take instead / the padded fp16 probabilities the
+# next product takes as its A
+# (fp32 result, padded fp16 product, M, N, A, B unpadded, fp32 A, B)
+_fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor, Tensor, Tensor]] = {}
+_fp16_in: dict[int, tuple[Tensor, Tensor]] = {}
+# softmax(q @ k^T) results that P @ V can instead compute as one fused HMX attention call (_hmx_attn_dsp): q, k^T fp16 operands
+_attn_in: dict[int, tuple[Tensor, Tensor, Tensor, int, int, Tensor, Tensor]] = {}  # (+ the fp32 q, k^T the product took)
+# realized transposed copies (TRANSPOSE_CONTIGUOUS) -> the transposing view each copies: a consumer that builds its own layout
+# from an operand (the generated attention, _attn_heads) reads through them to the source (_untranspose)
+_tview: dict[UOp, UOp] = {}
+
+def _untranspose(t:Tensor) -> Tensor:
+  """t with each realized transposed copy it reads through movement and elementwise ops (BEVFormer's k^T: Transpose, Reshape,
+  Transpose, Mul by the scale) replaced by its view, so a copy into another layout reads the source once. It stops at anything
+  else (a reduce, a realized product): rebuilt past those, the graph above them would be computed again"""
+  from tinygrad.uop.ops import Ops, GroupOp
+  @functools.cache
+  def go(u:UOp) -> UOp:
+    if (v := _tview.get(u)) is not None: return go(v)
+    if u.op not in GroupOp.Movement and u.op not in GroupOp.ALU and u.op is not Ops.CAST: return u
+    src = tuple(go(x) for x in u.src)
+    return u if all(a is b for a, b in zip(src, u.src)) else u.replace(src=src)
+  return Tensor(go(t.uop), device=t.device)
+
 # ***** runner ******
 debug = int(getenv("DEBUGONNX", "0"))
 limit = int(getenv("ONNXLIMIT", "-1"))
@@ -430,6 +464,211 @@ class OnnxRunner:
                                       for n in self.graph_nodes)
     return self
 
+  def _qdq_int_conv(self, node, inps, opts) -> Tensor|None:
+    """ONNX_QDQ_INT_CONV=1: Conv(DequantizeLinear(xq), DequantizeLinear(wq)) with u8/u16 xq (per-tensor) and int8/int16 wq
+    (per-channel, zero point 0) as an integer convolution (nn/qconv_v65.py); None keeps the float Conv"""
+    import numpy as np
+    from tinygrad.nn.qconv_v65 import qconv2d
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    xn, wn = self._producers.get(node.inputs[0]), self._producers.get(node.inputs[1])
+    if xn is None or wn is None or xn.op != "DequantizeLinear" or wn.op != "DequantizeLinear": return None
+    if opts.get("auto_pad", "NOTSET") != "NOTSET" or len(inps[1].shape) != 4: return None
+    xq = self.graph_values[xn.inputs[0]]
+    if not isinstance(xq, Tensor) or xq.dtype not in (dtypes.uint8, dtypes.uint16): return None
+    def arr(name): return np.asarray(self.graph_values[name].numpy() if isinstance(self.graph_values[name], Tensor) else self.graph_values[name])
+    # the quantization parameters and weights are constants: read once (the first, uncaptured call) and cached, since a TinyJit
+    # capture can't read tensor data. A node that doesn't qualify is cached as None and stays a float Conv
+    key = node.outputs[0]
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      sx, wq = arr(xn.inputs[1]), arr(wn.inputs[0])
+      if sx.size != 1 or wq.dtype not in (np.int8, np.int16): return None
+      if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
+      zx = int(arr(xn.inputs[2]).reshape(-1)[0]) if len(xn.inputs) > 2 and xn.inputs[2] else 0
+      sw = np.broadcast_to(arr(wn.inputs[1]).astype(np.float32).reshape(-1), (wq.shape[0],)).copy()
+      self._qconv_w[key] = (float(sx.reshape(-1)[0]), zx, wq, sw)
+    if (cached:=self._qconv_w[key]) is None: return None
+    sx_f, zx, wq, sw = cached
+    pads = opts.get("pads", 0)
+    p = [pads] * 4 if isinstance(pads, int) else list(pads)
+    # ONNX_QDQ_REQUANT=1 (lossy by the plan's bounded number of output steps): a Conv whose only consumer is a QuantizeLinear with
+    # per-tensor u8/u16 parameters returns the quantized tensor itself, from integer fixed-point arithmetic (qconv_v65.requant_plan)
+    out_q = None
+    if getenv("ONNX_QDQ_REQUANT"):
+      rkey = ("r", node.outputs[0])
+      if rkey not in self._qconv_w:
+        self._qconv_w[rkey] = None
+        if not hasattr(self, "_consumers"):
+          self._consumers = {}
+          for n in self.graph_nodes:
+            for i in n.inputs: self._consumers.setdefault(i, []).append(n)
+        cons = self._consumers.get(node.outputs[0], [])
+        if len(cons) == 1 and cons[0].op == "QuantizeLinear" and node.outputs[0] not in self.graph_outputs and len(cons[0].inputs) >= 3 and \
+            all(nm in self.graph_values and not isinstance(self.graph_values[nm], type(None)) for nm in cons[0].inputs[1:3]):
+          sy, zy = arr(cons[0].inputs[1]).reshape(-1), arr(cons[0].inputs[2]).reshape(-1)
+          bias = arr(node.inputs[2]).reshape(-1) if len(node.inputs) > 2 and node.inputs[2] else None
+          if sy.size == 1 and zy.size == 1 and zy.dtype in (np.uint8, np.uint16):
+            self._qconv_w[rkey] = (float(sy[0]), int(zy[0]), 255 if zy.dtype == np.uint8 else 65535, bias)
+      out_q = self._qconv_w[rkey]
+    ret = qconv2d(xq, zx, sx_f, wq, sw, inps[2] if len(inps) > 2 else None,
+                  stride=opts.get("strides", 1), dilation=opts.get("dilations", 1), padding=(p[1], p[3], p[0], p[2]),
+                  groups=opts.get("group", 1), out_q=out_q)
+    if out_q is not None and ret.dtype in (dtypes.uint8, dtypes.uint16):
+      if not hasattr(self, "_conv_q"): self._conv_q = set()
+      self._conv_q.add(node.outputs[0])
+    return ret
+
+  _QDQ_MOVES = ("Reshape", "Transpose", "Squeeze", "Unsqueeze", "Flatten", "Identity", "Slice")
+  _QDQ_VALUE = ("Gelu", "Relu", "Sigmoid", "Tanh", "Div", "Mul", "Add", "Sub", "Cast")
+
+  def _qdq_lut(self, node) -> Tensor|None:
+    """ONNX_QDQ_LUT=1, at a QuantizeLinear with per-tensor u8/u16 output parameters:
+    - Q(move(DQ(q))) with the same scale and zero point (the full-QDQ quantizer wraps even Reshape/Transpose) is move(q) on the
+      integer tensor, and Q(DQ(q)) is q;
+    - otherwise Q(f(src)), for a chain f of single-input value ops (Gelu, Relu, Sigmoid, Tanh, Div/Mul/Add/Sub by a scalar
+      or uniform constant, Cast) from a <= 16-bit integer source (DequantizeLinear of u8/u16, or a u8/u16 tensor itself, like the camera
+      frame), is a table of f over all 256/65536 source values: computed once on the host (float32 dequantize, f in float64,
+      round half to even, saturate), then one gather per element"""
+    import numpy as np, math
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    def arr(name):
+      v = self.graph_values[name]
+      return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+    def const(name):  # an initializer, a Constant, or a DequantizeLinear of constants (the full-QDQ quantizer's quantized scalars)
+      if name in self.const_names: return True
+      p = self._producers.get(name)
+      return p is not None and (p.op == "Constant" or (p.op == "DequantizeLinear" and all(const(i) for i in p.inputs if i)))
+    def qparams(n): return (arr(n.inputs[1]).reshape(-1), arr(n.inputs[2]).reshape(-1) if len(n.inputs) > 2 and n.inputs[2] else np.zeros(1))
+    key = ("q", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      sy, zy = qparams(node)
+      if sy.size != 1 or len(node.inputs) < 3 or not node.inputs[2] or zy.dtype not in (np.uint8, np.uint16): return None
+      # 1. movement fold
+      p = self._producers.get(node.inputs[0])
+      if p is not None and p.op in self._QDQ_MOVES: dq = self._producers.get(p.inputs[0])
+      else: dq, p = p, None
+      if dq is not None and dq.op == "DequantizeLinear" and all(const(x) for x in dq.inputs[1:] if x):
+        sx, zx = qparams(dq)
+        if sx.size == 1 and sx[0] == sy[0] and int(zx[0]) == int(zy[0]) and \
+           self.graph_values[dq.inputs[0]].dtype == (dtypes.uint8 if zy.dtype == np.uint8 else dtypes.uint16):
+          self._qconv_w[key] = ("move", p, dq.inputs[0])
+      # 2. table over a value chain
+      if self._qconv_w[key] is None:
+        chain, t = [], node.inputs[0]
+        while (n:=self._producers.get(t)) is not None and n.op in self._QDQ_VALUE:
+          var = [x for x in n.inputs if x and not const(x)]
+          if len(var) != 1: return None
+          # a constant operand is a scalar, or one value broadcast over the variable's shape (a per-channel mean constant whose
+          # channels all hold the same value) -- it must not widen the result
+          vshape = self.graph_values[var[0]].shape if isinstance(self.graph_values.get(var[0]), Tensor) else None
+          for x in (x for x in n.inputs if x and const(x)):
+            cv = arr(x)
+            if cv.size != 1 and (vshape is None or np.any(cv != cv.reshape(-1)[0]) or cv.ndim > len(vshape) or
+                                 any(d not in (1, v) for d, v in zip(cv.shape[::-1], vshape[::-1]))): return None
+          if n.op in ("Div", "Sub") and n.inputs[0] != var[0]: return None  # c / x, c - x: keep it simple
+          chain.append(n)
+          t = var[0]
+        src, x = None, None
+        if (n:=self._producers.get(t)) is not None and n.op == "DequantizeLinear" and all(const(i) for i in n.inputs[1:] if i):
+          sx, zx = qparams(n)
+          src = n.inputs[0]
+          if sx.size != 1 or self.graph_values[src].dtype not in (dtypes.uint8, dtypes.uint16): return None
+          size = 256 if self.graph_values[src].dtype == dtypes.uint8 else 65536
+          x = ((np.arange(size) - int(zx[0])).astype(np.float32) * np.float32(sx[0])).astype(np.float64)
+        elif isinstance(self.graph_values.get(t), Tensor) and self.graph_values[t].dtype in (dtypes.uint8, dtypes.uint16) and chain:
+          src, size = t, 256 if self.graph_values[t].dtype == dtypes.uint8 else 65536
+          x = np.arange(size).astype(np.float64)
+        if src is None or not chain and x is None: return None
+        for n in reversed(chain):
+          c = next((float(arr(i).reshape(-1)[0]) for i in n.inputs if i and const(i)), None)
+          if n.op == "Gelu":
+            x = 0.5 * x * (1 + (np.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)) if n.opts.get("approximate", "none") == "tanh"
+                                else np.vectorize(math.erf)(x / math.sqrt(2))))
+          elif n.op == "Relu": x = np.maximum(x, 0)
+          elif n.op == "Sigmoid": x = 1 / (1 + np.exp(-x))
+          elif n.op == "Tanh": x = np.tanh(x)
+          elif n.op == "Div": x = x / c
+          elif n.op == "Mul": x = x * c
+          elif n.op == "Add": x = x + c
+          elif n.op == "Sub": x = x - c
+          elif n.op == "Cast":
+            if OnnxDataType(n.opts["to"]).to_dtype() not in (dtypes.float32, dtypes.float16): return None
+          x = x.astype(np.float32).astype(np.float64)  # each ONNX op rounds to float32
+        info = np.iinfo(zy.dtype)
+        q = np.clip(np.rint(x.astype(np.float32) / np.float32(sy[0])) + int(zy[0]), info.min, info.max).astype(zy.dtype)
+        self._qconv_w[key] = ("lut", Tensor(q, device=self.graph_values[src].device).realize(), src)
+    if (plan:=self._qconv_w[key]) is None: return None
+    if plan[0] == "move":
+      mv, q = plan[1], self.graph_values[plan[2]]
+      if mv is None: return q
+      inps = [q] + [self._get_python_const(nm, mv.op, i) for i, nm in enumerate(mv.inputs) if i > 0]
+      return self._select_op(mv.op, mv.opset_id)(*inps, **mv.opts)
+    # its own buffer: fused into a consumer's padding, the gather's index load lost the pad mask (a phone TLB miss, qemu passed)
+    return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)].contiguous()
+
+  def _qdq_int_gemm(self, node, inps, opts) -> Tensor|None:
+    """ONNX_QDQ_INT_GEMM=1: Gemm (alpha = beta = 1, transA = 0) / MatMul with B = DequantizeLinear(int8/int16 constant, per output
+    channel, zero point 0, at least ONNX_QDQ_INT_GEMM_MIN elements) and a float A (a head) as integer vrmpy passes, A quantized to
+    uint16 at run time (nn/qconv_v65.qmatmul)"""
+    import numpy as np
+    from tinygrad.nn.qconv_v65 import qmatmul
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    key = ("g", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      if node.op == "Gemm" and (opts.get("alpha", 1.0) != 1.0 or opts.get("beta", 1.0) != 1.0 or opts.get("transA", 0)): return None
+      wn = self._producers.get(node.inputs[1])
+      if wn is None or wn.op != "DequantizeLinear" or wn.inputs[0] not in self.const_names: return None
+      def arr(name):
+        v = self.graph_values[name]
+        return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+      wq = arr(wn.inputs[0])
+      if wq.dtype not in (np.int8, np.int16) or wq.ndim != 2: return None
+      # only big weights: the integer path is ~7 small kernels (quantize the activation, cut its byte planes, a vrmpy pass per
+      # plane pair, the epilogue), which a 32x32 head layer's float GEMV beats; converting all ~90 driving heads was 891 ms
+      if wq.size < getenv("ONNX_QDQ_INT_GEMM_MIN", 65536): return None
+      if len(wn.inputs) > 2 and wn.inputs[2] and np.any(arr(wn.inputs[2]) != 0): return None
+      transB = node.op == "Gemm" and bool(opts.get("transB", 0))
+      sw = arr(wn.inputs[1]).astype(np.float32).reshape(-1)
+      n_out = wq.shape[0] if transB else wq.shape[1]
+      if sw.size not in (1, n_out) or (sw.size > 1 and wn.opts.get("axis", 1) != (0 if transB else 1)): return None
+      self._qconv_w[key] = (np.ascontiguousarray(wq.T if transB else wq), np.broadcast_to(sw, (n_out,)).copy())
+    if (plan:=self._qconv_w[key]) is None or not isinstance(inps[0], Tensor) or not dtypes.is_float(inps[0].dtype): return None
+    bias = inps[2] if node.op == "Gemm" and len(inps) > 2 and isinstance(inps[2], Tensor) else None
+    if bias is not None and bias.numel() != plan[0].shape[1]: return None
+    return qmatmul(inps[0], plan[0], plan[1], bias.reshape(-1) if bias is not None else None)
+
+  def _dq_unary_lut(self, node) -> Tensor|None:
+    """ONNX_QDQ_LUT=1: f(DequantizeLinear(xq)) for f in Gelu/Sigmoid/Tanh with a per-tensor u8/u16 xq and a float consumer (a
+    float head's Gemm input, say) is a float32 table of f over the 256/65536 values: computed once instead of once per use,
+    which also stops a reduce that fuses f from recomputing it for every output"""
+    import numpy as np, math
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    key = ("f", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      dq = self._producers.get(node.inputs[0])
+      if dq is None or dq.op != "DequantizeLinear": return None
+      src = dq.inputs[0]
+      if not isinstance(self.graph_values.get(src), Tensor) or self.graph_values[src].dtype not in (dtypes.uint8, dtypes.uint16): return None
+      def arr(name):
+        v = self.graph_values[name]
+        return np.asarray(v.numpy() if isinstance(v, Tensor) else v)
+      sx = arr(dq.inputs[1]).reshape(-1)
+      zx = int(arr(dq.inputs[2]).reshape(-1)[0]) if len(dq.inputs) > 2 and dq.inputs[2] else 0
+      if sx.size != 1: return None
+      size = 256 if self.graph_values[src].dtype == dtypes.uint8 else 65536
+      x = ((np.arange(size) - zx).astype(np.float32) * np.float32(sx[0])).astype(np.float64)
+      if node.op == "Gelu":
+        y = 0.5 * x * (1 + (np.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)) if node.opts.get("approximate", "none") == "tanh"
+                            else np.vectorize(math.erf)(x / math.sqrt(2))))
+      elif node.op == "Sigmoid": y = 1 / (1 + np.exp(-x))
+      else: y = np.tanh(x)
+      self._qconv_w[key] = (Tensor(y.astype(np.float32), device=self.graph_values[src].device).realize(), src)
+    if (plan:=self._qconv_w[key]) is None: return None
+    return plan[0][self.graph_values[plan[1]].cast(dtypes.int32)].contiguous()
+
   def _get_python_const(self, name:str, op:str, idx:int) -> list[ConstType]|ConstType|bytes|Any:
     """Convert tensor to python const with name-based caching for JIT stability."""
     t = self.graph_values[name]
@@ -479,7 +718,12 @@ class OnnxRunner:
 
         if debug >= 1: print((f"[{self.graph_name}] " if self.graph_name else "") + f"{num}: op '{node.op}' opt {opts}")
         if debug >= 2 and node.inputs: print("\tinputs:\n" + "\n".join(f"\t\t{x} - {i!r}" for x,i in zip(node.inputs, inps)))
-        ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
+        if node.op == "Conv" and getenv("ONNX_QDQ_INT_CONV") and (qc:=self._qdq_int_conv(node, inps, opts)) is not None: ret = qc
+        elif node.op == "QuantizeLinear" and node.inputs[0] in getattr(self, "_conv_q", ()): ret = self.graph_values[node.inputs[0]]
+        elif node.op == "QuantizeLinear" and getenv("ONNX_QDQ_LUT") and (qc:=self._qdq_lut(node)) is not None: ret = qc
+        elif node.op in ("Gelu", "Sigmoid", "Tanh") and getenv("ONNX_QDQ_LUT") and (qc:=self._dq_unary_lut(node)) is not None: ret = qc
+        elif node.op in ("Gemm", "MatMul") and getenv("ONNX_QDQ_INT_GEMM") and (qc:=self._qdq_int_gemm(node, inps, opts)) is not None: ret = qc
+        else: ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
         ret = ret if isinstance(ret, tuple) else (ret,)
         if debug >= 2: print("\toutputs:\n" + "\n".join(f"\t\t{x} - {o!r}" for x,o in zip(node.outputs, ret)))
 
@@ -617,8 +861,47 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def IsInf(x:Tensor, detect_negative:int=1, detect_positive:int=1): return x.isinf(bool(detect_positive), bool(detect_negative))
 
   # ***** Unary Ops (activation) *****
-  def softmax_1(x:Tensor, axis:int=1): return x.softmax(axis)
-  def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis)
+  # SOFTMAX_CONTIGUOUS=1: the softmax is realized on its own instead of fused into its consumer. Fused into attention's P @ V,
+  # the exp is computed inside the matmul once per (row, key) on a splat of the score across V's lanes (a whole vector exp per
+  # key on the DSP); on its own it is an elementwise kernel that vectorizes the exp across the keys
+  def _softmax_contig(x:Tensor, axis:int) -> Tensor:
+    # the last-axis softmax of a GEMM_FP16 product on the DSP (attention, Q @ K^T): the hand fp16 softmax on the padded product,
+    # and its padded fp16 result is what the next GEMM_FP16 product (P @ V) takes as its A. Generated, the slice + cast back, the
+    # three softmax kernels and the cast + pad for P @ V took ~45 ms per BEVFormer decoder layer (8 x 900 x 900)
+    if (ent := _fp16_out.get(id(x))) is not None and ent[0] is x and x._resolve_dim(axis) == x.ndim - 1 and ent[3] <= 2048:
+      _, y, M, N, q16, kth, qa, kb = ent
+      p16 = _softmax_h16_dsp(y, M, N, M + _hmx_pad_rows(M), N + -N % 32)
+      ret = p16[..., :M, :N].float()  # only computed if something else reads the probabilities
+      _fp16_in[id(ret)] = (ret, p16)
+      if q16.shape[-1] == 32 and q16.shape[-2] % 32 == 0 and kth.shape[-1] <= 1024: _attn_in[id(ret)] = (ret, q16, kth, M, N, qa, kb)
+      return ret
+    # a last-axis softmax over 2, 4 or 8 floats on the DSP (deformable attention's weights over its sampling points):
+    # HAND_SOFTMAX_GRP=1 takes the hand grouped softmax (_softmax_grp_dsp). Generated, the group max and sum are spelled as
+    # elementwise ops over the R lanes (no reduce): two elementwise kernels, exp(x - max) and e * 1 / sum, each one pass with
+    # the groups as lane gathers (HVX_SMALL_REDUCE, HVX_LANE_GATHER). The reduce form (max, sum of exp, exp / sum) took the exp
+    # twice; hexagon-sim, 160K floats: R=2 0.98 M cycles (hand 1.14 M), R=4 1.06 M (0.82 M), R=8 1.22 M (0.64 M)
+    if str(x.device).startswith("DSP") and x.dtype == dtypes.float32 and x._resolve_dim(axis) == x.ndim - 1 and x.shape[-1] in (2, 4, 8):
+      if getenv("HAND_SOFTMAX_GRP", 0): return _softmax_grp_dsp(x)
+      if getenv("SOFTMAX_GRP_FLAT", 1):
+        def lanes(t:Tensor) -> list[Tensor]: return [t[..., j:j+1] for j in range(t.shape[-1])]
+        e = (x - functools.reduce(Tensor.maximum, lanes(x))).exp().contiguous()
+        return e * (1 / functools.reduce(Tensor.add, lanes(e)))
+    if not getenv("SOFTMAX_CONTIGUOUS"): return x.softmax(axis)
+    # its row max and sum in two stages over (R // W, W): the first reduces R // W steps into W lanes that are contiguous in the
+    # input (vector accumulators), the second the W lanes. One stage reduced each row with the rows as the vector lanes, R floats
+    # apart -- a strided 4-wide load per row and step (BEVFormer's decoder: 900 keys, 2400 rows)
+    axis = x._resolve_dim(axis)
+    R = x.shape[axis]
+    W = next((w for w in (128, 64, 32) if isinstance(R, int) and R % w == 0 and R > w), None) or \
+        next((w for w in range(min(128, R // 2) if isinstance(R, int) else 0, 32, -1) if R % w == 0), None)
+    if W is None or axis != x.ndim - 1: return x.softmax(axis).contiguous()
+    split = (*x.shape[:-1], R // W, W)
+    # each first stage realized: fused with the second, the scheduler made one kernel and put the vector lanes on the rows again
+    m = x.reshape(split).max(-2).contiguous().max(-1, keepdim=True)
+    e = (x - m).exp()
+    return (e / e.reshape(split).sum(-2).contiguous().sum(-1, keepdim=True)).contiguous()
+  def softmax_1(x:Tensor, axis:int=1): return _softmax_contig(x, axis)
+  def softmax_13(x:Tensor, axis:int=-1): return _softmax_contig(x, axis)
   Softmax = {OpSetId(Domain.ONNX, 1):softmax_1, OpSetId(Domain.ONNX, 13):softmax_13}
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
   def Gelu(x:Tensor, approximate:str|None=None): return x.gelu(approximate="none" if approximate is None else approximate)
@@ -662,13 +945,27 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Min(*data_0:Tensor): return functools.reduce(Tensor.minimum, data_0)
   def Sum(*data_0:Tensor): return functools.reduce(Tensor.add, data_0)
   def Mean(*data_0:Tensor): return Sum(*data_0) / len(data_0)
+  def _reduce_last(x:Tensor, axes, keepdim:bool, op:str) -> Tensor|None:
+    # REDUCE_TWO_STAGE: a reduction over only the last (contiguous) axis, R = 32 * k with k > 1, in two stages: (R // 32, 32) ->
+    # 32 lanes, realized, then the 32. In one stage the rows became the vector lanes, R floats apart, with a 4x4 transpose per
+    # step (BEVFormer's LayerNorm statistics: 15 ms for 2500 rows of 256); the first stage is one 32-lane add per 32 floats
+    if not getenv("REDUCE_TWO_STAGE") or x.ndim == 0 or not isinstance(R:=x.shape[-1], int) or R % 32 or R < 64: return None
+    ax = tuple(sorted(a + x.ndim if a < 0 else a for a in ((axes,) if isinstance(axes, int) else axes or range(x.ndim))))
+    if ax != (x.ndim - 1,): return None
+    split = (*x.shape[:-1], R // 32, 32)
+    if op == "max": return x.reshape(split).max(-2).contiguous().max(-1, keepdim=keepdim)
+    r = x.reshape(split).sum(-2).contiguous().sum(-1, keepdim=keepdim)
+    return r / R if op == "mean" else r
   def ReduceMax(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "max")) is not None: return r
     return data.max(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceMin(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
     return data.min(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceSum(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "sum")) is not None: return r
     return data.sum(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceMean(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
+    if (r:=_reduce_last(data, _axes(axes, noop_with_empty_axes), bool(keepdims), "mean")) is not None: return r
     return data.mean(_axes(axes, noop_with_empty_axes), keepdim=keepdims)
   def ReduceSumSquare(data:Tensor, axes:list[int]|None=None, keepdims:int=1, noop_with_empty_axes:int=0):
     return ReduceSum(data.square(), axes, keepdims, noop_with_empty_axes)
@@ -695,7 +992,33 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Flatten(x:Tensor, axis:int=1): return x.reshape(prod(x.shape[0:axis]), -1)
   def Expand(x:Tensor, shape:list[int]): return x.expand(_broadcast_shape(x.shape, tuple(shape)))
   def Shrink(x:Tensor, bias:float=0.0, lambd:float=0.5): return (x < -lambd)*(x+bias) + (x > lambd)*(x-bias)
-  def Transpose(x:Tensor, perm:list[int]|None=None): return x.permute(order=perm or list(range(x.ndim)[::-1]))
+  # TRANSPOSE_CONTIGUOUS: the transposed copy is realized. As a view, a consumer that wants the transposed layout (attention's
+  # K^T feeding Q @ K^T) reads the source with the transposed strides, so its vector lanes become strided gathers
+  def Transpose(x:Tensor, perm:list[int]|None=None):
+    perm = perm or list(range(x.ndim)[::-1])
+    ret = x.permute(order=perm)
+    if not getenv("TRANSPOSE_CONTIGUOUS"): return ret
+    if str(x.device).startswith("DSP") and getenv("TRANSPOSE_SPLIT", 1) and (sp := _transpose_split(x, perm)) is not None: out = sp
+    else: out = ret.contiguous()
+    _tview[out.uop] = ret.uop
+    return out
+  def _transpose_split(x:Tensor, perm:list[int]) -> Tensor|None:
+    # a transposing copy whose two swapped axes (the input's last, the one that becomes the output's last) are multiples of 32
+    # takes 32 x 32 blocks (heuristic HVX_TRANSPOSE, renderer HVX_TRANSPOSE_NET: 0.3 ms for 6 x 256 x 384 floats on the V69).
+    # One that isn't (BEVFormer's camera maps, 6 x 256 x 375 -> 6 x 375 x 256: 6.2 ms) is split along it: the multiple-of-32
+    # part and the rest
+    a, b = x.ndim - 1, perm[-1]
+    if a == b or not all(isinstance(x.shape[i], int) for i in (a, b)) or (x.shape[a] % 32 == 0) == (x.shape[b] % 32 == 0): return None
+    sa = a if x.shape[a] % 32 else b
+    n, main = x.shape[sa], x.shape[sa] // 32 * 32
+    if main < 64: return None
+    # each part realized (lazily the scheduler fused them back into one kernel over the whole axis), then concatenated: a
+    # contiguous copy along the output's last axis (a slice assign into one buffer rewrote the whole buffer per part)
+    # The rest is the last 32 (overlapping the first part: a whole block too), of which the concat keeps its last n - main
+    def part(lo:int, hi:int) -> Tensor: return x.shrink(tuple((lo, hi) if i == sa else None for i in range(x.ndim))).permute(order=perm).contiguous()
+    j = perm.index(sa)
+    tail = part(n - 32, n).shrink(tuple((32 - (n - main), 32) if i == j else None for i in range(x.ndim)))
+    return part(0, main).cat(tail, dim=j).contiguous()
 
   def Squeeze(data:Tensor, axes:list[int]|None=None):
     return data.squeeze() if axes is None else functools.reduce(lambda d, dim: d.squeeze(dim), sorted(axes, reverse=True), data)
@@ -775,10 +1098,230 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def GlobalAveragePool(X:Tensor): return X.mean(axis=tuple(range(2, X.ndim)), keepdim=True)
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
 
-  def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
-    ret = alpha * (A.transpose(transA) @ B.transpose(transB))
-    if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
+  def _matmul_fp16(a:Tensor, b:Tensor) -> Tensor:
+    """a (..., M, K) @ b (..., K, N) in fp16 (fp16 inputs, fp32-exact accumulation and one fp16 rounding of the output on the
+    DSP's HMX), cast back to fp32. The fp16 operands are realized copies, padded to whole 32 x 32 HMX tiles, and the product is
+    realized before the slice and the cast back: the cast fused into the HMX kernel's tile packing, the cast back fused into its
+    output epilogue and tinygrad's own padding of a tensor-core axis (TC_OPT=2) each made the phone's HMX kernel slow and/or
+    wrong (M = 2500: 251 ms; padded here to 2528: as fast as M = 2560, 0.7 ms)"""
+    (M, K), N = a.shape[-2:], b.shape[-1]
+    r32 = lambda n: -n % 32
+    # cast first (with whatever the producer fused into it, e.g. a ReLU), then pad as a plain copy: padded in the same kernel, the
+    # row select landed on the fp16 result of the fused op instead of the load, which keeps all 128 lanes scalar (BEVFormer's
+    # FFN: ~6 ms per 900 x 512 cast)
+    # On the DSP a column pad that ends inside a 64-lane vector (900 -> 928) is the hand row copy (_rowcopy_dsp): generated, the
+    # column mask varied inside the vector that holds a row's end, memory coalescing grouped those lanes by mask into 4 + 16 +
+    # 8 + 4 pieces and the row was rebuilt lane by lane (BEVFormer's decoder attention probabilities, 8 x 900 x 900 -> 928 x 928:
+    # 129 ms on the V69). A row pad (the Gemms' M) or a narrow one is generated, as fast as the hand copy (hexagon-sim). The
+    # fused attention (_hmx_attn_dsp) takes k^T unpadded, so BEVFormer has none of the first kind left
+    dsp = str(a.device).startswith("DSP")
+    def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
+      t = t.half().contiguous()
+      if not (rows or cols): return t
+      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
+        return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
+      return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
+    # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: generated kernels head by head (HMX_ATTN=3, the default:
+    # BEVFormer's decoder 36.6 ms on the V69, the hand kernels' 37.9), the hand attention kernels (1, 2) or off (0)
+    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 3) == 3:
+      return _attn_heads(ent[5], ent[6], b, ent[3], ent[4])
+    if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 3):
+      return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
+    if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
+    else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
+    bh = b.half().contiguous()
+    b16 = pad16(bh, r32(K), r32(N))
+    y = a16.matmul(b16, dtype=dtypes.half).contiguous()
+    if y.shape[-2:] == (M, N): return y.float()
+    # the slice + cast back fuses into the consumers (a bias add, ...) for free -- except a softmax's, read through the view (49 ms
+    # more per BEVFormer decoder layer): on the DSP that takes the padded product itself (_softmax_contig)
+    ret = y[..., :M, :N].float()
+    if dsp: _fp16_out[id(ret)] = (ret, y, M, N, a16, bh, a, b)
     return ret
+
+  # at least two M tiles: the HMX lowering is wrong for a single 32-row M tile with several K tiles (32x128x256 and 32x256x128:
+  # cos ~0.71 in hexagon-sim and on the phone; 64x128x256 exact), e.g. BEVFormer's one-row can_bus MLP
+  def _hmx_pad_rows(M:int) -> int: return max(-M % 32, 64 - M)
+
+  def _attn_heads(q:Tensor, kt:Tensor, v:Tensor, M:int, N:int) -> Tensor:
+    """softmax(q k^T) v as generated kernels, one head at a time, transposed: S^T = K Q^T on the HMX (fp16), the softmax over the
+    keys -- S^T's rows, so the row max is a vector reduce with the queries as lanes, one stage (over S's rows it was a lane
+    reduction: a second stage of stride-64 gathers, 0.8 ms per head on the V69) --, O^T = V^T P^T on the HMX with P^T as its
+    row-major B. From q (..., M, 32), k^T (..., 32, N), v (..., N, 32) fp32 -> (..., M, 32) fp32. A head's S^T, exp'd in
+    place (1.8 MB for BEVFormer's 900 x 900), fits the VTCM the graph emitter places intermediates in (DSP_GRAPH_VTCM_KB); all
+    heads at once (13.8 MB) don't. Queries and keys are padded to a multiple of 64: rows of whole, aligned fp16 vectors.
+    The padding keys are masked by a constant bias column (-30000), the exp is computed once, in fp16 (exp2 of an fp16
+    argument: the renderer's 64-lane helper, HVX_HF_EXP2; probabilities within 5e-3 of fp32's).
+    The operands are built from the projections' outputs (_untranspose: BEVFormer's are (900, 256) row-major): Q^T and V^T as
+    32 x 32 block transposes, K as rows; and the result is one block transpose back to (M, heads x 32). Built from the ONNX
+    graph's realized (heads, 900, 32) / (heads, 32, 900) copies, each operand was a second transposing copy with rows of 900
+    (no whole vectors: 2.9 ms each, 13 ms per decoder layer)"""
+    *bs, _, D = q.shape
+    H, Mp, Np = prod(bs), M + -M % 64, N + -N % 64
+    q, kt, v = (_untranspose(t) for t in (q, kt, v))
+    # in fp32 (rows of 32 floats: whole HVX vectors, block transposes by the transpose network), padded rows first, cast last
+    def rows(t:Tensor, n:int, p:int) -> Tensor: return t.reshape(H, n, D).pad(((0, 0), (0, p - n), (0, 0))).contiguous()
+    # q times log2(e): S^T comes out in base 2 (exp2 of S^T - max, no multiply)
+    qT = (rows(q, M, Mp) * (1 / math.log(2))).transpose(1, 2).contiguous().half().contiguous()               # (H, 32, Mp)
+    kp = rows(kt.transpose(-1, -2), N, Np).half().contiguous()                                               # (H, Np, 32)
+    # V^T's row 32 is ones over the keys (zeros past N): the P V product's row 32 is then each query's sum of exp, and the
+    # normalization is a divide in the store of O^T (as a pass of its own over P^T: 0.25 ms per head on the V69, the sum 0.05)
+    ones = Tensor([1.0] * N + [0.0] * (Np - N), device=q.device).reshape(1, 1, Np).expand(H, 1, Np).pad(((0, 0), (0, 31), (0, 0)))
+    vT = rows(v, N, Np).transpose(1, 2).contiguous().cat(ones, dim=1).contiguous().half().contiguous()       # (H, 64, Np)
+    bias = Tensor([[0.0]] * N + [[-30000.0]] * (Np - N), device=q.device).half()                            # (Np, 1)
+    # each head's unnormalized O^T and its sums stored (cast to fp32) into its rows of one buffer: one store kernel per head.
+    # Stacked or concatenated, the heads were a per-element select over 8 buffers (24 ms per decoder layer); built in a zeros
+    # buffer, the scheduler folded the stores into one such kernel. The divide goes into the block transpose back: in the
+    # store, the sums' broadcast over the 32 rows made the rows the upcast axis (strided scalar loads and stores)
+    oT = Tensor.empty(H, D + 1, Mp, dtype=dtypes.float32, device=q.device)
+    if getenv("ATTN_RAW", 1):
+      # S^T and P^T in raw HMX tiles: no conversion either way. A buffer of Np Mp + 1000 fp16 elements (ops_dsp _HMX_RAW_TAIL) is
+      # one the HMX kernels write and read as raw tiles -- S^T's tile (key tile a, query tile b) at (b Nt + a) 1024, row pairs
+      # interleaved, as the HMX stores them and P V's spanning B load pair reads them -- while tinygrad sees a row-major (Np, Mp)
+      # matrix in both matmuls (the tensor cores apply as usual). Converting S^T's tiles to rows was ~125 us of the 180 us S^T
+      # call per head on the V69, packing P^T's back about as much of P V's. The softmax between runs on the raw tiles
+      # themselves, as R[mt, (nt, r), (c, p)] = S^T[32 nt + 2 r + p, 32 mt + c] (a flat reshape of the same memory): the max over
+      # the keys is a vector max over (nt, r) with (c, p) as lanes, then a max over p (both lanes of a pair get it); the bias is
+      # one row of tiles expanded over the queries
+      Mt, Nt = Mp // 32, Np // 32
+      def raw() -> Tensor: return Tensor.empty(Np * Mp + 1000, dtype=dtypes.half, device=q.device)
+      bias2 = bias.reshape(1, Nt, 16, 1, 2).expand(1, Nt, 16, 32, 2).reshape(1, Nt, 16, 64).contiguous()
+      for h in range(H):
+        sb, eb = raw(), raw()
+        sb[:Np * Mp].reshape(Np, Mp).assign(kp[h].matmul(qT[h], dtype=dtypes.half))
+        # N even (BEVFormer's 900): no bias. The keys below N are the first N / 2 row pairs, so the max and the sums reduce over
+        # those only, and the max is clamped at -15: the padding keys' scores are 0 (zero rows of K), their exp at most 2^15 (no
+        # inf), times V^T's zero columns in P V. The bias tiles were a DDR load next to each VTCM one, in the max and in the exp.
+        # (Underflows only where every score of a query is below -29 in log2 units, all of its probabilities < 2^-14)
+        nb = N % 2 == 0 and getenv("ATTN_NOBIAS", 1)
+        s = sb[:Np * Mp].reshape(Mt, Nt, 16, 64)
+        x = s if nb else s + bias2
+        mm = (s.reshape(Mt, Nt * 16, 64)[:, :N // 2] if nb else x).reshape(Mt, -1, 64).max(1, keepdim=True).contiguous()  # (Mt, 1, 64)
+        # the max of each lane pair, over a tile's 16 row pairs: broadcast over the key tiles only (30, which no vector width
+        # divides). Broadcast over all 480 row pairs, the DSP heuristic upcast them for its reuse (scalar loads 128 bytes apart)
+        # (three small kernels: the pair max, its lanes doubled by a vector shuffle, the broadcast copy at 64 lanes. Fused, or the
+        # pair max as a flip within pairs, the 64 lanes split into 32 x 2 and the kernel ran scalar fp16, ~0.09 ms per head)
+        m1 = mm.reshape(Mt, 32, 2).max(-1, keepdim=True)
+        m1 = (m1.maximum(-15) if nb else m1).expand(Mt, 32, 2).contiguous()
+        m2 = m1.reshape(Mt, 1, 1, 64).expand(Mt, 1, 16, 64).contiguous()
+        eb[:Np * Mp].reshape(Mt, Nt, 16, 64).assign((x - m2).exp2())
+        # the sums by a reduce over P's tiles, P V with V^T's 32 rows only: with the ones row the product took two M tiles, twice the
+        # spanning loads (0.12 ms per head on the V69). In fp16 over runs of up to 16 row pairs, then fp32 over the runs: summed
+        # in fp32 throughout, LLVM's widening of each vector to a qf32 pair, its lane shuffle back and the conversions after every
+        # add were 7 packets per row pair (49 us per head; an fp16 add is one, as in the max)
+        if getenv("ATTN_SUM_HMX", 1):
+          # the sums by the HMX too, as V^T's row of ones (a second M tile per output tile): no second pass over P
+          y = vT[h].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float()
+          oT[h].assign(y[:D + 1])                                                                             # O^T | sums
+          continue
+        e = eb[:Np * Mp].reshape(Mt, Nt * 16, 64)
+        e = e[:, :N // 2] if nb else e
+        g = max(d for d in range(1, 17) if e.shape[1] % d == 0) if getenv("ATTN_SUM16", 1) else 1
+        ps = e.reshape(Mt, -1, g, 64).sum(2, dtype=dtypes.half).float().sum(1).contiguous()                   # (Mt, 64)
+        oT[h, D:].assign(ps.reshape(Mt, 32, 2).sum(-1).reshape(1, Mp))                                      # sums
+        # (stored in fp16 first: the cast and the fp32 store fused into P V's output tiles took it from 0.06 to 0.29 ms per head)
+        oT[h, :D].assign(vT[h, :D].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float())  # O^T
+    for h in range(H if not getenv("ATTN_RAW", 1) else 0):
+      s16 = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous()                                               # S^T (Np, Mp)
+      # the shift by the max in fp16 (the exponent is rounded to fp16 for the exp anyway): in fp32 the conversions both ways
+      # doubled the exp kernel (0.39 ms per head on the V69)
+      x = s16 + bias
+      m = x.max(0, keepdim=True)
+      # exp(S^T) over S^T's own buffer: one 1.8 MB region per head
+      e = (x - m).exp2()
+      e = s16.assign(e) if getenv("ATTN_EXP_INPLACE", 1) else e.contiguous()
+      y = vT[h].matmul(e, dtype=dtypes.half).contiguous().float()                                            # (V^T | 1) exp
+      oT[h].assign(y[:D + 1])                                                                                 # O^T | sums
+    o = (oT[:, :D] * (1 / oT[:, D:])).permute(2, 0, 1).reshape(Mp, H * D).contiguous()[:M]                   # (M, H x 32)
+    return o.reshape(M, H, D).permute(1, 0, 2).reshape(*bs, M, D)
+
+  def _hmx_attn_dsp(q16:Tensor, kt16:Tensor, v16:Tensor, M:int, N:int) -> Tensor:
+    """softmax(q k^T) v per head -> (..., M, 32) float, from q (..., Mp, 32), k^T (..., 32, N), v (..., Np, 32) half (q and v
+    zero-padded to whole tiles, k^T as it is): the hand attention kernels in test/external/dsp/hand/attn. HMX_ATTN=1: one fused HMX call (its softmax on the
+    graph thread); 2: per head an HMX call for S, the softmax on the DSP_THREADS pool on the same VTCM tiles, an HMX
+    call for P @ V"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    *bs, Mp, _ = q16.shape
+    Np, H, nt = N + -N % 32, prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def ptr(b): return b.flatten().index(UOp.const(0, dtypes.int))
+    def call(name, arg, out, *ins, threaded=False):
+      def kern(*bufs):
+        t = UOp.range(nt, 0, AxisType.THREAD) if threaded else None
+        cu = UOp(Ops.CUSTOM, dtypes.void, (*map(ptr, bufs), *((t,) if threaded else ())), arg=arg)
+        return (cu.end(t) if threaded else cu).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+      return Tensor.custom_kernel(out, *ins, fxn=kern)[0]
+    # (the split form's S blocks take 256 KB + 64 KB each of the VTCM: HMX_VTCM_KB=4096 holds 60)
+    if getenv("HMX_ATTN", 2) == 1 or Mp // 32 > (getenv("HMX_VTCM_KB", 256) - 256) // 64:
+      return call(f"hmx_attn_{H}x{M}x{N}", f"__hmx_attn({{0}}, {{1}}, {{2}}, {{3}}, {H}, {M}, {Mp}, {N}, {Np});",
+                  Tensor.empty(*bs, M, 32, dtype=dtypes.float32, device=q16.device), q16, kt16, v16)
+    # the VTCM holds one head at a time: each head's S call takes the previous head's output (read by nothing) to run after it
+    outs, dep = [], q16
+    for h in range(H):
+      tok = call(f"hmx_attn_s_{M}x{N}", f"__hmx_attn_s({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {h}, {M}, {Mp}, {N}, {Np});",
+                 Tensor.empty(32, dtype=dtypes.int32, device=q16.device), q16, kt16, v16, dep)
+      tok = call(f"attn_sm_{M}x{N}", f"__attn_sm_vtcm({{0}}, {{1}}, {{2}}, {nt}, {Mp // 32}, {Np // 32}, {N - (Np - 32)});",
+                 Tensor.empty(32, dtype=dtypes.int32, device=q16.device), tok, threaded=True)
+      dep = call(f"hmx_attn_pv_{M}x{N}", f"__hmx_attn_pv({{0}}, {{1}}, {M}, {Np});",
+                 Tensor.empty(M, 32, dtype=dtypes.float32, device=q16.device), tok)
+      outs.append(dep)
+    return Tensor.stack(*outs).reshape(*bs, M, 32)
+
+  def _softmax_grp_dsp(x:Tensor) -> Tensor:
+    """softmax over x's last axis (2, 4 or 8) by the hand grouped softmax in ops_dsp.py (_SOFTMAX_GRP), split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    R, nt = x.shape[-1], max(1, getenv("DSP_THREADS", 1))
+    G = x.numel() // R
+    # its own aligned buffer (the kernel reads whole vectors from its first byte), assigned so the producer fuses into the copy
+    xin = Tensor.empty(*x.shape, dtype=dtypes.float32, device=x.device).assign(x)
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs, arg=f"__softmax_grp({{0}}, {{1}}, {{2}}, {nt}, {G}, {R});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"softmax_grp_{G}x{R}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*x.shape, dtype=dtypes.float32, device=x.device), xin, fxn=kern)[0]
+
+  def _softmax_h16_dsp(y:Tensor, M:int, N:int, R2:int, C2:int) -> Tensor:
+    """y (..., R, C) half, contiguous -> (..., R2, C2) half: the softmax over each row's first N of its first M rows, zeros
+    elsewhere. The hand fp16 softmax in ops_dsp.py (_SOFTMAX_H16), the rows split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    *bs, R, C = y.shape
+    B, nt = prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs, arg=f"__softmax_h16({{0}}, {{1}}, {{2}}, {nt}, {B}, {R}, {C}, {M}, {N}, {R2}, {C2});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"softmax_h16_{B}x{M}x{N}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*bs, R2, C2, dtype=dtypes.half, device=y.device), y, fxn=kern)[0]
+
+  def _rowcopy_dsp(x:Tensor, rows:int, cols:int) -> Tensor:
+    """x (..., R, C) half, contiguous -> (..., rows, cols) half: the top-left rows x cols of each matrix, zeros where x has none.
+    The hand row copy in ops_dsp.py (_ROWCOPY), the rows split over DSP_THREADS"""
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    *bs, R, C = x.shape
+    B, nt = prod(bs), max(1, getenv("DSP_THREADS", 1))
+    def kern(Y, X):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), X.flatten().index(UOp.const(0, dtypes.int)), t)
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
+               arg=f"__rowcopy({{0}}, {{1}}, {{2}}, {nt}, {B}, {R}, {C}, {rows}, {cols});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"rowcopy_{B}x{R}x{C}_{rows}x{cols}", opts_to_apply=()))
+    return Tensor.custom_kernel(Tensor.empty(*bs, rows, cols, dtype=dtypes.half, device=x.device), x, fxn=kern)[0]
+
+  def MatMul(A:Tensor, B:Tensor):
+    # GEMM_FP16 (see Gemm) covers MatMul's products too, batched ones included (BEVFormer's decoder self-attention: Q @ K^T and
+    # P @ V over 8 heads)
+    if getenv("GEMM_FP16") and A.dtype == dtypes.float32 and A.ndim >= 2 and B.ndim >= 2: return _matmul_fp16(A, B)
+    return A @ B
+
+  def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
+    # GEMM_FP16: the product in fp16 on the DSP's HMX (_matmul_fp16); the bias is added in fp32. Opt-in: it changes the numerics
+    if getenv("GEMM_FP16") and A.dtype == dtypes.float32: ret = alpha * _matmul_fp16(A.transpose(transA), B.transpose(transB))
+    else: ret = alpha * (A.transpose(transA) @ B.transpose(transB))
+    if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
+    # MATMUL_CONTIGUOUS: the product realized on its own. Fused with a consumer that reads it in another layout (BEVFormer's
+    # sampling offsets split into x / y per head), the matmul's output lanes followed that layout and its weight loads became
+    # strided gathers
+    return ret.contiguous() if getenv("MATMUL_CONTIGUOUS") else ret
 
   def Einsum(*Inputs:list[Tensor], equation:str): return Tensor.einsum(equation, *Inputs)
 
@@ -925,8 +1468,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def LayerNormalization(x:Tensor, scale:Tensor, bias:Tensor|None=None, axis:int=-1, epsilon:float=1e-05, stash_type:int=1):
     assert stash_type == 1, "only float32 is supported"
     axes = tuple(i for i in range(axis if axis >= 0 else x.ndim + axis, x.ndim))
-    mean = (x32:=x.cast(dtypes.float)).mean(axis=axes, keepdim=True)
-    inv_std_dev = (x32.sub(mean)).square().mean(axis=axes, keepdim=True).add(epsilon).rsqrt()
+    x32 = x.cast(dtypes.float)
+    mean = _reduce_last(x32, axes, True, "mean")
+    if mean is None: mean = x32.mean(axis=axes, keepdim=True)
+    var = _reduce_last(x32.sub(mean).square(), axes, True, "mean")
+    inv_std_dev = (var if var is not None else x32.sub(mean).square().mean(axis=axes, keepdim=True)).add(epsilon).rsqrt()
     ret = (x32.sub(mean)*inv_std_dev).cast(x.dtype).mul(scale)
     return (ret.add(bias) if bias is not None else ret), mean, inv_std_dev
   def SkipLayerNormalization(x:Tensor, skip:Tensor, gamma:Tensor, beta:Tensor|None=None, bias:Tensor|None=None, epsilon:float=1e-12):
@@ -1210,6 +1756,91 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     indices = (indices < 0).where(x.shape[axis], 0) + indices
     return x.gather(axis, indices)
 
+  def GridSample(X:Tensor, grid:Tensor, align_corners:int=0, mode:str="linear", padding_mode:str="zeros"):
+    # 2-D bilinear, zero padding (BEVFormer's / Deformable DETR's sampling). X is laid out channel-last, so each tap reads its C
+    # channels as one contiguous row, and the rows are gathered with a direct indexed load (Tensor.gather is a one-hot compare
+    # summed over all H*W positions per tap). Out-of-range taps read row 0 with weight 0
+    if mode not in ("linear", "bilinear") or padding_mode != "zeros" or X.ndim != 4:
+      raise NotImplementedError(f"GridSample: only 2-D bilinear with zero padding, got mode={mode} padding_mode={padding_mode}")
+    N, C, H, W = X.shape
+    Ho, Wo = grid.shape[1], grid.shape[2]
+    rows = X.permute(0, 2, 3, 1).reshape(N * H * W * C).contiguous()
+    gx, gy = grid[..., 0], grid[..., 1]
+    # ONNX / torch: align_corners maps -1 and 1 to the corner pixels' centers, otherwise to the outer edges
+    if align_corners: x, y = (gx + 1) * ((W - 1) / 2), (gy + 1) * ((H - 1) / 2)
+    else: x, y = ((gx + 1) * W - 1) / 2, ((gy + 1) * H - 1) / 2
+    x0, y0 = x.floor(), y.floor()
+    fx, fy = x - x0, y - y0
+    base = (Tensor.arange(N, dtype=dtypes.int32) * (H * W)).reshape(N, 1, 1)
+    out = None
+    for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+      xt, yt = x0 + dx, y0 + dy
+      ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
+      w = ok.where((fx if dx else 1 - fx) * (fy if dy else 1 - fy), 0.0)
+      row = ok.where(base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32), 0)
+      elems = row.reshape(-1, 1) * C + Tensor.arange(C, dtype=dtypes.int32).reshape(1, C)
+      tap = Tensor(rows.uop.index(elems.reshape(-1).uop)).reshape(N, Ho, Wo, C) * w.unsqueeze(-1).cast(X.dtype)
+      out = tap if out is None else out + tap
+    return cast(Tensor, out).permute(0, 3, 1, 2)
+
+  def MSDA(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None=None, H:int=0, W:int=0):
+    """onnxsim::MSDA: one-level multi-scale deformable attention in the hand DSP kernel's contract (test/external/dsp/hand/msda,
+    mode MSDA_REF_PIX): value (NV, H*W, C) channels-last, ref (NVR, Q, R, 2) in [0, 1], off (Q, M, NO, P, 2) raw offsets in
+    pixels, attw (Q, M, NO, P), vis (NV, Q) uint8 or absent -> (Q, C) = the mean over the visible maps of
+    sum_p attw * bilinear(value[v, :, head h], ref[.., p % R] * (W, H) - 0.5 + off). On the DSP it is that hand kernel (one call,
+    queries split over DSP_THREADS); elsewhere the same math through GridSample"""
+    NV, S, C = value.shape
+    Q, M, NO, P, _ = off.shape
+    NVR, R = ref.shape[0], ref.shape[2]
+    assert S == H * W and C % M == 0 and NO in (1, NV) and NVR in (1, NV), f"MSDA: inconsistent shapes {value.shape} {ref.shape} {off.shape}"
+    if str(value.device).startswith("DSP") and getenv("HAND_MSDA", 1):
+      # MSDA_SPLIT_MAPS=1: the plain mean over several maps (BEVFormer's two-frame temporal attention) as one call per map, so a
+      # map's values (2.56 MB) fit the graph's VTCM arena: the calls got faster (6.5 -> 4.7 ms per encoder layer on the V69) but
+      # the per-map copies of the interleaved offsets / weights cost more (9.7 ms over 3 layers)
+      if vis is None and NV > 1 and getenv("MSDA_SPLIT_MAPS", 0):
+        per = [_msda_dsp(value[v:v+1], ref[v:v+1] if NVR > 1 else ref, off[:, :, v:v+1] if NO > 1 else off,
+                         attw[:, :, v:v+1] if NO > 1 else attw, None, H, W) for v in range(NV)]
+        return functools.reduce(Tensor.add, per) * (1.0 / NV)
+      return _msda_dsp(value, ref, off, attw, vis, H, W)
+    D = C // M
+    # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
+    refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
+    wh = Tensor([float(W), float(H)], dtype=value.dtype)
+    maps = []
+    for v in range(NV):
+      loc = refp[v if NVR > 1 else 0].reshape(Q, 1, P, 2) + off[:, :, v if NO > 1 else 0] / wh                 # (Q, M, P, 2)
+      s = GridSample(value[v].reshape(H * W, M, D).permute(1, 2, 0).reshape(M, D, H, W), (2 * loc - 1).permute(1, 0, 2, 3))
+      a = attw[:, :, v if NO > 1 else 0].permute(1, 0, 2).reshape(M, 1, Q, P)                                   # s: (M, D, Q, P)
+      maps.append((s * a).sum(-1).reshape(C, Q).T)                                                             # (Q, C)
+    per_map = Tensor.stack(*maps, dim=0)                                                                        # (NV, Q, C)
+    if vis is None: return per_map.mean(0)
+    vf = vis.cast(value.dtype).reshape(NV, Q, 1)
+    return (per_map * vf).sum(0) / vf.sum(0).maximum(1.0)
+
+  def _msda_dsp(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    NV, S, C = value.shape
+    Q, M, NO, P, _ = off.shape
+    NVR, R = ref.shape[0], ref.shape[2]
+    nt = max(1, getenv("DSP_THREADS", 1))
+    # the kernel reads value / loc / attw / out as whole aligned buffers from their first byte (its HVX body wants 128-byte
+    # alignment), so each input is assigned into a buffer of its own: a slice of a realized buffer can stay a view, and the call
+    # would get its base pointer
+    def own(t:Tensor, dt) -> Tensor: return Tensor.empty(*t.shape, dtype=dt, device=t.device).assign(t.cast(dt))
+    ins = [own(value, dtypes.float32), own(off, dtypes.float32), own(ref, dtypes.float32), own(attw, dtypes.float32)]
+    if vis is not None: ins.append(own(vis, dtypes.uint8))
+    consts = f"{NV}, {S}, {H}, {W}, {M}, {C // M}, {P}, {Q}, {NO}, {NVR}, {R}"
+    def kern(Y, *bufs):
+      t = UOp.range(nt, 0, AxisType.THREAD)
+      srcs = (Y.flatten().index(UOp.const(0, dtypes.int)), *[b.flatten().index(UOp.const(0, dtypes.int)) for b in bufs], t)
+      vis_arg = "{5}" if vis is not None else "0"
+      cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
+               # (the value maps, parameter 1, are read as whole 128-byte rows: the graph emitter may put them in VTCM)
+               arg=f"/* vtcm-params: 1 */ __msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
+      return cu.end(t).sink(arg=KernelInfo(name=f"msda_{NV}x{Q}x{M}x{P}", opts_to_apply=()))
+    y = Tensor.empty(Q, C, dtype=dtypes.float32, device=value.device)
+    return Tensor.custom_kernel(y, *ins, fxn=kern)[0]
+
   def Compress(inp:Tensor, condition:list[bool], axis:int|None=None):
     if axis is None:
       inp = inp.flatten()
@@ -1227,6 +1858,11 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     if out_dtype == dtypes.uchar:
       # this appears to work in practice, at least for uchar out_dtype. it folds with the quantize stuff
       ret = _clamp_cast((x / y_scale + 0.4999999 + y_zero_point).int(), out_dtype)
+    elif x.dtype == dtypes.float32 and getenv("ONNX_QUANT_MAGIC", 1) and dtypes.is_int(out_dtype) and out_dtype.itemsize <= 2:
+      # round half to even straight to an int: below 2**22, x + 1.5*2**23 has spacing 1, so the add rounds and the mantissa is
+      # round(x) + 2**22. Clipped to +-2**22 first (the result saturates to 8/16 bits anyway). ~4 ops against round()'s ~25
+      q = ((x / y_scale).clip(-4194304.0, 4194304.0) + 12582912.0).bitcast(dtypes.int32) - 0x4B400000
+      ret = _clamp_cast(q + y_zero_point, out_dtype)
     else:
       ret = _clamp_cast(((x / y_scale).round() + y_zero_point), out_dtype)
     return ret.contiguous()

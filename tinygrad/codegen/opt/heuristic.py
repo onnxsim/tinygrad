@@ -1,18 +1,28 @@
 import itertools
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, tc
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
-from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.dtype import dtypes
+from tinygrad.uop.ops import Ops, GroupOp, resolve, AxisType
 from tinygrad.dtype import dtypes
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
 HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
+HVX_SMALL_REDUCE = getenv("HVX_SMALL_REDUCE", 1)
+HVX_TRANSPOSE = getenv("HVX_TRANSPOSE", 1)
+HVX_TRANSPOSE_B = getenv("HVX_TRANSPOSE_B", 32)
+HVX_TRANSPOSE_NET = getenv("HVX_TRANSPOSE_NET", 1)
+# HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 queries / keys) may take its largest divisor
+# between 32 and the vector lane budget (900 -> 100: three HVX vectors and a 4-lane tail) instead of falling back to 4 lanes
+HVX_UPCAST_ODD = getenv("HVX_UPCAST_ODD", 0)
 
-def _unit_stride(k:Scheduler, axis:int) -> bool:
-  # some buffer's index has this axis's range as a bare term (stride 1): upcasting it gives contiguous vector accesses
+def _unit_stride_bufs(k:Scheduler, axis:int) -> int:
+  # how many buffers' indices have this axis's range as a bare term (stride 1): upcasting it gives them contiguous vector accesses
   rng = k.rngs[axis]
-  return any(c is rng for b in k.bufs for c in b.src[1].get_idx().split_uop(Ops.ADD))
+  return sum(any(c is rng for c in b.src[1].get_idx().split_uop(Ops.ADD)) for b in k.bufs)
+
+def _unit_stride(k:Scheduler, axis:int) -> bool: return _unit_stride_bufs(k, axis) > 0
 
 def _every_unit_stride(k:Scheduler, axis:int) -> bool:
   # every buffer indexed along this axis has its range as a bare term (stride 1), and at least one is: no gathers
@@ -23,6 +33,43 @@ def _every_unit_stride(k:Scheduler, axis:int) -> bool:
     if not any(c is rng for c in idx.split_uop(Ops.ADD)): return False
     hit = True
   return hit
+
+def _contiguous_with_upcast(k:Scheduler, axis:int) -> bool:
+  # every buffer indexed along this axis reads it at unit stride, or at a stride equal to the extent of an upcast axis it reads
+  # at unit stride (the axis then continues that upcast's lanes contiguously: a softmax over groups of 4 with the 4 upcast takes
+  # 32 groups as 128 contiguous lanes), and at least one buffer does
+  rng, hit = k.rngs[axis], False
+  ups = {k.rngs[a]: int(k.full_shape[a]) for a in k.axes_of(AxisType.UPCAST)}
+  for b in k.bufs:
+    idx = b.src[1].get_idx()
+    if rng not in idx.backward_slice: continue
+    terms = list(idx.split_uop(Ops.ADD))
+    if not any(c is rng for c in terms):
+      st = next((int(c.src[1].arg) for c in terms if c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST), None)
+      if st is None or not any(u in ups and ups[u] == st for u in terms): return False
+    hit = True
+  return hit
+
+def _stride_in_every(k:Scheduler, axis:int, st:int, inner) -> bool:
+  # every buffer that reads `inner` (a range at unit stride) reads `axis` at stride st, and every other buffer reading `axis`
+  # reads it at unit stride: the axis continues `inner`'s elements contiguously (groups of st one after another)
+  rng, hit = k.rngs[axis], False
+  for b in k.bufs:
+    idx = b.src[1].get_idx()
+    if rng not in idx.backward_slice: continue
+    terms = list(idx.split_uop(Ops.ADD))
+    want = st if inner in idx.backward_slice else 1
+    if want == 1 and any(c is rng for c in terms): continue
+    # (a buffer without `inner` may also read one fixed element of each group: a lane broadcast, rendered as a lane gather)
+    if not any(c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST and c.src[1].arg in (want, st) for c in terms): return False
+    hit = hit or want == st
+  return hit
+
+def _odd_upcasts(k, axis:int, cap:int) -> list[int]:
+  # only on an axis every buffer reads at unit stride: an odd width on a strided axis is that many scalar gathers per step
+  n = int(k.full_shape[axis])
+  if not HVX_UPCAST_ODD or any(n % w == 0 for w in (32, 64, 128) if w <= cap) or not _every_unit_stride(k, axis): return []
+  return [d for d in range(min(cap, n), 32, -1) if n % d == 0][:1]
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
@@ -45,8 +92,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   """
   # under MOCKDSP (v65, no fp16 vector hardware), half-precision vector arithmetic is miscompiled by clang's v65 backend:
   # keep half kernels scalar (no upcast, no tensor core) so the mock only ever sees scalar fp16 ops, which the
-  # fp16 helpers cover. The device path (real v69 codegen) is unchanged.
-  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and \
+  # fp16 helpers cover. The device path (real v69 codegen) is unchanged, and so is a v68+ capture under MOCKDSP (HVX_ARCH v68+:
+  # its kernels are only traced for the device, never run by the mock), which needs the HMX tensor core for fp16 matmuls
+  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and int(str(getenv("HVX_ARCH", "v65")).lstrip("v")) < 68 and \
      any(b.dtype == dtypes.half for b in k.bufs):
     return k
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
@@ -61,7 +109,20 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # Hexagon's vrmpy TC is one vector instruction per thread: an extra M/N upcast lands *inside* its 32 accumulator
         # lanes (later upcasts are the faster axes of the register accumulator), so every WMMA's C becomes a strided gather.
         # One WMMA per 32-lane accumulator slice keeps it a single HVX register.
-        if tk.ren is not None and tk.ren.target.device == "DSP": continue
+        if tk.ren is not None and tk.ren.target.device == "DSP":
+          # DSP_TC_MUPCAST pixels per weight load (after the TC's own lanes, so no strided accumulator): each 128-byte weight vector
+          # feeds that many vrmpys before it leaves the register file. 0 or 1 = off; with DSP_TC_PUPCAST=2, N4xP2 143 ms vs N8xP2 144 ms (driving hmix); N8 alone 154
+          if tc_dim == 0 and getattr(tk, "tensor_core", None) is not None and tk.tensor_core.dims == (32, 1, 4) and \
+              (mu:=getenv("DSP_TC_MUPCAST", 4)) > 1 and rngs[0] is not None and rngs[0].src[0].divides(mu) is not None:
+            try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[0]), mu))
+            except KernelOptError: pass
+          # DSP_TC_PUPCAST pixels per weight vector loaded (the M axis, upcast after the TC's lanes like the N block above): the weight
+          # vector is loaded once and feeds that many pixels' vrmpys. 1 = off; 2 measured best (4 stalls the compiler)
+          if tc_dim == 1 and getattr(tk, "tensor_core", None) is not None and tk.tensor_core.dims == (32, 1, 4) and \
+              (pu:=getenv("DSP_TC_PUPCAST", 2)) > 1 and rngs[1] is not None and rngs[1].src[0].divides(pu) is not None:
+            try: tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[1]), pu))
+            except KernelOptError: pass
+          continue
         szs = [sz for sz in [5,4,3,2] if rngs[tc_dim].src[0].divides(sz) is not None]
         if szs:
           # set it to the replaced range
@@ -70,10 +131,73 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       # single-instruction, single-thread op with no warp/lane cooperation, so it has no LOCAL axis to use)
       if tk.ren is not None and tk.ren.has_local and (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]):
         tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
+      # the DSP's vrmpy TensorCore is one HVX thread's instruction: split its kernel over the hardware threads like any other. Not
+      # an HMX one: the HMX unit is held by one thread (the graph skel's), and its fused int8 requant epilogue declares its flags
+      # once per output run, which a split leaves undeclared in the other slices
+      if tk.ren is not None and tk.ren.target.device == "DSP" and getattr(tk, "tensor_core", None) not in tc.hexagon_hmx + tc.hexagon_hmx_i8:
+        return apply_threads(tk)
       return tk
 
   # make a copy so it does not mutate the input
   k = k.copy()
+  is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  # a renderer can cap upcasts at one vector register: v65 HVX (128 bytes, no float vectors) sets upcast_max_bytes, so the
+  # lane cap follows the reduction dtype (32 f32 lanes, 128 byte lanes). qfloat DSPs keep several-vector float accumulators
+  max_bytes = getattr(k.ren, "upcast_max_bytes", None)
+  dsp_vector_lanes = max_bytes // k.reduceop.dtype.itemsize if is_dsp and max_bytes and k.reduceop is not None else 128
+  # ...and there float is scalar, so a float reduction wants register blocking (small upcasts on the axes whose loads are
+  # reused, as on a CPU) rather than one contiguous vector-wide axis: it takes the non-DSP upcast rules below
+  v65_float = is_dsp and max_bytes is not None and k.reduceop is not None and dtypes.is_float(k.reduceop.dtype)
+  dsp_scalar_float = bool(getenv("DSP_SCALAR_BLOCK", 1)) and v65_float
+  # blocking only pays with reuse in two directions (a conv: inputs shared across output channels, weights across pixels); a GEMV
+  # has one, and blocking its output axis measured 10x slower on the phone than the contiguous vector-style upcast
+  if dsp_scalar_float:
+    reuse_axes = [a for a in k.upcastable_dims if k.full_shape[a] > 1 and any(k.rngs[a] not in b.src[1].get_idx().backward_slice for b in k.bufs)]
+    dsp_scalar_float = len(reuse_axes) >= 2
+
+  # on qfloat DSPs, a reduction over a small contiguous axis (softmax / max / sum over 2..8 floats: deformable attention's
+  # sampling points) whose groups sit one after another: 32 groups as the vector lanes and the small axis unrolled, so its R
+  # loads per step are the lanes of R contiguous vectors (memory_coalescing merges them; the shuffles that pick each group
+  # element are register permutes). As the generic rules left it -- 128 groups as lanes, the R steps a loop -- every load was a
+  # 128-lane stride-R gather: BEVFormer's encoder-layer softmax over 4 points, 5.7 M cycles for the max and sum vs 1 M by hand
+  if is_dsp and HVX_SMALL_REDUCE and max_bytes is None and k.reduceop is not None and len(k.axes_of(AxisType.REDUCE)) == 1:
+    r = k.axes_of(AxisType.REDUCE)[0]
+    R = int(k.full_shape[r]) if isinstance(k.full_shape[r], int) else 0
+    # (R = 32 with the transpose network: the 32 groups' rows are a 32 x 32 block, the sum is over its columns -- HVX_TRANSPOSE_NET)
+    if (2 <= R <= 8 or (R == 32 and HVX_TRANSPOSE_NET)) and _every_unit_stride(k, r):
+      for a in k.upcastable_dims[::-1]:
+        if k.full_shape[a] % 32 == 0 and _stride_in_every(k, a, R, k.rngs[r]):
+          k.apply_opt(Opt(OptOps.UPCAST, a, 32))
+          k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(k.axes_of(AxisType.REDUCE)[0]), 0))  # (the upcast moved it)
+          return apply_threads(k)
+
+  # ...and the elementwise kernels over such groups (the softmax's normalisation): the small axis whole and 128 / R groups, so
+  # lanes are 128 contiguous floats (the generic rules took 128 groups as lanes with a 2-wide axis left a loop: stride-2 lanes)
+  if is_dsp and HVX_SMALL_REDUCE and max_bytes is None and k.reduceop is None:
+    for r in k.upcastable_dims[::-1]:
+      R = int(k.full_shape[r]) if isinstance(k.full_shape[r], int) else 0
+      if not (2 <= R <= 8 and 128 % R == 0 and _every_unit_stride(k, r)): continue
+      a = next((a for a in k.upcastable_dims[::-1] if a != r and k.full_shape[a] % (128 // R) == 0 and _stride_in_every(k, a, R, k.rngs[r])), None)
+      if a is None: continue
+      rr = k.rngs[r]
+      k.apply_opt(Opt(OptOps.UPCAST, a, 128 // R))
+      k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rr), 0))  # (the upcast above may have moved it)
+      return apply_threads(k)
+
+  # a transposing copy (an axis contiguous in one buffer is strided in another, and another axis the other way round): both axes
+  # upcast by 32, so loads and stores are whole rows and the transpose happens in registers (lane gathers). Upcast on the output's
+  # contiguous axis alone, every load was a strided scalar (attention's per-head 900 x 32 -> 32 x 960 copies: 45 cycles a value)
+  if is_dsp and HVX_TRANSPOSE and max_bytes is None and k.reduceop is None and not k.axes_of(AxisType.UPCAST):
+    def unit_in(a): return {i for i, b in enumerate(k.bufs) if any(c is k.rngs[a] for c in b.src[1].get_idx().split_uop(Ops.ADD))}
+    def strided_in(a): return {i for i, b in enumerate(k.bufs) if k.rngs[a] in b.src[1].get_idx().backward_slice} - unit_in(a)
+    dims = [a for a in k.upcastable_dims if isinstance(k.full_shape[a], int) and k.full_shape[a] % 32 == 0]
+    pair = next(((a, b) for a in dims for b in dims if a != b and k.full_shape[b] % HVX_TRANSPOSE_B == 0 and
+                 (unit_in(a) & strided_in(b)) and (unit_in(b) & strided_in(a))), None)
+    if pair is not None:
+      rb = k.rngs[pair[1]]
+      k.apply_opt(Opt(OptOps.UPCAST, pair[0], 32))
+      k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(rb), HVX_TRANSPOSE_B))
+      return apply_threads(k)
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -129,7 +253,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for axis in k.upcastable_dims:
     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
     is_masked = k.rngs[axis] in where_gate_rngs
-    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+    max_masked_upcast = min(7 * 7, dsp_vector_lanes // k.upcast_size()) if is_dsp else 7 * 7
+    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= max_masked_upcast:
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
@@ -154,9 +279,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (on the DSP, one HVX-register-sized or larger vector: 128/64/32 lanes,
-    # since real shapes like ...x272 aren't multiples of 128 and would otherwise fall back to a 4-wide upcast)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128,64,32] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider upcasts up to one HVX vector (the lane count depends on the reduction dtype); real shapes like ...x272
+    # aren't multiples of 128 and would otherwise fall back to a 4-wide upcast for byte-sized reductions
+    dsp_upcast_sizes = [s for s in [128,64,32,16,8,4] if s * k.upcast_size() <= dsp_vector_lanes]
+    vector_dsp = is_dsp and not dsp_scalar_float
+    for axis, upcast_amount in [(a, u) for a in k.upcastable_dims for u in
+        ((dsp_upcast_sizes + _odd_upcasts(k, a, dsp_vector_lanes // k.upcast_size()) if not len(upcasted_axis) else [])
+         if vector_dsp else [3,4])]:
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -175,7 +304,25 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if rng in idx.backward_slice and not unit: gathers += 1
         # on the DSP first avoid gathers (HVX_UPCAST_CONTIG=1), then prefer the widest vector for the same axis (both keys are 0
         # elsewhere, so ordering is unchanged)
-        xb_choices.append((gathers if is_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if is_dsp else 0,
+        # v65 (upcast_max_bytes set): an upcast that makes a load a gather only costs -- float code there is scalar, and integer
+        # vectors need unit stride. Such a kernel (a conv epilogue over 1350 pixels: only the channel axis divides) stays scalar
+        # (integer reductions too: they are HVX vector code; only the scalar float register blocking gains from such upcasts)
+        if is_dsp and max_bytes is not None and not dsp_scalar_float and gathers and getenv("DSP_V65_NO_GATHER_UPCAST", 1): continue
+        # HVX: no gathering upcast for a broadcast's reuse while another axis is unit-stride in every buffer (HVX_UPCAST_CONTIG takes
+        # it below). A per-key bias on attention scores made the rows the lanes: the max over 928 x 960 fp16 scores read 2-byte
+        # gathers 960 apart, 27.5 M cycles vs 3.4 M for the sum next to it
+        # (reductions only: an elementwise stack of per-head outputs got 3x slower without its row upcast)
+        if vector_dsp and HVX_UPCAST_CONTIG and gathers and k.reduceop is not None and not k.axes_of(AxisType.UPCAST) and \
+            any(a2 != axis and _every_unit_stride(k, a2) for a2 in k.upcastable_dims): continue
+        # elementwise too when the unit-stride axis fills whole HVX vectors in every buffer (HVX_EW_NO_GATHER_UPCAST): the raw-tile
+        # attention's exp (scores broadcast-shifted by a per-query max over 480 row pairs) and that max's broadcast went scalar.
+        # Not for an axis a comparison reads (a stack of per-head outputs: a select chain on the head index, which the upcast folds)
+        if vector_dsp and HVX_UPCAST_CONTIG and gathers and k.reduceop is None and not k.axes_of(AxisType.UPCAST) and \
+            getenv("HVX_EW_NO_GATHER_UPCAST", 1) and \
+            not any(u.op in (Ops.CMPNE, Ops.CMPLT, Ops.CMPEQ) and rng in u.backward_slice for u in k.ast.toposort()) and \
+            any(a2 != axis and _every_unit_stride(k, a2) and isinstance(n2:=k.full_shape[a2], int) and
+                all(n2 * b.src[0].dtype.itemsize % 128 == 0 for b in k.bufs) for a2 in k.upcastable_dims): continue
+        xb_choices.append((gathers if vector_dsp and HVX_UPCAST_CONTIG else 0, num_strides, sum_strides, -upcast_amount if vector_dsp else 0,
                            axis, upcast_amount))
     if xb_choices:
       xb_choices = sorted(xb_choices)
@@ -190,27 +337,40 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # vector (up to 128 lanes in all) when every buffer reads it at unit stride
   if is_dsp and HVX_UPCAST_ELEMWISE and not k.axes_of(AxisType.REDUCE) and k.upcasted and k.upcast_size() < 32:
     for axis, w in itertools.product(k.upcastable_dims[::-1], (128, 64, 32)):
-      if (w == 32 or k.upcast_size() * w <= 128) and k.full_shape[axis] % w == 0 and _every_unit_stride(k, axis):
+      if (w == 32 or k.upcast_size() * w <= 128) and k.full_shape[axis] % w == 0 and \
+          (_every_unit_stride(k, axis) or _contiguous_with_upcast(k, axis)):
         k.apply_opt(Opt(OptOps.UPCAST, axis, w))
         break
 
   # on the DSP, a reduction nothing broadcasts into (a per-element dot product like q . k over a small head dim) got no upcast
   # above; the unroll below would then take every "nothing upcasted" case and leave it scalar. Upcast the innermost output
   # axis first instead: a vector accumulator per 128 outputs, the reduce stays a loop
-  if is_dsp and HVX_UPCAST_CONTIG and not k.axes_of(AxisType.UPCAST) and k.axes_of(AxisType.REDUCE):
-    for splits in [128,64,32]:
-      if k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-        k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+  # (not for scalar float on v65: 128 accumulators live in memory, and a GEMV with [out, in] weights reads 128 rows per step)
+  if is_dsp and HVX_UPCAST_CONTIG and not (v65_float and getenv("DSP_SCALAR_GEMV", 1)) and not k.axes_of(AxisType.UPCAST) and \
+      k.axes_of(AxisType.REDUCE):
+    # (on v65: the unit-stride axis, which needn't be the last -- a channel-blocked depthwise conv's is the 32 channels, its last
+    # the image width -- and at most one register of lanes). The axis at unit stride in the most buffers first: a W16 depthwise conv
+    # writing NCHW has its width at unit stride in the output only, and upcasting it made the input and weight loads 32-lane gathers
+    axes = [k.upcastable_dims[-1]] if k.upcastable_dims else []
+    if max_bytes is not None:
+      axes = sorted([a for a in k.upcastable_dims if _unit_stride(k, a)][::-1], key=lambda a: -_unit_stride_bufs(k, a)) + axes
+    for axis, splits in itertools.product(axes, [s for s in [128,64,32] if max_bytes is None or s <= dsp_vector_lanes]):
+      if k.full_shape[axis] % splits == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, axis, splits))
         break
 
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    # scalar float on v65: accumulators x unrolled taps must stay near the 32-register file, or the loop body is spills
+    scalar_cap = getenv("DSP_SCALAR_UNROLL", 16) if dsp_scalar_float else None
+    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64) and \
+        (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
-        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
+        if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3 and \
+            (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
           k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
       else:
         for splits in [4]:
@@ -219,11 +379,39 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             break
   except KernelOptError: pass
 
-  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, as wide as the innermost dim allows, up to 128 lanes)
-  for splits in ([128,64,32,16,8,4] if is_dsp else [4]):
+  # v65 elementwise (a copy, a plane split, a layout change): the rules above only upcast an axis some buffer broadcasts along, and
+  # a small masked/slot upcast (a queue's 5 slots) stops the fallback below, so a byte copy ran one byte at a time. Vectorize a
+  # unit-stride axis: up to 128 lanes, and at most 8 registers live across the slots already upcast
+  if is_dsp and max_bytes is not None and not k.axes_of(AxisType.REDUCE) and getenv("DSP_V65_COPY_VECTORIZE", 1) and \
+      not any(_unit_stride(k, a) for a in k.axes_of(AxisType.UPCAST)):
+    itemsize = max(b.src[0].dtype.itemsize for b in k.bufs)
+    for axis in k.upcastable_dims[::-1]:
+      # unit stride in every buffer that uses the axis (one strided buffer makes the vector a gather: DM's 345x3x64 kernels got slower)
+      rng = k.rngs[axis]
+      if not _unit_stride(k, axis) or any(rng in b.src[1].get_idx().backward_slice and
+                                          not any(c is rng for c in b.src[1].get_idx().split_uop(Ops.ADD)) for b in k.bufs): continue
+      if (s:=next((s for s in (128, 64, 32, 16) if k.full_shape[axis] % s == 0 and s * k.upcast_size() * itemsize <= 1024), None)):
+        k.apply_opt(Opt(OptOps.UPCAST, axis, s))
+        break
+
+  # if nothing at all is upcasted and it's easy to, do an upcast (on the DSP, up to one HVX vector)
+  for splits in ([s for s in [128,64,32,16,8,4] if s <= dsp_vector_lanes] if is_dsp and not (v65_float and getenv("DSP_SCALAR_GEMV", 1))
+                 else [4]):
     if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
-      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
+      # an odd-width HVX upcast first, where it beats the power-of-two split this would take (900: 100 lanes, not 4)
+      odd = _odd_upcasts(k, k.upcastable_dims[-1], dsp_vector_lanes) if is_dsp else []
+      k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], odd[0] if odd and odd[0] > splits else splits))
       break
+
+  # on the DSP, an fp16 elementwise kernel with an exp2 (the qf16 polynomial: ~20 dependent ops per vector) at 128 lanes keeps
+  # two vectors' chains in flight, one HVX op per packet. HVX_EW_EXP_LANES widens it: 256, four (the attention's exp over raw
+  # tiles, 117 -> 74 us per head on the V69; 512 took 93)
+  if is_dsp and (wl:=getenv("HVX_EW_EXP_LANES", 256)) > 128 and not k.axes_of(AxisType.REDUCE) and k.upcast_size() == 128 and \
+      all(b.src[0].dtype.itemsize == 2 for b in k.bufs) and any(u.op is Ops.EXP2 for u in k.ast.backward_slice):
+    for axis in k.upcastable_dims[::-1]:
+      if k.full_shape[axis] % (wl // 128) == 0:
+        k.apply_opt(Opt(OptOps.UPCAST, axis, wl // 128))
+        break
 
   # **** local groups ****
 
@@ -246,17 +434,46 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         k.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
         if will_delete_shape: deleted_shape += 1
 
-  # **** threading ****
+  return apply_threads(k)
 
+def _work_per_elem(k:Scheduler) -> int:
+  # a rough per-element cost of the kernel: its ALU ops, transcendentals / reciprocals 20 each (scalar float code on the DSP: an
+  # inverse sigmoid of 2700 reference points, exp + two reciprocals + a log polynomial each, took 1.2 ms on one thread)
+  heavy = (Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.SQRT, Ops.SIN, Ops.FDIV)
+  return max(1, sum(20 if u.op in heavy else 1 for u in k.ast.toposort() if u.op in GroupOp.ALU and dtypes.is_float(u.dtype)) // 8)
+
+def apply_threads(k:Scheduler) -> Scheduler:
   if k.ren.has_threads and k.ren.global_max is not None:
+    pool = getattr(k.ren, "pool_threads", k.ren.global_max[0])
+    if getattr(k.ren, "thread_work_weighted", False):
+      w = _work_per_elem(k)
+      def few(t:int) -> bool: return resolve(prod(k.full_shape) * w // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
+    else:
+      def few(t:int) -> bool: return resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
+    def balance(t:int) -> float: return t / (pool * -(-t // pool))
+    def balanced(axis:int) -> list[int]:
+      n = k.full_shape[axis]
+      return [t for t in range(pool + 1, k.ren.global_max[0] + 1) if isinstance(n, int) and n % t == 0 and balance(t) >= 0.85]
     for threads in [32,16,12,8,6,5,4,3,2]:
-      # Skip if too many threads. Heuristic: use about 128K ops per thread
-      if threads > k.ren.global_max[0] or resolve(prod(k.full_shape) // (128 << 10) < threads): continue
+      # Skip if too many threads. Heuristic: use about 128K ops per thread (a renderer whose per-element cost is far higher, like
+      # the DSP's scalar float, sets a lower thread_min_elems)
+      if threads > pool or few(threads): continue
+      # fewer threads than the pool where more slices than threads spread better (HVX_THREAD_BALANCE): 30 rows of vectors as 15
+      # slices over 4 threads (94%) rather than 3 threads (75%) -- the attention softmax's reduces over raw tiles
+      if threads < pool and getenv("HVX_THREAD_BALANCE", 1) and k.ren.global_max[0] > pool and not few(pool) and \
+          any(balance(t) > threads / pool for a in k.axes_of(AxisType.WEAK) for t in balanced(a)): break
       for axis in k.axes_of(AxisType.WEAK):
         if k.full_shape[axis] % threads == 0:
           try: k.apply_opt(Opt(OptOps.THREAD, axis, threads))
           except KernelOptError: pass
           break
       if k.applied_opts and k.applied_opts[-1].op is OptOps.THREAD: break
-
+    # no axis divides by a pool size (625 rows = 5^4): more slices than threads, when they spread evenly enough (25 slices over 4
+    # threads: 89%). BEVFormer's LayerNorm second stage ran on one thread, 0.7 ms per call
+    if pool > 1 and k.ren.global_max[0] > pool and not any(o.op is OptOps.THREAD for o in k.applied_opts) and not few(pool):
+      for axis in k.axes_of(AxisType.WEAK):
+        if cands:=balanced(axis):
+          try: k.apply_opt(Opt(OptOps.THREAD, axis, min(cands)))
+          except KernelOptError: continue
+          break
   return k

@@ -27,13 +27,16 @@ def _cap_exec(ctx, call, ast):
     ids.append(id(b))
   outs = {ast.arg.globals.index(i) for i in ast.arg.outs}
   src = ast.src[2].arg
-  if "__hmx_qadd_chunk(" in src: outs.add(0)  # the custom QLinearAdd kernel writes its output in the CUSTOM call, not a STORE
-  _CAP["calls"].append((re.sub(r"\x1b\[[0-9;]*m", "", ast.arg.name), src, ids, outs))
+  # the custom QLinearAdd / MSDA / row copy / softmax / attention kernels write their output in the CUSTOM call, not a STORE
+  if any(f in src for f in ("__hmx_qadd_chunk(", "__msda_call(", "__rowcopy(", "__softmax_h16(", "__softmax_grp(", "__hmx_attn", "__attn_sm_vtcm(")): outs.add(0)
+  # a DSP_THREADS kernel takes a trailing core_id: its slices are the launch's global_size[0] (0: not threaded)
+  nthreads = int(ast.arg.global_size[0]) if 'core_id' in ast.arg.runtimevars else 0
+  _CAP["calls"].append((re.sub(r"\x1b\[[0-9;]*m", "", ast.arg.name), src, ids, outs, nthreads))
   return [0.0]
 
 def capture(fn:Callable[[], object]) -> tuple[list, dict]:
   """fn's kernels, in order, recorded instead of run -> (calls, bufs): calls = [(name, src, [buffer ids], output param
-  indices)], bufs = {id: [Buffer, nbytes, "read" if read before any kernel writes it]}. Realize constants before."""
+  indices, core_id slices or 0)], bufs = {id: [Buffer, nbytes, "read" if read before any kernel writes it]}. Realize constants before."""
   import tinygrad.engine.realize as R
   from tinygrad.uop.ops import PatternMatcher
   _CAP["calls"].clear(); _CAP["bufs"].clear()
@@ -43,7 +46,7 @@ def capture(fn:Callable[[], object]) -> tuple[list, dict]:
   finally: R.pm_exec = old
   calls, bufs = list(_CAP["calls"]), dict(_CAP["bufs"])
   written: set[int] = set()
-  for _, _, ids, outs in calls:
+  for _, _, ids, outs, _ in calls:
     for j, b in enumerate(ids):
       if j in outs: written.add(b)
       elif b not in written and bufs[b][2] is None: bufs[b][2] = "read"
@@ -54,7 +57,7 @@ def emit(outdir, calls, bufs, inp, out) -> dict:
   from tinygrad.helpers import getenv
   o = pathlib.Path(outdir); o.mkdir(parents=True, exist_ok=True)
   xid, yid = id(inp), id(out)
-  order = list(dict.fromkeys(b for _, _, ids, _ in calls for b in ids))
+  order = list(dict.fromkeys(b for _, _, ids, *_ in calls for b in ids))
   idx = {b: i for i, b in enumerate(order)}
   blob, off = bytearray(), {}
   for b in order:
@@ -63,7 +66,7 @@ def emit(outdir, calls, bufs, inp, out) -> dict:
       blob += bytes(-len(blob) % 128)
   knames: dict[str, str] = {}
   lines: list[str] = []
-  for name, src, ids, _ in calls:
+  for name, src, ids, *_ in calls:
     if src not in knames:
       kn = knames[src] = f"k{len(knames)}"
       body = src.split("/* DSP boilerplate */")[0]
