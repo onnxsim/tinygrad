@@ -475,6 +475,8 @@ HVX_REVEC_CMP = getenv("HVX_REVEC_CMP", 0)
 HVX_SPLAT_WHERE = getenv("HVX_SPLAT_WHERE", 1)
 _CMP = {Ops.CMPLT: "<", Ops.CMPNE: "!=", Ops.CMPEQ: "=="}
 def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP)
+HVX_SPLAT_SCALAR = getenv("HVX_SPLAT_SCALAR", 0)
+def _splat_scalar() -> bool: return bool(HVX_SPLAT_SCALAR)
 def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and n % 32 == 0
 def _is32(dt) -> bool: return dt in (dtypes.float32, dtypes.int32, dtypes.uint32)
 def _cmp_vec_op(u:UOp, n:int) -> bool:
@@ -837,7 +839,10 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if s0._shape != () or not ((s0.op in _vec_ops() and s0.dtype != dtypes.bool) or _cmp_vec_op(s0, n)): return None
   # a splat of one scalar op (a per-sample weight broadcast over the channel lanes) stays that scalar op and one vsplat: as a
   # vector op it does the same work on splatted operands, and pulls the scalar compares / selects under it into vectors too
-  if _revec_cmp() and all(s is s0 for s in srcs): return None
+  # HVX_SPLAT_SCALAR=1: always, float too. The generated MSDA's per-tap bilinear weights (scalar math from loaded locations, splat
+  # over the head's 32 channels) were qf32 vector chains on splats with ~230 vector spills per gated body: cross-attention
+  # 16.5 -> 8.7 ms, temporal self-attention 11.3 -> 6.6 ms per encoder layer on the V69 (HAND_MSDA=0)
+  if (_revec_cmp() or _splat_scalar()) and all(s is s0 for s in srcs): return None
   # a scalar float max renders as a statement expression; a vector one (qfloat targets) as HVX's native max (dsp_string)
   if s0.op is Ops.MAX and dtypes.is_float(s0.dtype) and not _hvx_qfloat(): return None
   if any(s.op is not s0.op or s.dtype != s0.dtype or s.arg != s0.arg or len(s.src) != len(s0.src) or s._shape != () for s in srcs): return None
