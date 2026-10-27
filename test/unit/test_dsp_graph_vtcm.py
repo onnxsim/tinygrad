@@ -178,6 +178,24 @@ class TestFp16Weights(unittest.TestCase):
     self.assertEqual(sorted((n.input[0], n.output[0]) for n in casts), [("v__fp16", "v"), ("w__fp16", "w")])
     self.assertEqual(list(model.graph.node).index(casts[-1]), 1)   # ahead of every use
 
+class TestHmxOverlap(unittest.TestCase):
+  def test_pairs(self):
+    # an HMX call runs beside a threaded call it doesn't depend on (either side of it); a call in between that the moved one
+    # depends on stops it; the moved call's first-touched buffers cost their bytes x the calls moved over (the budget)
+    b = {n: FakeBuf(4096) for n in "xwqmkst"}
+    rid = {id(t): i for i, t in enumerate(b.values())}
+    views, base = {id(t): t for t in b.values()}, {id(t): t for t in b.values()}
+    H, T = "__hmx_call_start();", "threaded"
+    calls = [("cast", T, [id(b["m"]), id(b["x"])], {0}, 4),           # 0: m = f(x)
+             ("proj", H, [id(b["q"]), id(b["x"]), id(b["w"])], {0}, 0),  # 1: q = x w (independent of 0)
+             ("e", T, [id(b["k"]), id(b["q"])], {0}, 4),               # 2: k = f(q)
+             ("S", H, [id(b["s"]), id(b["k"])], {0}, 0),               # 3: s = g(k): depends on 2
+             ("t", T, [id(b["t"]), id(b["m"])], {0}, 4)]               # 4: t = f(m): independent of 3, moves up to it
+    sizes = [4096] * len(b)
+    self.assertEqual(g.hmx_overlap_pairs(calls, views, base, rid, sizes, budget=0), {})
+    pairs = g.hmx_overlap_pairs(calls, views, base, rid, sizes, budget=4096)
+    self.assertEqual(pairs, {0: (0, 1), 3: (4, 3)})
+
 class TestCoreParam(unittest.TestCase):
   def test_core_position(self):
     # the threaded kernel's core id goes where its signature declares it (a buffer index skipped: declared before the last buffer)

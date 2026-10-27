@@ -15,6 +15,8 @@ extern unsigned long long HAP_perf_get_time_us(void);
 
 static void g_parallel(void (*f)(unsigned char**, int), unsigned char** R, int n);
 #define G_PARALLEL(f, R, n) g_parallel(f, R, n)
+static void g_parallel_hmx(void (*f)(unsigned char**, int), unsigned char** R, int n, void (*h)(unsigned char**));
+#define G_PARALLEL_HMX(f, R, n, h) g_parallel_hmx(f, R, n, h)
 #include "graph.h"
 #ifndef G_NSTATE
 #define G_NSTATE 0
@@ -88,6 +90,9 @@ static qurt_barrier_t g_go, g_done;
 static void (*volatile g_fn)(unsigned char**, int);
 static unsigned char** volatile g_fR;
 static volatile int g_fn_n, g_quit;
+static volatile int g_dyn;  /* slices claimed one at a time from g_next (g_parallel_hmx) instead of strided */
+static int g_next;
+static inline int g_claim(void) { return __atomic_fetch_add(&g_next, 1, __ATOMIC_RELAXED); }
 
 static void helper(void* arg) {
   int me = (int)(uintptr_t)arg;
@@ -95,7 +100,8 @@ static void helper(void* arg) {
   for (;;) {
     qurt_barrier_wait(&g_go);
     if (g_quit) break;
-    for (int c = me; c < g_fn_n; c += g_pool_n) g_fn(g_fR, c);
+    if (g_dyn) for (int c; (c = g_claim()) < g_fn_n; ) g_fn(g_fR, c);
+    else for (int c = me; c < g_fn_n; c += g_pool_n) g_fn(g_fR, c);
     qurt_barrier_wait(&g_done);
   }
   qurt_hvx_unlock();
@@ -109,6 +115,21 @@ static void g_parallel(void (*f)(unsigned char**, int), unsigned char** R, int n
   for (int c = 0; c < n; c += g_pool_n) f(R, c);
   qurt_barrier_wait(&g_done);
 }
+
+#ifdef G_HMX
+/* an HMX call h alongside f's slices (dsp_graph_v65 DSP_GRAPH_HMX_OVERLAP): the helpers start on the slices, this thread runs h
+ * under the HMX lock, then claims what slices are left */
+static void g_parallel_hmx(void (*f)(unsigned char**, int), unsigned char** R, int n, void (*h)(unsigned char**)) {
+  if (g_pool_n <= 1) { g_parallel(f, R, n); g_hmx_lock(); h(R); g_hmx_unlock(); return; }
+  g_fn = f, g_fR = R, g_fn_n = n, g_next = 0, g_dyn = 1;
+  qurt_barrier_wait(&g_go);
+  g_hmx_lock(); h(R); g_hmx_unlock();
+  for (int c; (c = g_claim()) < n; ) f(R, c);
+  qurt_barrier_wait(&g_done);
+  g_dyn = 0;
+}
+
+#endif
 
 static void pool_stop(void) {
   if (g_pool_n <= 1) return;
