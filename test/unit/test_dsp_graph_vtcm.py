@@ -97,16 +97,16 @@ class TestVtcmPlacement(unittest.TestCase):
     self.assertEqual(regs[order.index(id(b))], -1)
 
   def test_raw_tile_alignment_and_prefetch(self):
-    # a raw-tile buffer (1024 k + 1000 fp16 elements, written all but its marker tail) goes to a 2 KB boundary, where the HMX reads
-    # and writes it in place; the kernels' software prefetches of parameters placed in VTCM become no-ops
+    # a raw-tile buffer (listed by the renderer: /* hmx-tile: j */) goes to a 2 KB boundary, where the HMX reads and writes it in
+    # place; the kernels' software prefetches of parameters placed in VTCM become no-ops
     x, w, y, a = FakeBuf(16384), FakeBuf(16384), FakeBuf(16384), FakeBuf(16512)
-    s = FakeBuf((1024 * 8 + 1000) * 2)
+    s = FakeBuf(1024 * 8 * 2)
     sv = FakeBuf(1024 * 8 * 2, base=s)
     bufs = {id(b): [b, b.nbytes, None] for b in (x, w, y, a, s, sv)}
     pf = "(__builtin_HEXAGON_Y2_dcfetch((char*)(@+0)+2048), 0);" + VEC
     calls = [("e", kern("e", [VEC]), [id(a), id(x)], {0}, 0),
-             ("h", kern("h", [VEC, VEC], hmx=True), [id(sv), id(a), id(w)], {0}, 0),   # a stays live across s's write
-             ("e2", kern("e2", [pf, VEC]), [id(y), id(sv), id(a)], {0}, 0)]
+             ("h", "/* hmx-tile: 0 */ " + kern("h", [VEC, VEC], hmx=True), [id(sv), id(a), id(w)], {0}, 0),   # a stays live across s's write
+             ("e2", "/* hmx-tile: 1 */ " + kern("e2", [pf, VEC]), [id(y), id(sv), id(a)], {0}, 0)]
     with tempfile.TemporaryDirectory() as d:
       old = os.environ.get("DSP_GRAPH_VTCM_KB")
       os.environ["DSP_GRAPH_VTCM_KB"] = "64"
@@ -147,10 +147,10 @@ class TestHoist(unittest.TestCase):
     if sys_path not in sys.path: sys.path.insert(0, sys_path)
     from dsp_graph_onnx import pull_raw_tile_readers
     b = {n: FakeBuf(4096) for n in "ixzo"}
-    b["p"] = FakeBuf((1024 + 1000) * 2)
+    b["p"] = FakeBuf(1024 * 2)
     bufs = {id(t): [t] for t in b.values()}
     calls = [("exp", "plain", [id(b["p"]), id(b["i"])], {0}), ("other", "plain", [id(b["z"]), id(b["x"])], {0}),
-             ("tail", "plain", [id(b["x"]), id(b["i"])], {0}), ("PV", "__hmx_", [id(b["o"]), id(b["p"])], {0})]
+             ("tail", "plain", [id(b["x"]), id(b["i"])], {0}), ("PV", "/* hmx-tile: 1 */ __hmx_", [id(b["o"]), id(b["p"])], {0})]
     self.assertEqual([c[0] for c in pull_raw_tile_readers(calls, bufs)], ["exp", "PV", "other", "tail"])
 
 class TestCoreParam(unittest.TestCase):

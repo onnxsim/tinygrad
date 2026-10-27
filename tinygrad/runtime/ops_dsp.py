@@ -1203,7 +1203,7 @@ static inline void __hmx_flush(void) {
   __hmx_pn = 0;
 }
 static inline void __hmx_pend(int n, const __fp16* p, const __fp16* q) { __hmx_pn = n; __hmx_pp = p; __hmx_pq = q; __hmx_ob ^= 1; }
-/* raw-tile buffers (a fp16 PARAM of 1024 k + _HMX_RAW_TAIL elements, nn/onnx.py's attention S^T and P): tinygrad indexes them
+/* raw-tile buffers (a fp16 PARAM with layout "hmx_tile", nn/onnx.py's attention S^T and P): tinygrad indexes them
  * as a row-major (rows, LD) matrix, the HMX kernels write and read them as raw tiles -- tile (row tile a, column tile b) at
  * (b * rows / 32 + a) * 1024, in the HMX's own layout (row pairs interleaved), so neither side converts. __hmx_rawb: the raw B
  * operand's base, set at the start of the call */
@@ -2261,17 +2261,23 @@ def hmx_qlinear_add(a, b, ra:float, rb:float, fixed:float):
   y = Tensor.empty(*a.shape, dtype=dtypes.uint8, device=a.device)
   return Tensor.custom_kernel(y, a, b, fxn=kern)[0]
 
-# raw-tile buffers (see __hmx_store_raw): marked by their size, 1024 k + _HMX_RAW_TAIL fp16 elements (nn/onnx.py allocates them)
-_HMX_RAW_TAIL = 1000
+# raw-tile buffers (see __hmx_store_raw): fp16 buffers of 1024 k elements in layout HMX_TILE (Tensor.empty(..., layout=HMX_TILE),
+# nn/onnx.py's attention S^T and P). The layout rides on the buffer (ParamArg.layout), not a view: tinygrad's matmul sees a row-major
+# (rows, LD) matrix the HMX lowering redirects to the tiles, while the softmax between reads the same memory flat. (As a view, the
+# key range's %2 split by pm_split_ranges had the tensor core tile the wrong axes.) The renderer lists them for the graph emitter
+# (/* hmx-tile: j */), which places them at 2 KB in VTCM
+HMX_TILE = "hmx_tile"
 def _hmx_raw_param(p:UOp) -> bool:
-  return p.op is Ops.PARAM and p.dtype == dtypes.half and len(p.shape) == 1 and p.shape[0] % 1024 == _HMX_RAW_TAIL
+  if p.op is not Ops.PARAM or p.layout != HMX_TILE: return False
+  if p.dtype != dtypes.half or len(p.shape) != 1 or p.shape[0] % 1024: raise RuntimeError(f"{HMX_TILE} buffer must be fp16 of 1024 k elements")
+  return True
 
 def _hmx_raw_geom(idx:list[UOp], p:UOp, ranges:list[UOp]):
   # row r's index idx[r] = idx[0] + r LD, (size - tail) / LD rows: -> (LD, row tiles), else None
   d = [_hmx_const_delta(lambda env, ii=ii: None if (a:=_hmx_eval(ii, env)) is None or (z:=_hmx_eval(idx[0], env)) is None else a - z, ranges)
        for ii in idx]
   if d[1] is None or d[1] <= 0 or d[1] % 32 or any(x != r * d[1] for r, x in enumerate(d)): return None
-  n = p.shape[0] - _HMX_RAW_TAIL
+  n = p.shape[0]
   return (d[1], n // d[1] // 32) if n % (32 * d[1]) == 0 else None
 
 def _hmx_raw_b(rows, kr:UOp, loops:tuple, ranges:list[UOp]):
@@ -2544,7 +2550,7 @@ def _hmx_acc_rewrite(uops:list[UOp]) -> tuple[list[UOp], bool]:
         if p not in rawo:
           rawo.add(p)
           last_param = max(pos[x] for x in uops if x.op is Ops.PARAM)
-          vt = f"const int __hmx_rv = __hmx_vt({{0}}, {2*(p.shape[0]-_HMX_RAW_TAIL)}u);"
+          vt = f"const int __hmx_rv = __hmx_vt({{0}}, {2*p.shape[0]}u);"
           after.setdefault(last_param, []).append(UOp(Ops.CUSTOM, dtypes.void, (p,), vt))
         after.setdefault(at, []).extend(([rowptr[0]] if rowptr[0] not in pos else []) +
                                         [UOp(Ops.CUSTOM, dtypes.void, (rowptr[0], p)+sx+tuple(r for r, _ in coef), code)])
@@ -2947,6 +2953,9 @@ class DSPRenderer(ClangRenderer):
     if (gs:=sorted({p.arg.slot for u in uops if u.op is Ops.LOAD and u.src and u.src[0].op in (Ops.INDEX, Ops.SHRINK) and _gathered(u.src[0])
                     for p in [u.src[0].src[0]] if p.op is Ops.PARAM and getattr(p.arg, "slot", -1) >= 0})):
       prefix.append(f"/* vtcm-gathered: {','.join(map(str, gs))} */")
+    # the raw-tile parameters, for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
+    if (rs:=sorted({u.arg.slot for u in uops if u.op is Ops.PARAM and u.layout == HMX_TILE})):
+      prefix.append(f"/* hmx-tile: {','.join(map(str, rs))} */")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),

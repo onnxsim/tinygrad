@@ -85,6 +85,10 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
     elif pre.endswith("*(") or not hmx: return False  # a scalar access; a pointer handed to a non-HMX (hand) kernel's code
   return seen
 
+def _listed(src:str, tag:str) -> set[int]:
+  """the parameter indices a kernel's source lists in a /* tag: 1,2 */ comment (the renderer's or a hand kernel's call)"""
+  return {int(x) for d in re.findall(rf"/\* {tag}: ([\d,]+) \*/", src) for x in d.split(",")}
+
 def _core_param(src:str, nbufs:int) -> int:
   """the position of a threaded kernel's core id (its `const int` parameter) among its parameters (default: after the buffers)"""
   body = src.split("/* DSP boilerplate */")[0]
@@ -164,6 +168,7 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     whole: set[int] = set()
     narrow: set[int] = set()
     weight: dict[int, int] = {}
+    rawt: set[int] = set()
     for n, (_, src, ids, outs, _) in enumerate(calls):
       declared = re.search(r"/\* vtcm-params: ([\d,]+) \*/", src)
       # (and a generated kernel's gathered parameters, which the renderer lists: from DDR every gathered row is a cache miss)
@@ -174,16 +179,15 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
         uses.setdefault(r, []).append(n)
         # a parameter a hand kernel declares (MSDA's value maps) is gathered from many times per call: worth 16 plain uses
         weight[r] = weight.get(r, 0) + (16 if j in heavy else 1)
-        # (a raw-tile buffer's marker tail is never written)
-        if j in outs and views[b].offset == 0 and views[b].nbytes in (base[b].nbytes, base[b].nbytes - 2000 * (base[b].nbytes % 2048 == 2000)):
-          whole.add(r)
+        if j in outs and views[b].offset == 0 and views[b].nbytes == base[b].nbytes: whole.add(r)
+        if j in _listed(src, "hmx-tile"): rawt.add(r)
         if not _vtcm_access_ok(src, j): narrow.add(r)
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
     cand = [r for r in uses if r in whole and r not in narrow and r not in pinned and id(regions[r]) not in blob_off and
             _rnd(regions[r].nbytes) <= vkb * 1024]
     vplaced: dict[int, tuple[int, int, int, int]] = {}  # region -> (offset, size, first call, last call)
-    # raw-tile buffers (ops_dsp __hmx_store_raw: 1024 k + 1000 fp16 elements) at 2 KB: the HMX reads and writes them in place
-    def align(r:int) -> int: return 2048 if regions[r].nbytes % 2048 == 2000 else ALIGN
+    # raw-tile buffers (ops_dsp HMX_TILE, listed by the renderer: /* hmx-tile: j */) at 2 KB: the HMX reads and writes them in place
+    def align(r:int) -> int: return 2048 if r in rawt else ALIGN
     def fit(size:int, f:int, l:int, skip=(), al:int=ALIGN) -> int|None:
       busy = sorted((o, o + sz) for r2, (o, sz, f2, l2) in vplaced.items() if r2 not in skip and not (l2 < f or l < f2))
       off = 0

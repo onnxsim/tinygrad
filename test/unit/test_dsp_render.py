@@ -368,30 +368,31 @@ class TestDSPHmx(unittest.TestCase):
     self.assertIn("if ((Lidx1)>0) { if ((Lidx2)%2==0 && (Lidx2)+1<30)", kernel)
 
   def test_raw_tile_buffers(self):
-    # a fp16 buffer of 1024 k + 1000 elements holds raw HMX tiles (nn/onnx.py's attention S^T and P): tinygrad's row-major (rows,
+    # a fp16 buffer in layout hmx_tile holds raw HMX tiles (nn/onnx.py's attention S^T and P): tinygrad's row-major (rows,
     # LD) view is only how it indexes them. The product goes out tile by tile at its raw place, (column tile x row tiles + row
     # tile) x 1024, and a raw B operand is read in place, its K panel being consecutive tiles
     hm = tc.hexagon_hmx + tc.hexagon_v65
-    sb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
-    sb[:64 * 96].reshape(64, 96).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
-    kernel = dsp_source(sb, hm).split("__attribute__((noinline)) void", 1)[1]
+    sb = Tensor.empty(64, 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
+    src = dsp_source(sb, hm)
+    self.assertIn("/* hmx-tile: 0 */", src)   # listed for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
+    kernel = src.split("__attribute__((noinline)) void", 1)[1]
     # (row tile Lidx1, column tile Lidx2 of 2 x 3: the place linear in the loops, the VTCM test once per call)
-    self.assertIn("const int __hmx_rv = __hmx_vt(data0_7144, 12288u);", kernel)
-    self.assertIn("__hmx_store_rawv((__fp16*)data0_7144 + 0+(Lidx1)*1024+(Lidx2)*2048, __hmx_rv);", kernel)
+    self.assertIn("const int __hmx_rv = __hmx_vt(data0_6144, 12288u);", kernel)
+    self.assertIn("__hmx_store_rawv((__fp16*)data0_6144 + 0+(Lidx1)*1024+(Lidx2)*2048, __hmx_rv);", kernel)
     self.assertEqual(kernel.count("__hmx_begin();"), 1)  # once per call, not per output tile
     self.assertNotIn("__hmx_out2(", kernel)
-    eb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
-    pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb[:64 * 96].reshape(64, 96), dtype=dtypes.half)
+    eb = Tensor.empty(64 * 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE)
+    pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb.reshape(64, 96), dtype=dtypes.half)
     kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
-    self.assertIn("__hmx_rawb = (__fp16*)data2_7144;", kernel)
+    self.assertIn("__hmx_rawb = (__fp16*)data2_6144;", kernel)
     self.assertRegex(kernel, r"__hmx_mac_span_raw\(__hmx_ca\(0\), __hmx_rawb\+\(Lidx\d\)\*2048, 2\);")
     self.assertNotIn("__hmx_pack2(_b", kernel)
     # A (one row of tiles, packed on the first output tile) L2-prefetched there; the output tile converted after the next one's
     # load pair (HMX_DEFER)
     self.assertRegex(kernel, r"if \(\(Ridx0\)==0\) __hmx_prefetch_rows\(")
     # two N tiles: computed as a pair from adjacent K panels and converted to full rows together (HMX_OUTPAIR_RAW)
-    eb = Tensor.empty(64 * 128 + 1000, dtype=dtypes.half)
-    pv = Tensor.empty(64, 64, dtype=dtypes.half).matmul(eb[:64 * 128].reshape(64, 128), dtype=dtypes.half)
+    eb = Tensor.empty(64 * 128, dtype=dtypes.half, layout=ops_dsp.HMX_TILE)
+    pv = Tensor.empty(64, 64, dtype=dtypes.half).matmul(eb.reshape(64, 128), dtype=dtypes.half)
     kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
     self.assertRegex(kernel, r"__hmx_rawb\+\(Lidx\d\)\*2048\+2048, 2\);")
     self.assertIn("__hmx_pend(2, _p, _q);", kernel)

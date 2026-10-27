@@ -1175,7 +1175,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # store, the sums' broadcast over the 32 rows made the rows the upcast axis (strided scalar loads and stores)
     oT = Tensor.empty(H, D + 1, Mp, dtype=dtypes.float32, device=q.device)
     if getenv("ATTN_RAW", 1):
-      # S^T and P^T in raw HMX tiles: no conversion either way. A buffer of Np Mp + 1000 fp16 elements (ops_dsp _HMX_RAW_TAIL) is
+      # S^T and P^T in raw HMX tiles: no conversion either way. A buffer in layout hmx_tile (ops_dsp HMX_TILE) is
       # one the HMX kernels write and read as raw tiles -- S^T's tile (key tile a, query tile b) at (b Nt + a) 1024, row pairs
       # interleaved, as the HMX stores them and P V's spanning B load pair reads them -- while tinygrad sees a row-major (Np, Mp)
       # matrix in both matmuls (the tensor cores apply as usual). Converting S^T's tiles to rows was ~125 us of the 180 us S^T
@@ -1184,17 +1184,17 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       # the keys is a vector max over (nt, r) with (c, p) as lanes, then a max over p (both lanes of a pair get it); the bias is
       # one row of tiles expanded over the queries
       Mt, Nt = Mp // 32, Np // 32
-      def raw() -> Tensor: return Tensor.empty(Np * Mp + 1000, dtype=dtypes.half, device=q.device)
+      # (each buffer made in the shape its writer assigns: an assign through a reshape of a whole buffer doesn't reach the buffer)
+      def raw(*shape) -> Tensor: return Tensor.empty(*shape, dtype=dtypes.half, device=q.device, layout="hmx_tile")
       bias2 = bias.reshape(1, Nt, 16, 1, 2).expand(1, Nt, 16, 32, 2).reshape(1, Nt, 16, 64).contiguous()
       for h in range(H):
-        sb, eb = raw(), raw()
-        sb[:Np * Mp].reshape(Np, Mp).assign(kp[h].matmul(qT[h], dtype=dtypes.half))
+        sb = raw(Np, Mp).assign(kp[h].matmul(qT[h], dtype=dtypes.half))
         # N even (BEVFormer's 900): no bias. The keys below N are the first N / 2 row pairs, so the max and the sums reduce over
         # those only, and the max is clamped at -15: the padding keys' scores are 0 (zero rows of K), their exp at most 2^15 (no
         # inf), times V^T's zero columns in P V. The bias tiles were a DDR load next to each VTCM one, in the max and in the exp.
         # (Underflows only where every score of a query is below -29 in log2 units, all of its probabilities < 2^-14)
         nb = N % 2 == 0 and getenv("ATTN_NOBIAS", 1)
-        s = sb[:Np * Mp].reshape(Mt, Nt, 16, 64)
+        s = sb.reshape(Mt, Nt, 16, 64)
         x = s if nb else s + bias2
         mm = (s.reshape(Mt, Nt * 16, 64)[:, :N // 2] if nb else x).reshape(Mt, -1, 64).max(1, keepdim=True).contiguous()  # (Mt, 1, 64)
         # the max of each lane pair, over a tile's 16 row pairs: broadcast over the key tiles only (30, which no vector width
@@ -1204,23 +1204,23 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
         m1 = mm.reshape(Mt, 32, 2).max(-1, keepdim=True)
         m1 = (m1.maximum(-15) if nb else m1).expand(Mt, 32, 2).contiguous()
         m2 = m1.reshape(Mt, 1, 1, 64).expand(Mt, 1, 16, 64).contiguous()
-        eb[:Np * Mp].reshape(Mt, Nt, 16, 64).assign((x - m2).exp2())
+        eb = raw(Mt, Nt, 16, 64).assign((x - m2).exp2())
         # the sums by a reduce over P's tiles, P V with V^T's 32 rows only: with the ones row the product took two M tiles, twice the
         # spanning loads (0.12 ms per head on the V69). In fp16 over runs of up to 16 row pairs, then fp32 over the runs: summed
         # in fp32 throughout, LLVM's widening of each vector to a qf32 pair, its lane shuffle back and the conversions after every
         # add were 7 packets per row pair (49 us per head; an fp16 add is one, as in the max)
         if getenv("ATTN_SUM_HMX", 1):
           # the sums by the HMX too, as V^T's row of ones (a second M tile per output tile): no second pass over P
-          y = vT[h].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float()
+          y = vT[h].matmul(eb.reshape(Np, Mp), dtype=dtypes.half).contiguous().float()
           oT[h].assign(y[:D + 1])                                                                             # O^T | sums
           continue
-        e = eb[:Np * Mp].reshape(Mt, Nt * 16, 64)
+        e = eb.reshape(Mt, Nt * 16, 64)
         e = e[:, :N // 2] if nb else e
         g = max(d for d in range(1, 17) if e.shape[1] % d == 0) if getenv("ATTN_SUM16", 1) else 1
         ps = e.reshape(Mt, -1, g, 64).sum(2, dtype=dtypes.half).float().sum(1).contiguous()                   # (Mt, 64)
         oT[h, D:].assign(ps.reshape(Mt, 32, 2).sum(-1).reshape(1, Mp))                                      # sums
         # (stored in fp16 first: the cast and the fp32 store fused into P V's output tiles took it from 0.06 to 0.29 ms per head)
-        oT[h, :D].assign(vT[h, :D].matmul(eb[:Np * Mp].reshape(Np, Mp), dtype=dtypes.half).contiguous().float())  # O^T
+        oT[h, :D].assign(vT[h, :D].matmul(eb.reshape(Np, Mp), dtype=dtypes.half).contiguous().float())  # O^T
     for h in range(H if not getenv("ATTN_RAW", 1) else 0):
       s16 = kp[h].matmul(qT[h], dtype=dtypes.half).contiguous()                                               # S^T (Np, Mp)
       # the shift by the max in fp16 (the exponent is rounded to fp16 for the exp anyway): in fp32 the conversions both ways

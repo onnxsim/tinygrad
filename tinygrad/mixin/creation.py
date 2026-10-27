@@ -20,7 +20,7 @@ class CreationMixin(DTypeMixin, MovementMixin):
     return self._wrap_uop(UOp.mstack(*[fxn(self._uop.shard_shape, d)._uop for d in self.device]).unshard(self._uop.axis))
 
   @classmethod
-  def empty(cls, *shape, device:str|tuple[str, ...]|None=None, dtype:DTypeLike|None=None) -> Self:
+  def empty(cls, *shape, device:str|tuple[str, ...]|None=None, dtype:DTypeLike|None=None, layout:str|None=None) -> Self:
     """
     Creates an empty tensor with the given shape.
 
@@ -36,7 +36,7 @@ class CreationMixin(DTypeMixin, MovementMixin):
     dt = to_dtype(dtype) if dtype is not None else dtypes.default_float
     new_shape = argfix(*shape)
     max_shape = to_max_shape(new_shape)
-    u = UOp.new_buffer(canonicalize_device(device), prod(max_shape), dt).reshape(max_shape).shrink_to(new_shape)
+    u = UOp.new_buffer(canonicalize_device(device), prod(max_shape), dt, layout=layout).reshape(max_shape).shrink_to(new_shape)
     return cls._wrap_uop(u)
 
   def empty_like(self, dtype: DTypeLike|None=None, device: str|tuple[str, ...]|None=None) -> Self:
