@@ -102,6 +102,21 @@ class TestDSPRender(unittest.TestCase):
     finally: ops_dsp.HVX_REVEC_CMP = old
     self.assertNotIn("__hvx_m32 _m", src)
 
+  def test_splat_scalar_keeps_float_weights_scalar(self):
+    # HVX_SPLAT_SCALAR: a splat of one scalar float op (the generated MSDA's bilinear tap weight, broadcast over a head's 32
+    # channels) stays that scalar op + one vsplat instead of a vector op on splatted operands
+    from tinygrad.uop.ops import UOp
+    buf = UOp.placeholder((4,), dtypes.float32, 0)
+    a, b = buf.index(UOp.const(0, dtypes.int32)).load(), buf.index(UOp.const(1, dtypes.int32)).load()
+    x = UOp.stack(*[a * b + a] * 32)
+    old = ops_dsp.HVX_SPLAT_SCALAR
+    try:
+      ops_dsp.HVX_SPLAT_SCALAR = 0
+      self.assertIsNotNone(ops_dsp.hvx_revectorize(x))
+      ops_dsp.HVX_SPLAT_SCALAR = 1
+      self.assertIsNone(ops_dsp.hvx_revectorize(x))
+    finally: ops_dsp.HVX_SPLAT_SCALAR = old
+
   def test_strided_reduce_prefetches_rows_ahead(self):
     # a reduction down the rows of a row-major (512, 1024) half matrix: the load moves 2 KB per reduce step, so it prefetches
     # HVX_PREFETCH_STRIDES (4) rows ahead, not HVX_PREFETCH bytes (one row)
