@@ -289,21 +289,36 @@ def main() -> None:
   y = holder["y"]
   used = {id(b[0].base) for b in bufs.values()}
   ins = [(name, t) for name, t in feeds.items() if id(t.uop.buffer.base) in used]
-  info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for _, t in ins], y.uop.buffer)
+  # recurrent state, as examples/openpilot/dsp_graph_v65.py: an output next_X of input X's shape and dtype is X's next value. The
+  # program loops it back on the DSP after every run, so a caller sends X once and leaves it out after that (program.txt "state")
+  slot = {name: i for i, (name, _) in enumerate(ins)}
+  gidx = {vi.name: i for i, vi in enumerate(graph_inputs)}
+  single = len(model.graph.output) == 1
+  dims_of = lambda vi: [d.dim_value for d in vi.type.tensor_type.shape.dim]
+  state_pairs, at = [], 0
+  for k, vo in enumerate(model.graph.output):
+    to = vo.type.tensor_type
+    dt = to.elem_type if single and to.elem_type in (1, 2) else 1
+    nbytes = int(np.prod([d.dim_value or 1 for d in to.shape.dim])) * (1 if dt == 2 else 4)
+    x = vo.name[5:]
+    if vo.name.startswith("next_") and x in slot and feeds[x].nbytes() == nbytes and \
+       graph_inputs[gidx[x]].type.tensor_type.elem_type == dt and dims_of(graph_inputs[gidx[x]]) == dims_of(vo):
+      state_pairs.append((k, gidx[x], slot[x], at, nbytes))
+    at += nbytes
+  info = dsp_graph_v65.emit(out, calls, bufs, [t.uop.buffer for _, t in ins], y.uop.buffer,
+                            state=[(sl, off, ln) for _, _, sl, off, ln in state_pairs])
   print(f"emitted {info['calls']} calls ({info['threaded_calls']} threaded), {info['kernels']} kernels, hmx={info['hmx']}, "
         f"{info['vtcm_regions']} regions in {info['vtcm_bytes']/1e6:.2f} MB VTCM, "
         f"{info['blob']/1e6:.1f} MB weights, {info['scratch']/1e6:.2f} MB scratch -> {out}", file=sys.stderr)
   dsp_graph_v65.build(out, kernel_arch=args.arch)
 
   # program.txt: the runner's I/O contract (see examples/openpilot/dsp_graph_v65.py and onnxsim's remote_hexagon_worker.cpp)
-  slot = {name: i for i, (name, _) in enumerate(ins)}
   threads = max(1, int(os.environ["DSP_THREADS"]))
   lines = [f"ncalls {info['calls']}", f"threads {threads}", f"output_bytes {info['output_bytes']}"]
   for i, vi in enumerate(graph_inputs):
     nbytes = feeds[vi.name].nbytes() if vi.name in slot else 0
     lines.append(f"input {i} {vi.type.tensor_type.elem_type} {nbytes} {slot.get(vi.name, -1)}")
   lines += [f"name {i} {c[0]}" for i, c in enumerate(calls)]
-  single = len(model.graph.output) == 1
   total = 0
   for vo in model.graph.output:
     tt = vo.type.tensor_type
@@ -312,6 +327,7 @@ def main() -> None:
     n = int(np.prod(dims))
     total += n * (1 if dt == 2 else 4)
     lines.append(f"output {dt} {n} " + " ".join(map(str, dims)))
+  lines += [f"state {k} {i}" for k, i, _, _, _ in state_pairs]
   if total != info["output_bytes"]: sys.exit(f"ONNX outputs ({total} bytes) don't match the program output ({info['output_bytes']} bytes)")
   size = dsp_graph_v65.pack(out, args.artifact, lines, arch=args.arch)
   manifest = {"schema_version": 1,
