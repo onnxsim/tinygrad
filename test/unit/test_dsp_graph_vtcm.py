@@ -27,6 +27,7 @@ class TestVtcmAccess(unittest.TestCase):
     self.assertFalse(g._vtcm_access_ok(kern("k", [SCALAR]), 1))
     self.assertTrue(g._vtcm_access_ok(kern("k", ["__fp16128 a = (*((__fp16128*)((@+0))));"]), 1))
     self.assertTrue(g._vtcm_access_ok(kern("k", ["(__builtin_HEXAGON_Y2_dcfetch((char*)(@+0)+2048), 0);" + VEC]), 1))  # a prefetch
+    self.assertTrue(g._vtcm_access_ok(kern("k", ["__tg_l2box((const char*)(@+0)+0, 128u, 128, 8);" + VEC]), 1))  # an L2 stream box
     # a pointer handed to helper code: HMX helpers pack / store with HVX; a hand kernel's code is unknown
     self.assertTrue(g._vtcm_access_ok(kern("k", ["__hmx_pack2(_a+0, (@+0), (@+32));"], hmx=True), 1))
     self.assertFalse(g._vtcm_access_ok(kern("k", ["__msda_call((@+0));"]), 1))

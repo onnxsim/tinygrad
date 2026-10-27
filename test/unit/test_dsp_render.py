@@ -275,6 +275,70 @@ class TestDSPQfMath(unittest.TestCase):
     ops_dsp.QF_MATH = False
     self.assertNotIn("__TG_EXP2", dsp_source(Tensor.empty(2048).exp()))
 
+class TestDSPL2Stream(unittest.TestCase):
+  # HVX_L2STREAM_KB (v68+): an input stream whose per-iteration footprint is one 2-D box gets one l2fetch box per chunk, issued
+  # from a strip-mined outer loop; contiguous whole-vector streams keep their dcfetches
+  def setUp(self): self.prev, ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB = (ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB), True, 16
+  def tearDown(self): ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB = self.prev
+
+  def test_subline_rows_strip_mined(self):
+    # row sums of a (900, 32) float matrix read as float4s (BEVFormer's LayerNorm statistics): 128 rows of 128 bytes per chunk,
+    # the first chunk fetching itself and the next, then only the next; the hot loop has no branch
+    src = dsp_source(Tensor.empty(900, 32).sum(1)).split("/* DSP boilerplate")[0]
+    self.assertIn("for (int Lidx1_c = 0; Lidx1_c < 900; Lidx1_c += 128) {", src)
+    self.assertIn("int _o = Lidx1_c ? Lidx1_c+128 : 0, _n = Lidx1_c+256 < 900 ? Lidx1_c+256 : 900; _n -= _o;", src)
+    self.assertRegex(src, r"__tg_l2box\(\(const char\*\)\(data1_28800\+\(\(_o<<5\)\+4\)\)\+-16, 128u, 128, _n\)")
+    self.assertIn("for (int Lidx1 = Lidx1_c; Lidx1 < (Lidx1_c+128 < 900 ? Lidx1_c+128 : 900); Lidx1++) {", src)
+    self.assertIn("}}", src)
+
+  def test_transpose_columns_box(self):
+    # a transpose reads 32 rows per output tile, the next tile 128 bytes on: "cols" boxes of 32 rows at the row stride, and no
+    # dcfetches (theirs were a whole outer step ahead: the attention's transposes 251 -> 169 us per call on the V69)
+    src = dsp_source(Tensor.empty(32, 2048).T.contiguous()).split("/* DSP boilerplate")[0]
+    self.assertRegex(src, r"__tg_l2box\([^;]*, 8192u, _n\*128, 32\)")
+    self.assertNotIn("dcfetch", src)
+
+  def test_contiguous_vectors_keep_dcfetch(self):
+    src = dsp_source(Tensor.empty(900, 256).cast(dtypes.half)).split("/* DSP boilerplate")[0]
+    self.assertNotIn("__tg_l2box(", src)
+    self.assertIn("__builtin_HEXAGON_Y2_dcfetch(", src)
+
+  def test_off(self):
+    ops_dsp.HVX_L2STREAM_KB = 0
+    self.assertNotIn("__tg_l2box(", dsp_source(Tensor.empty(800, 32).sum(1)))
+
+  def test_box_fit(self):
+    self.assertEqual(ops_dsp._l2_box([(0, 64), (512, 640)]), None)                  # rows of different widths
+    self.assertEqual(ops_dsp._l2_box([(1024, 1152), (0, 128), (512, 640)]), (0, 128, 512, 3))
+    self.assertEqual(ops_dsp._l2_box([(0, 16), (16, 32), (32, 128)]), (0, 128, 128, 1))
+
+class TestDSPSplatRecip(unittest.TestCase):
+  # a reciprocal of a splat: one scalar reciprocal, or (a lane of a vector) one vector reciprocal for every lane
+  def setUp(self): self.prev, ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH = (ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH), True, True
+  def tearDown(self): ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH = self.prev
+
+  def test_scalar_divisor(self):
+    src = dsp_source(Tensor.empty(64, 32) / Tensor.empty(64).reshape(64, 1)).split("/* DSP boilerplate")[0].split("void E_")[1]
+    self.assertIn("((float32)(1.0f/val0))", src)
+    self.assertNotIn("__TG_RECIP(", src)
+
+  def test_lane_divisors_hoisted(self):
+    # x / splat(v[k]) for lanes k of one loaded vector v (the attention's transposed P / row sums): one RECIPROCAL(v), right
+    # after v, and multiplies by splats of its lanes
+    from tinygrad.uop.ops import UOp, Ops
+    seen: list = []
+    orig = ops_dsp._transpose_groups
+    ops_dsp._transpose_groups = lambda ren, uops: seen.append(uops) or orig(ren, uops)
+    try: dsp_source(Tensor.empty(4096) * 3)
+    finally: ops_dsp._transpose_groups = orig
+    v = next(u for u in seen[0] if u.op is Ops.LOAD and u.max_numel() > 1)
+    n = v.max_numel()
+    lanes = [UOp(Ops.INDEX, dtypes.float32, (v, UOp(Ops.CONST, dtypes.int, (), k))) for k in range(3)]
+    divs = [UOp(Ops.FDIV, dtypes.float32, (v, UOp(Ops.STACK, dtypes.float32, (lane,) * n))) for lane in lanes]
+    out = ops_dsp._hoist_splat_recip([v, *divs])
+    self.assertEqual([u.op for u in out], [Ops.LOAD, Ops.RECIPROCAL] + [Ops.INDEX, Ops.STACK, Ops.MUL] * 3)
+    self.assertTrue(all(u.src[0] is out[1] for u in out if u.op is Ops.INDEX))
+
 class TestDSPVrmpyGemv(unittest.TestCase):
   # a W8A8 decode GEMV: one uint8 activation row times int8 weights, int32 accumulation -- exactly vrmpybusv (u8 x s8 dot4)
   K, N = 576, 1536
