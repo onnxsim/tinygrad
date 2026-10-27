@@ -1130,10 +1130,14 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
         return out
       t = t.half().contiguous()
       if not (rows or cols): return t
-      # (and a matrix of a few rows padded to two tiles, BEVFormer's one-row can_bus MLP: generated, its row select stayed per lane,
-      # 0.68 ms for a 1 x 128 -> 64 x 128 pad on the V69)
-      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64) or (rows and t.shape[-2] < 32)):
+      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
         return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
+      # a matrix of a few rows padded both ways (BEVFormer's one-row can_bus MLP, 1 x 18 -> 64 x 32): the columns first, then the rows,
+      # so the row pad selects whole rows (one vector select a row) -- in one go every lane was a scalar fp16 select, 94 us on the V69
+      # against the hand row copy's 11
+      if dsp and rows and cols and t.shape[-2] < 32:
+        t = t.pad(((0, 0),) * (t.ndim - 1) + ((0, cols),)).contiguous()
+        cols = 0
       return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
     # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: generated kernels head by head (HMX_ATTN=3, the default:
     # BEVFormer's decoder 36.6 ms on the V69, the hand kernels' 37.9), the hand attention kernels (1, 2) or off (0)
@@ -1814,7 +1818,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # (MSDA_STAGE=2) from there -- BEVFormer's encoder (2500 queries) generated: enc1 11.4 -> 9.6, enc3 34.6 -> 29.5 ms on the V69;
     # its decoder (900) stays hand (generated 23.5 -> 25.3 ms)
     hand = getenv("HAND_MSDA", -1)
-    if hand < 0: hand = int(Q < getenv("MSDA_GEN_MIN_Q", 2048))
+    if hand < 0: hand = int(Q < getenv("MSDA_GEN_MIN_Q", 0))
     if str(value.device).startswith("DSP") and hand:
       # MSDA_SPLIT_MAPS=1: the plain mean over several maps (BEVFormer's two-frame temporal attention) as one call per map, so a
       # map's values (2.56 MB) fit the graph's VTCM arena: the calls got faster (6.5 -> 4.7 ms per encoder layer on the V69) but
@@ -1909,7 +1913,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     Q, M, NO, P, _ = off.shape
     NVR, D = refp.shape[0], C // M
     offv = off.permute(2, 0, 1, 3, 4) if NO > 1 else off[:, :, 0].reshape(1, Q, M, P, 2)                        # (NV|1, Q, M, P, 2)
-    rp = refp.reshape(NVR, Q, 1, 1, P, 2)
+    # the reference points stored first (a few KB): computed ones (BEVFormer's decoder layers refine them with a sigmoid) broadcast over
+    # heads and taps end the scheduler's ranges, which realized x0 + tap / y0 + tap at full size -- two (Q, M, 4, P) int buffers per
+    # layer from scalar kernels, 0.2-0.6 ms each on the V69
+    rp = refp.contiguous().reshape(NVR, Q, 1, 1, P, 2)
     x = rp[..., 0] * W + offv[..., 0].reshape(-1, Q, M, 1, P) - 0.5                                             # (NV, Q, M, 1, P)
     y = rp[..., 1] * H + offv[..., 1].reshape(-1, Q, M, 1, P) - 0.5
     def flr(t:Tensor) -> tuple[Tensor, Tensor]:
