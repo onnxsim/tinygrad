@@ -1820,16 +1820,37 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
         y = rp[..., 1] * H + offv[..., 1] - 0.5
         x, y = x.expand(NV, Q, M, P), y.expand(NV, Q, M, P)
         flat = value.reshape(-1).contiguous()
-        x0, y0 = x.floor(), y.floor()
+        arith = getenv("MSDA_ARITH", 1)
+        if arith:
+          # arithmetic only (adds, products, max / min, one bitcast): no compares, selects or float->int conversions, which have
+          # no vector form here, so the renderer can vectorize the address math across lanes. floor: round to nearest by
+          # +-1.5 2^23, minus 1 where that rounded up (a step 0/1 from max / min of the difference times 2^24)
+          # (the simplifier doesn't reassociate around a rounding constant this large: uop/symbolic _reassoc)
+          def step(t:Tensor) -> Tensor: return (t * 16777216.0).maximum(0.0).minimum(1.0)
+          def flr(t:Tensor) -> Tensor:
+            r = (t + 12582912.0) - 12582912.0
+            return r - step(r - t)
+          x0, y0 = flr(x), flr(y)
+        else: x0, y0 = x.floor(), y.floor()
         fx, fy = x - x0, y - y0
         base = (Tensor.arange(NV, dtype=dtypes.int32) * (H * W)).reshape(NV, 1, 1, 1)
         hcol = (Tensor.arange(M, dtype=dtypes.int32) * D).reshape(1, 1, M, 1, 1)
         s = None
         for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
           xt, yt = x0 + dx, y0 + dy
-          ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
-          w = ok.where((fx if dx else 1 - fx) * (fy if dy else 1 - fy), 0.0)
-          row = ok.where(base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32), 0)
+          if arith:
+            # an integer-valued u is inside [0, L-1] when both steps are 1; outside taps read a clamped (valid) row at weight 0;
+            # the row index in float (exact below 2^23), then to int through the mantissa of index + 2^23
+            def inside(u:Tensor, L:int) -> Tensor: return (u + 1).maximum(0.0).minimum(1.0) * (L - u).maximum(0.0).minimum(1.0)
+            w = (fx if dx else 1 - fx) * (fy if dy else 1 - fy) * inside(xt, W) * inside(yt, H)
+            rowf = base.cast(x.dtype) + yt.maximum(0.0).minimum(H - 1) * W + xt.maximum(0.0).minimum(W - 1)
+            # (the low mantissa bits by a mask sized to the rows: an exact small int whose bounds the simplifier knows -- as
+            # bits - 0x4B000000 the row times C was distributed into an int32 shift that overflows)
+            row = (rowf + 8388608.0).bitcast(dtypes.int32) & ((1 << (NV * H * W - 1).bit_length()) - 1)
+          else:
+            ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
+            w = ok.where((fx if dx else 1 - fx) * (fy if dy else 1 - fy), 0.0)
+            row = ok.where(base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32), 0)
           el = row.unsqueeze(-1) * C + hcol + Tensor.arange(D, dtype=dtypes.int32).reshape(1, 1, 1, 1, D)       # (NV, Q, M, P, D)
           tap = Tensor(flat.uop.index(el.reshape(-1).uop)).reshape(NV, Q, M, P, D) * w.unsqueeze(-1).cast(value.dtype)
           s = tap if s is None else s + tap

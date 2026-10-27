@@ -37,4 +37,13 @@ class TestGatedReduce(unittest.TestCase):
     self.assertEqual([u.op for u in lst].count(Ops.IF), 1)
     self.assertEqual([u.op for u in lst].count(Ops.ENDIF), 1)
 
+class TestRoundingConstant(unittest.TestCase):
+  def test_no_reassoc_around_rounding_constant(self):
+    # (t + 1.5 2^23) - 1.5 2^23 rounds t to an integer; reassociated it was t again (or, fused, lost t's fraction): the MSDA's
+    # arithmetic floor relies on it
+    t = Tensor(np.array([-1.7, -0.5, -0.2, 0.0, 0.3, 1.5, 2.7, 24.9], np.float32)) * 1.0
+    r = (t + 12582912.0) - 12582912.0
+    x0 = r - ((r - t) * 16777216.0).maximum(0.0).minimum(1.0)
+    np.testing.assert_equal(x0.numpy(), np.floor(t.numpy()))
+
 if __name__ == "__main__": unittest.main()
