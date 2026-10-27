@@ -1916,8 +1916,17 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       return rows * w.unsqueeze(-1).cast(value.dtype)
     # without a mask every map is summed: the maps go in the table too (BEVFormer's temporal attention: 2 maps x 4 taps x 4 points,
     # one vector)
-    if vis is None: return taps(el.permute(1, 2, 0, 3, 4).stage(3), w.permute(1, 2, 0, 3, 4).stage(3)).sum((2, 3, 4)).reshape(Q, C) * (1.0 / NV)
-    tot = (vis != 0).reshape(NV, Q, 1, 1, 1, 1).where(taps(el.stage(2), w.stage(2)), 0.0).sum((0, 3, 4))           # (Q, M, D)
+    # MSDA_STAGE=2: the heads in the table too, built once per (map, query) for all heads (their accumulators upcast): the tap axis
+    # outermost, a loop around (heads x points) lanes (STAGE_LANES)
+    def staged(t:Tensor, n:int) -> Tensor:
+      if getenv("MSDA_STAGE", 1) < 2: return t.stage(n)
+      lead, tap = t.ndim - n - 1, t.ndim - 2                                         # the head axis, the tap axis
+      order = list(range(lead)) + [tap, lead] + [a for a in range(lead + 1, t.ndim) if a != tap]
+      return t.permute(order).stage(n + 1).permute(argsort(order))
+    if vis is None:
+      el, w = el.permute(1, 2, 0, 3, 4), w.permute(1, 2, 0, 3, 4)                                                # (Q, M, NV, 4, P)
+      return taps(staged(el, 3), staged(w, 3)).sum((2, 3, 4)).reshape(Q, C) * (1.0 / NV)
+    tot = (vis != 0).reshape(NV, Q, 1, 1, 1, 1).where(taps(staged(el, 2), staged(w, 2)), 0.0).sum((0, 3, 4))      # (Q, M, D)
     return tot.reshape(Q, C) / vis.cast(value.dtype).sum(0).maximum(1.0).reshape(Q, 1)
 
   def _msda_dsp(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:

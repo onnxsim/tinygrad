@@ -51,11 +51,12 @@ class TestStage(unittest.TestCase):
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-4)
 
   def test_one_kernel_with_vector_table(self):
-    # the table is a 32-lane register array, stored as one vector per row and read as scalars by the reduce's loop
+    # the table is a 32-lane register array, stored as one vector per row and read as scalars by the reduce's loop (unrolled by
+    # STAGE_UNROLL=4 only, not into one vector load and lane extractions)
     srcs = dsp_sources(table_reduce(Tensor.empty(16, 32), Tensor.empty(16, 32), Tensor.empty(16, 32, 32)))
     self.assertEqual(len(srcs), 1)
     src = srcs[0]
-    tab = re.search(r"\*\((buf\d+)\+Ridx\d+\)", src)
+    tab = re.search(r"\(\(float\*\)\((buf\d+)\+\(Ridx\d+<<2\)\)\)\[0\]", src)   # (STAGE_UNROLL=4: four entries a step)
     self.assertIsNotNone(tab)
     self.assertIn(f"float {tab.group(1)}[32] __attribute__((aligned(128)));", src)
     self.assertIn(f"*((float32*)(({tab.group(1)}+0))) =", src)
@@ -75,7 +76,7 @@ class TestStage(unittest.TestCase):
     # (8 rows: a kernel no other test renders -- programs are cached by AST)
     try: src = dsp_sources(table_reduce(Tensor.empty(8, 32), Tensor.empty(8, 32), Tensor.empty(8, 32, 32)))[0]
     finally: ops_dsp.HVX_QFLOAT = old
-    self.assertRegex(src, r"= __builtin_bit_cast\(float32, __QADD\(__QB\(.*\), __QMUL\(")
+    self.assertRegex(src, r"= \(float32\)__builtin_bit_cast\(__hvx_f, __QADD\(__QB\(.*\), __QADD\(__QADD\(__QADD\(__QMUL\(")
     self.assertIn("__QSF(", src)
 
   def test_int_lanes_through_bits(self):
@@ -92,6 +93,29 @@ class TestStage(unittest.TestCase):
     self.assertIn("__builtin_bit_cast(int32, (float32)__hvx_sfbar(", src)
     self.assertRegex(src, r"\*\(\(int32\*\)\(\(buf\d+\+0\)\)\) =")
 
+  def test_table_loop_outside_lanes(self):
+    # a table of more than STAGE_LANES (64) entries: its innermost axes are the vector lanes and a loop goes around them; what
+    # doesn't depend on that loop's axis is computed once, outside it. Gated, the whole loop moves into the IF (sink_into_ifs)
+    a, X, vis = Tensor.empty(8, 64), Tensor.empty(8, 4, 64, 32), Tensor.empty(8, dtype=dtypes.uint8)
+    tab = ((a.exp2().reshape(8, 1, 64) + Tensor.arange(4).reshape(1, 4, 1)) * 0.5).stage(2)               # (8, 4, 64): 4 x 64
+    src = dsp_sources((vis != 0).reshape(8, 1, 1, 1).where(tab.unsqueeze(-1) * X, 0.0).sum((1, 2)))[0]
+    body = src[src.index("if ("):]
+    loop = re.search(r"for \(int (Lidx\d+) = 0; \1 < 4; \1\+\+\) \{", body)
+    self.assertIsNotNone(loop)
+    self.assertNotIn("exp2", body[loop.end():body.index("for (int Ridx")])      # (v65 render: the exp2 is a polynomial, outside the loop)
+    self.assertRegex(body[loop.end():], r"\*\(\(float64\*\)\(\(buf\d+\+\(Lidx\d+<<6\)\)\)\) =")
+    self.assertEqual(src.count("if ("), 1)
+
+  def test_norm_add_col(self):
+    # (HVX_REVEC_BITCAST) lanes x + c, c + x and x (c = 0 folded away) line up as x + c
+    from tinygrad.runtime import ops_dsp
+    from tinygrad.uop.ops import UOp, Ops
+    x = UOp.range(100, 0).cast(dtypes.int32)
+    with _env(HVX_REVEC_BITCAST="1"): col = ops_dsp._norm_add_col((x, x + 3, UOp(Ops.ADD, x.dtype, (x.const_like(5), x))))
+    self.assertEqual([c.op for c in col], [Ops.ADD]*3)
+    self.assertEqual([c.src[1].arg for c in col], [0, 3, 5])
+    self.assertTrue(all(c.src[0] is x for c in col))
+
   def test_msda_staged(self):
     # the generated MSDA through register tables (MSDA_STAGE=1) against numpy, with and without a visibility mask
     from tinygrad.nn.onnx import onnx_ops
@@ -104,8 +128,9 @@ class TestStage(unittest.TestCase):
       attw = rng.uniform(0, 1, (Q, M, NO, P)).astype(np.float32)
       vis = (rng.uniform(0, 1, (NV, Q)) < 0.5).astype(np.uint8) if masked else None
       args = (Tensor(value), Tensor(ref), Tensor(off), Tensor(attw), None if vis is None else Tensor(vis))
-      with _env(MSDA_STAGE="1"): out = onnx_ops["MSDA"](*args, H=H, W=W).numpy()
       with _env(MSDA_GATED="0"): want = onnx_ops["MSDA"](*args, H=H, W=W).numpy()
-      np.testing.assert_allclose(out, want, rtol=1e-4, atol=1e-4)
+      for stage in ("1", "2"):
+        with _env(MSDA_STAGE=stage): out = onnx_ops["MSDA"](*args, H=H, W=W).numpy()
+        np.testing.assert_allclose(out, want, rtol=1e-4, atol=1e-4)
 
 if __name__ == "__main__": unittest.main()

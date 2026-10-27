@@ -72,7 +72,7 @@ class ElementwiseMixin(CreationMixin):
     """
     Computes the last n axes into a register table inside the consumer's kernel, once per iteration of the consumer's loops over the
     other axes: two loop nests joined by an on-chip buffer (like GPU shared memory), each with its own vectorization. The table's
-    loops are fully upcast, so keep it small (a few HVX vectors).
+    innermost axes are vector lanes (up to STAGE_LANES, 64), the rest loops around them; keep it small (a few HVX registers).
     """
     assert 0 < n <= len(self.shape), f"stage: {n} axes of a {len(self.shape)}-d tensor"
     return self._wrap_uop(self._uop.alu(Ops.CONTIGUOUS, arg=("stage", n)))

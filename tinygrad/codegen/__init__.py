@@ -310,7 +310,14 @@ def add_reg_stage(ctx:tuple[Iterator[int], dict], idx:UOp, x:UOp):
     n, lane = prod(x.max_shape), UOp.const(0, dtypes.weakint)
     for r in ext: lane = lane * r.src[0] + r
     buf = UOp.placeholder((n * prod([r.src[0].arg for r in ext]),), x.dtype, slot=next(ctx[0]), addrspace=AddrSpace.REG)
-    up = {r:r.replace(arg=r.arg[:-1]+(AxisType.UPCAST,)) for r in own}
+    # its innermost axes upcast up to STAGE_LANES lanes, the rest loops around them: what doesn't depend on those loops is computed
+    # once, outside (the generated MSDA's floors per point, not per tap: 256 lanes in one go spilled HVX registers)
+    zero = {r:r.const_like(0) for r in own}
+    def stride(r:UOp) -> int: return x.src[1].substitute({**zero, r:r.const_like(1)}).simplify().arg
+    up, lanes = {}, 1
+    for r in sorted(own, key=stride):
+      if lanes * r.src[0].arg > getenv("STAGE_LANES", 64) and lanes > 1: break
+      up[r], lanes = r.replace(arg=r.arg[:-1]+(AxisType.UPCAST,)), lanes * r.src[0].arg
     ctx[1][x] = (buf.after(buf.index(lane * n + x.src[1]).store(x.src[0]).end(*own).substitute(up)), lane * n)
   st, base = ctx[1][x]
   return idx.replace(src=(st, base + idx.src[1])+idx.src[2:])
@@ -489,11 +496,7 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
     newlst.extend(ret[1])
   return newlst
 
-_SINKABLE = GroupOp.ALU | {Ops.LOAD, Ops.CAST, Ops.BITCAST, Ops.INDEX, Ops.STACK, Ops.SHRINK, Ops.CUSTOMI}
-def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
-  """move the values only an IF block uses into it: from the IF's own scope (after the innermost RANGE / IF still open at it), pure
-  ops and loads -- a load only when no store lies between it and the IF. The IF of a gated store (GATED_REDUCE) then skips its
-  value's whole computation, not just the store"""
+def merge_ifs(lst:list[UOp]) -> list[UOp]:
   # adjacent blocks under the same gate become one (a gated vector store split into per-lane stores: one IF each)
   merged, alias = [], {}
   for u in lst:
@@ -501,11 +504,18 @@ def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
       alias[u] = merged.pop().src[0]
       continue
     merged.append(u)
-  if alias:
-    def opener(i:UOp) -> UOp:
-      while i in alias: i = alias[i]
-      return i
-    lst = [UOp(Ops.ENDIF, src=(opener(u.src[0]),)) if u.op is Ops.ENDIF else u for u in merged]
+  if not alias: return lst
+  def opener(i:UOp) -> UOp:
+    while i in alias: i = alias[i]
+    return i
+  return [UOp(Ops.ENDIF, src=(opener(u.src[0]),)) if u.op is Ops.ENDIF else u for u in merged]
+
+_SINKABLE = GroupOp.ALU | {Ops.LOAD, Ops.CAST, Ops.BITCAST, Ops.INDEX, Ops.STACK, Ops.SHRINK, Ops.CUSTOMI}
+def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
+  """move the values only an IF block uses into it: from the IF's own scope (after the innermost RANGE / IF still open at it), pure
+  ops and loads -- a load only when no store lies between it and the IF. The IF of a gated store (GATED_REDUCE) then skips its
+  value's whole computation, not just the store"""
+  lst = merge_ifs(lst)
   users: dict[UOp, list[UOp]] = {}
   for u in lst:
     for x in u.src: users.setdefault(x, []).append(u)
@@ -529,13 +539,29 @@ def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
       inside = set(out[i + 1:j])
       move: list[int] = []
       store_after = False
-      for k in range(i - 1, s, -1):
+      k = i
+      while (k:=k - 1) > s:
         u = out[k]
-        # a register table (Tensor.stage) only read inside: its stores move in too (and are no barrier to moving loads)
+        # a register table (Tensor.stage) only read inside: its stores move in too (and are no barrier to moving loads), and so does
+        # the loop that builds it (a table's loop axes: STAGE_LANES) when it does nothing else
         if u.op in (Ops.STORE, Ops.AFTER) and _staged_buf(u.src[0]) and users.get(u) and all(x in inside for x in users[u]):
           move.append(k)
           inside.add(u)
           continue
+        if u.op is Ops.END:
+          r0, depth = k - 1, 0
+          while not (out[r0].op is Ops.RANGE and depth == 0):
+            depth += out[r0].op is Ops.END
+            depth -= out[r0].op is Ops.RANGE
+            r0 -= 1
+          blk = out[r0:k + 1]
+          if r0 > s and any(x.op is Ops.STORE for x in blk) and \
+             all(x.op is not Ops.IF and (x.op is not Ops.STORE or _staged_buf(x.src[0])) for x in blk) and \
+             all(y in inside or y in blk for x in blk for y in users.get(x, [])):
+            move += range(r0, k + 1)
+            inside.update(blk)
+            k = r0
+            continue
         if u.op is Ops.STORE: store_after = True
         if u.op not in _SINKABLE or (u.op is Ops.LOAD and store_after) or not users.get(u): continue
         if all(x in inside for x in users[u]):
@@ -564,6 +590,7 @@ def hoist_ifs(lst:list[UOp]) -> list[UOp]:
   """an IF whose gate is known before the loop around it, in a loop that does nothing outside the IF (no store, no inner block),
   goes around the loop: a gated reduce over a register table (Tensor.stage) then skips the whole table walk, and sink_into_ifs can
   move the table's computation in too"""
+  lst = merge_ifs(lst)
   for _ in range(len(lst)):
     pos = {u:k for k,u in enumerate(lst)}
     for i,u in enumerate(lst):

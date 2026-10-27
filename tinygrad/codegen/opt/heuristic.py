@@ -146,6 +146,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  # a register table (Tensor.stage) built inside a reduce: the output axes it doesn't depend on (up to STAGE_UPCAST_MAX lanes) are
+  # upcast, so it is built once for all of them rather than once per iteration -- the generated MSDA's heads (MSDA_STAGE=2: its
+  # cross-attention 4.0 -> 2.4 ms on the V69). STAGE_UPCAST_OUT=0: off
+  stages = [u for u in k.ast.backward_slice if u.op is Ops.STAGE and u.arg.addrspace is AddrSpace.REG]
+  if getenv("STAGE_UPCAST_OUT", 1) and stages:
+    inner = [s for s in stages if any(r.arg[-1] is AxisType.REDUCE for r in s.src[0].ranges)]
+    free = [k.rngs[a] for a in k.upcastable_dims if inner and all(k.rngs[a] not in s.src[0].ranges for s in inner)]
+    if free and prod(r.vmax + 1 for r in free) <= getenv("STAGE_UPCAST_MAX", 256):
+      try:
+        for r in free: k.apply_opt(Opt(OptOps.UPCAST, k.rngs.index(r), 0))
+      except KernelOptError: pass
   # a renderer can cap upcasts at one vector register: v65 HVX (128 bytes, no float vectors) sets upcast_max_bytes, so the
   # lane cap follows the reduction dtype (32 f32 lanes, 128 byte lanes). qfloat DSPs keep several-vector float accumulators
   max_bytes = getattr(k.ren, "upcast_max_bytes", None)
@@ -369,10 +380,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   try:
     # scalar float on v65: accumulators x unrolled taps must stay near the 32-register file, or the loop body is spills
     scalar_cap = getenv("DSP_SCALAR_UNROLL", 16) if dsp_scalar_float else None
-    # a loop over a register table's entries (Tensor.stage) reads them as scalars: unrolled, the reads became one vector load and a
-    # lane extraction per entry (STAGE_UNROLL entries per step)
+    # a loop over a register table's entries (Tensor.stage) reads them as scalars: unrolled whole, the reads became one vector load
+    # and a lane extraction per entry. STAGE_UNROLL entries a step (pairs of 64-bit loads; 1 -> 4: generated MSDA enc1 16.1 -> 14.9 ms)
     if k.unrollable_dims and _reads_stage(k, k.unrollable_dims[-1]):
-      if (su:=getenv("STAGE_UNROLL", 1)) > 1 and k.full_shape[k.unrollable_dims[-1]] % su == 0:
+      if (su:=getenv("STAGE_UNROLL", 4)) > 1 and k.full_shape[k.unrollable_dims[-1]] % su == 0:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, su))
     elif k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64) and \
         (scalar_cap is None or k.upcast_size() * k.full_shape[k.unrollable_dims[-1]] <= scalar_cap):
