@@ -269,7 +269,17 @@ def main() -> None:
   def fn():
     r = run(feeds)
     outs = [r[vo.name] for vo in model.graph.output] if isinstance(r, dict) else [r]
-    holder["y"] = (outs[0] if len(outs) == 1 else Tensor.cat(*[o.cast(dtypes.float32).flatten() for o in outs])).contiguous().realize()
+    if len(outs) == 1:
+      holder["y"] = outs[0].contiguous().realize()
+      return
+    # several outputs back to back: each stored into its own slice of one buffer (a plain copy, or an extra store of its
+    # producer under MULTIOUT) -- a Tensor.cat selected per element among all of them: BEVFormer's encoder + decoder in one
+    # program (bev_embed 2500 x 256 + cls / bbox 900 x 10) spent 16.4 ms in that one kernel on the V69
+    y, at = Tensor.empty(sum(o.numel() for o in outs), dtype=dtypes.float32, device=outs[0].device), 0
+    for o in outs:
+      y[at:at + o.numel()].assign(o.cast(dtypes.float32).flatten())
+      at += o.numel()
+    holder["y"] = y.realize()
   calls, bufs = dsp_graph.capture(fn)
   if os.environ.get("DSP_GRAPH_SINK", "1") != "0": calls = sink_calls(calls, bufs)
   if os.environ.get("DSP_GRAPH_HMX_HOIST", "1") != "0": calls = hoist_out_of_hmx_chains(calls, bufs)
