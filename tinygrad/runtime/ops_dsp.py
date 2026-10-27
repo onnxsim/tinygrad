@@ -10,7 +10,7 @@ from tinygrad.codegen.opt import tc
 from tinygrad.runtime.autogen import libc, qcom_dsp
 if getenv("IOCTL"): import extra.dsp.run # noqa: F401 # pylint: disable=unused-import
 
-from tinygrad.uop.ops import PatternMatcher, UPat
+from tinygrad.uop.ops import PatternMatcher, UPat, graph_rewrite
 
 HVX_PREFETCH = getenv("HVX_PREFETCH", 2048)
 HVX_PREFETCH_HALF = getenv("HVX_PREFETCH_HALF", 128)
@@ -34,6 +34,18 @@ DSP_V65_HW = ContextVar("DSP_V65_HW", 0)
 def _v65_hw() -> bool: return not HVX_QFLOAT and bool(DSP_V65_HW.value)
 
 # ***** qfloat lowering (v68+) *****
+# V69 HVX float is qf32. The rules the renderer relies on, from hexagon-clang 19's output and checked on the phone (hexagon-sim
+# models some of qf32, not all of it):
+# - IEEE sf wherever a use needs it, converted by LLVM: a compare (vcmp.gt on sf), max / min, a bitcast (integer tricks on the
+#   bits) and a store all take `Vd.sf = Vu.qf32` of a computed value first -- vector compares / selects / bit tricks are sound.
+# - add / sub stay qf32 and are accurate, except that a subtract of nearly equal sf operands is not exact where the IEEE one is
+#   (Sterbenz): the error is up to an ulp of the larger operand. So no magic-number int <-> float tricks on vectors (bits(1.5 *
+#   2^23 + e) - 1.5 * 2^23 gave e = -4 -> -3), and a difference of near-equal values (log2's m - 1) comes from the integer bits.
+# - a multiply of two computed values, or of a widened half, is renormalized through IEEE sf first (__hvx_mulsf, below).
+# - a rounding trick, (x + 1.5 * 2^23) - 1.5 * 2^23, needs an asm barrier forcing the sum to sf.
+# - vector int <-> float conversion, __builtin_convertvector, is exact vector code (integer ops around vcl0, 40 / 26
+#   instructions); trunc / floor are 32 libcalls, hence __hvx_trunc. A computed float converted to int sees its sf rounding.
+# - scalar float code is IEEE; a scalar half -> float cast is a libcall (__extendhfsf2), hence __tg_h2f.
 # LLVM's qfloat lowering is fast and accurate for adds/subs and for multiplies with an IEEE sf operand (a load or a
 # constant): measured bit-identical to converting after every op. The case it gets badly wrong is a multiply of two
 # *computed* values: it keeps both in qf32 and emits qf32 x qf32 without renormalizing (21% worst-case relative error
@@ -113,10 +125,38 @@ def _gathered(bidx:UOp) -> bool:
   # tap rows, 128 bytes each, scattered over the value maps: twice the DDR traffic)
   return any(u.op is Ops.LOAD for s in bidx.src[1:] for u in s.backward_slice)
 
+# log2 as a helper (tinygrad's xlog2 rebuilds 2^-e by float -> int -> float and guards every special case with a compare, so
+# every Log ran scalar, ~10 compare barriers per value): x = 2^e m with m in [0.75, 1.5) by integer ops on the bits, log2(m) by
+# xlog2's own atanh series in s = (m-1)/(m+1) (|s| <= 0.2, 1 ulp). e to float by the int -> float vector conversion (hexagon-clang
+# lowers it to integer ops, vcl0 + shifts: exact), not by the magic-number trick bits(2^23 + 2^22 + e) - (2^23 + 2^22): a qf32
+# subtract of two sf operands is not exact even where the IEEE one is (Sterbenz) -- its error is up to an ulp of the larger
+# operand, so e = -4 came out -3 (hexagon-sim models it too). For the same reason m - 1 comes from the bits (the mantissa
+# difference times 2^-23 or 2^-24): as a qf32 subtract it was 1.7e-4 off relative at x = 1.0004 (now 6e-7 worst). Positive
+# subnormals are scaled by 2^64 first. Special cases by the bits, as xlog2: +-0 -> -inf, negative and -nan -> nan, +inf / +nan ->
+# themselves. The vector form selects with int masks; its computed x computed products go through IEEE sf (__hvx_mulsf)
+HVX_QF_LOG2 = getenv("HVX_QF_LOG2", 1)
+_QF_LOG2_V = ("static inline __hvx_f __tg_log2_v(__hvx_f x) {"
+  " __hvx_i b = __builtin_bit_cast(__hvx_i, x), d = (b > 0) & (b < 0x00800000);"
+  " __hvx_i bs = (d & __builtin_bit_cast(__hvx_i, x * 1.8446744073709552e19f)) | (~d & b), e = (bs - 0x3f400000) >> 23;"
+  " __hvx_i d1 = bs - (e << 23) - 0x3f800000; __hvx_f ef = __builtin_convertvector(e + (d & -64), __hvx_f);"
+  " __hvx_f m1 = __builtin_convertvector(d1, __hvx_f) * __builtin_bit_cast(__hvx_f, 0x34000000 - ((d1 >> 31) & 0x800000));"
+  " __hvx_f s = __hvx_mulsf(m1, __tg_recip_v(m1 + 2.0f)), s2 = __hvx_mulsf(s, s);"
+  " __hvx_f t = __hvx_mulsf(0.4374550283f * s2 + 0.5764790177f, s2) + 0.9618012905120f;"
+  " __hvx_f r = __hvx_mulsf(t, __hvx_mulsf(s, s2)) + ef + s * 2.8853900432586669922f + s * 3.2734474483568488616e-08f;"
+  " __hvx_i ri = __builtin_bit_cast(__hvx_i, r), z = (b & 0x7fffffff) == 0, neg = (b < 0) & ~z, big = b >= 0x7f800000;"
+  " ri = (z & (__hvx_i)0xff800000) | (neg & (__hvx_i)0x7fc00000) | (big & b) | (~(z | neg | big) & ri);"
+  " return __builtin_bit_cast(__hvx_f, ri); }")
+_QF_LOG2_S = ("static inline float __tg_log2_s(float x) {"
+  " int b; __builtin_memcpy(&b, &x, 4); if ((b & 0x7fffffff) == 0) return -__builtin_inff(); if (b < 0) return __builtin_nanf(\"\");"
+  " if (b >= 0x7f800000) return x; int d = b < 0x00800000; if (d) { x *= 1.8446744073709552e19f; __builtin_memcpy(&b, &x, 4); }"
+  " int e = (b - 0x3f400000) >> 23, mb = b - (e << 23); float m; __builtin_memcpy(&m, &mb, 4);"
+  " float s = (m - 1.0f) * __tg_recip_s(m + 1.0f), s2 = s * s, t = (0.4374550283f * s2 + 0.5764790177f) * s2 + 0.9618012905120f;"
+  " return t * (s * s2) + (float)(e - 64 * d) + s * 2.8853900432586669922f + s * 3.2734474483568488616e-08f; }")
+
 def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
   if not QF_MATH: return []
   uses = {(Ops.RECIPROCAL if u.op is Ops.FDIV else u.op, u.max_numel()) for u in uops
-          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT) and u.dtype == dtypes.float32 or _hf_div(u)}
+          if u.op in (Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT, Ops.LOG2) and u.dtype == dtypes.float32 or _hf_div(u)}
   if not uses: return []
   poly = "".join(f" p = __hvx_mulsf(p, f) + {c}f;" for c in _QF_EXP2_C[1:])
   out = ["typedef float __hvx_f __attribute__((ext_vector_type(32)));",
@@ -145,8 +185,9 @@ def _qf_math_helpers(uops:list[UOp], vtype) -> list[str]:
          " for (int k = 0; k < 3; k++) y = __hvx_mulsf(y, 1.5f - __hvx_mulsf(h, __hvx_mulsf(y, y))); return __hvx_mulsf(x, y); }",
          "static inline float __tg_sqrt_s(float x) {"
          " int b; __builtin_memcpy(&b, &x, 4); b = 0x5F3759DF - (b >> 1); float y; __builtin_memcpy(&y, &b, 4);"
-         " for (int k = 0; k < 3; k++) y = y * (1.5f - 0.5f * x * y * y); return x * y; }"]
-  for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL), ("sqrt", Ops.SQRT)):
+         " for (int k = 0; k < 3; k++) y = y * (1.5f - 0.5f * x * y * y); return x * y; }",
+         _QF_LOG2_V, _QF_LOG2_S]
+  for name, op in (("exp2", Ops.EXP2), ("recip", Ops.RECIPROCAL), ("sqrt", Ops.SQRT), ("log2", Ops.LOG2)):
     widths = sorted({n for o, n in uses if o is op})
     if not widths: continue
     assoc = []
@@ -326,6 +367,53 @@ def _transpose_groups(ren, uops:list[UOp]) -> list[UOp]:
   return [x for p, u in enumerate(uops) for x in ((inserts[p], u) if p in inserts else (u,))]
 
 def _render_transpose_col(ctx, x:UOp) -> str|None: return getattr(ctx, "_tr_cols", {}).get(x)
+
+# HVX_GATHER_MATH's strided gathers (a STACK of scalar float loads at constant offsets from one address, stride 2 / 3 / 10 in the
+# reference-point update): whole-vector loads over the span and a shuffle tree that drops each lane into place, instead of one
+# scalar load + vinsert + valign per lane (and the scalar registers they hold, spilled). The span's vector loads stay inside it
+# (the last one ends at the last element), so nothing past the buffer is read
+def _strided_gather(ctx, x:UOp) -> str|None:
+  n = len(x.src)
+  if not getattr(ctx, "_gm_kernel", False) or n < 16 or not _hvx_chunkable(n) or x.dtype != dtypes.float32: return None
+  s0 = x.src[0]
+  if any(s.op is not Ops.LOAD or s._shape != () or s.src[0].op is not Ops.INDEX or len(s.src[0].src) != 2 or len(s.src) != len(s0.src) or
+         s.src[0].src[0] is not s0.src[0].src[0] or s.src[1:] != s0.src[1:] for s in x.src): return None
+  offs = []
+  for s in x.src:
+    d = (s.src[0].src[1] - s0.src[0].src[1]).simplify()
+    if d.op is Ops.CAST: d = d.src[0]
+    if d.op is not Ops.CONST or not isinstance(d.arg, int): return None
+    offs.append(d.arg)
+  lo = min(offs)
+  rel, span = tuple(o - lo for o in offs), max(offs) - lo + 1
+  if span < 32 or span > 16 * 32: return None
+  name = f"__tg_gather{n}_{len(ctx._gathers)}" if (n, rel) not in ctx._gathers else ctx._gathers[(n, rel)][0]
+  ctx._gathers.setdefault((n, rel), (name, ctx.render_type(x), span))
+  call = f"{name}({ctx[x.src[offs.index(lo)].src[0]]})"
+  return call if len(s0.src) == 1 else f"(({ctx[s0.src[2]]})?{call}:(({ctx.render_type(x)})({ctx[s0.src[1]]})))"
+
+def _gather_helper(n:int, rel:tuple, name:str, t:str, span:int) -> str:
+  nv = -(-span // 32)
+  vo = [min(32 * j, span - 32) for j in range(nv)]
+  out = [f"static inline {t} {name}(const float* p) {{"] + [f" __tg_gv v{j} = *(const __tg_gvu*)(p+{o});" for j, o in enumerate(vo)]
+  chunks = []
+  for c in range(-(-n // 32)):
+    parts = []
+    for j in range(nv):
+      lanes = {i - 32 * c: rel[i] - vo[j] for i in range(32 * c, min(n, 32 * c + 32)) if min(rel[i] // 32, nv - 1) == j}
+      if lanes: parts.append((f"__builtin_shufflevector(v{j}, v{j}, {','.join(str(lanes.get(i, -1)) for i in range(32))})", set(lanes)))
+    while len(parts) > 1:
+      nxt = [(f"__builtin_shufflevector({a}, {b}, {','.join(str(i if i in la else 32 + i if i in lb else -1) for i in range(32))})", la | lb)
+             for (a, la), (b, lb) in zip(parts[0::2], parts[1::2])]
+      parts = nxt + ([parts[-1]] if len(parts) % 2 else [])
+    chunks.append(parts[0][0])
+  w = 32
+  while len(chunks) > 1:  # concatenated pairwise (an odd one out paired with itself: its copy is past n, dropped below)
+    if len(chunks) % 2: chunks.append(chunks[-1])
+    chunks, w = [f"__builtin_shufflevector({a}, {b}, {','.join(map(str, range(2 * w)))})" for a, b in zip(chunks[0::2], chunks[1::2])], 2 * w
+  tail = f"__builtin_shufflevector(r, r, {','.join(map(str, range(n)))}); }}" if n % 32 else "r; }"
+  out.append(f" __auto_type r = {chunks[0]}; return ({t}){tail}")
+  return "\n".join(out)
 
 def _render_lane_gather(ctx, x:UOp) -> str|None:
   if not HVX_LANE_GATHER or (g:=_lane_gather(x.src)) is None: return None
@@ -673,13 +761,24 @@ def _interleave4_stack(ctx, x:UOp) -> str|None:
 # lane (BEVFormer's sampler: ~40 per sample). Rendering (dsp_string, _cmp_helpers): a compare is an int mask (-1 / 0, what a
 # C vector compare yields), narrowed to tinygrad's 0/1 byte-per-lane bool vector only where one is materialized; WHERE is a
 # bit select on that mask, a bool -> float cast an AND with 1.0f's bits, and TRUNC / float -> int32 are exact integer-only
-# helpers (v68/v69 have no vector float <-> int convert, so LLVM scalarizes __builtin_convertvector / truncf per lane).
+# helpers (v68/v69 have no vector float <-> int convert instruction; LLVM's own convertvector is integer vector code too, but truncf
+# is a libcall per lane). An HVX_GATHER_MATH kernel's compares re-vectorize without this flag (_CMP_SCOPE).
 # Small bool vectors stay scalar: LLVM's Hexagon backend can't select some of those ("v2i32 = bitcast (V2Q ...)").
 HVX_REVEC_CMP = getenv("HVX_REVEC_CMP", 0)
+def _gather_math() -> bool:
+  from tinygrad.codegen.opt import heuristic  # HVX_GATHER_MATH (heuristic.py): one flag for the upcast and its rendering
+  return bool(heuristic.HVX_GATHER_MATH)
+# compares re-vectorize everywhere with HVX_REVEC_CMP, else only inside an HVX_GATHER_MATH kernel's stores (hvx_group_stores sets
+# this while it rebuilds them, the renderer while it renders a kernel holding vector compares), and so do gathered loads (lane
+# constructors of scalar loads): other kernels keep their code
+_CMP_SCOPE = [False]
 HVX_SPLAT_WHERE = getenv("HVX_SPLAT_WHERE", 1)
 _CMP = {Ops.CMPLT: "<", Ops.CMPNE: "!=", Ops.CMPEQ: "=="}
-def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP)
-def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and n % 32 == 0
+def _revec_cmp() -> bool: return bool(HVX_REVEC_CMP) or _CMP_SCOPE[0]
+# (HVX_GATHER_MATH's upcasts are any 16 to 128 lanes, a divisor of the row count times the columns: as int masks those widen to
+# whole registers fine)
+def _cmp_lanes(n:int) -> bool: return n % 32 == 0 or (_CMP_SCOPE[0] and _hvx_chunkable(n))
+def _bool_lanes_ok(n:int) -> bool: return _revec_cmp() and _cmp_lanes(n)
 def _is32(dt) -> bool: return dt in (dtypes.float32, dtypes.int32, dtypes.uint32)
 def _cmp_vec_op(u:UOp, n:int) -> bool:
   if not _bool_lanes_ok(n): return False
@@ -691,7 +790,7 @@ def _cmp_vec_op(u:UOp, n:int) -> bool:
 
 def _vec_n(u:UOp) -> int|None:
   n = u.max_numel() if u._shape is not None else 1
-  return n if n > 1 and n % 32 == 0 and _revec_cmp() else None
+  return n if n > 1 and _cmp_lanes(n) and _revec_cmp() else None
 
 def _mask(ctx, u:UOp, n:int) -> str:
   # u (a bool vector of n lanes) as an int mask expression: -1 where true, 0 where false
@@ -740,6 +839,17 @@ def _cmp_helpers(uops:list[UOp]) -> list[str]:
             f" {m} s = ({m})u >> 31; return (r ^ s) - s; }}"]
   return out
 
+# a scalar half -> float cast (v68+): clang calls __extendhfsf2 for every one (no scalar hf instructions), ~100 cycles a value -- the
+# decoder's reg-branch bias add, fp16 GEMM rows of 10 -> fp32, ran 70-85 us a call. Inline instead: the exponent rebiased (+112) and
+# the mantissa shifted for normals, inf / nan kept, subnormals m * 2^-24 (an exact scalar convert); bit-exact for every half
+HVX_SCALAR_H2F = getenv("HVX_SCALAR_H2F", 1)
+_H2F = ("static inline float __tg_h2f(unsigned short u) { unsigned e = (u >> 10) & 31u, m = u & 1023u, s = (u & 0x8000u) << 16;"
+        " unsigned b = e == 31u ? (s | 0x7f800000u | (m << 13)) : (s | ((e + 112u) << 23) | (m << 13));"
+        " float f; __builtin_memcpy(&f, &b, 4); float d = (float)m * 5.9604644775390625e-8f; return e ? f : (s ? -d : d); }")
+def _scalar_h2f(x:UOp) -> bool:
+  return bool(HVX_QFLOAT and HVX_SCALAR_H2F) and x.op is Ops.CAST and x.dtype == dtypes.float32 and x.src[0].dtype == dtypes.half and \
+    x.max_numel() == 1
+
 dsp_string = PatternMatcher([
   (UPat(Ops.RECIPROCAL, src=(UPat(Ops.STACK, name="st"),), name="x"), _recip_of_splat),
   (UPat(Ops.FDIV, src=(UPat.var("a"), UPat(Ops.STACK, name="st")), name="x"), lambda ctx,x,a,st:
@@ -747,6 +857,11 @@ dsp_string = PatternMatcher([
   # a loop with an L2 stream prefetch (_l2_plan): strip-mined, the box issued per chunk (_l2_for); its END closes both loops
   (UPat(Ops.RANGE, name="x"), _l2_for),
   (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE, name="r"))), lambda ctx,r: "}}" if r in getattr(ctx, "_l2", {}) and r.dtype != dtypes.void else None),
+  (UPat(Ops.CAST, dtype=dtypes.float32, name="x"), lambda ctx,x: f"__tg_h2f(__builtin_bit_cast(unsigned short, {ctx[x.src[0]]}))"
+   if _scalar_h2f(x) else None),
+  # a lane of hvx_group_stores' named vector
+  (UPat(Ops.INDEX, src=(UPat(Ops.CUSTOM, arg="{0}", name="v"), UPat(name="c"))),
+   lambda ctx,v,c: f"{ctx[v]}[{l}]" if (l:=_lane(c)) is not None else None),
   # HVX_REVEC_CMP (see _cmp_vec_op): vector compares as int masks narrowed to 0/1 bytes, WHERE as a mask bit select, bool ->
   # float as the mask AND 1.0f's bits, TRUNC / float -> int32 through the exact integer helpers
   (UPat(tuple(_CMP), dtype=dtypes.bool, name="x"), lambda ctx,x: f"__builtin_convertvector({_mask(ctx, x, n)} & 1, {ctx.render_type(x)})"
@@ -779,6 +894,7 @@ dsp_string = PatternMatcher([
   (UPat(Ops.STACK, name="x"), lambda ctx,x: f"(({ctx.render_type(x)})__builtin_shufflevector({ctx[v]}, {ctx[v]}, {','.join(str(l) for l in lanes)}))"
    if (sl:=_lane_slice(x)) is not None and (v:=sl[0]) is not None and (lanes:=sl[1]) else None),
   (UPat(Ops.STACK, name="x"), _render_transpose_col),
+  (UPat(Ops.STACK, name="x"), _strided_gather),
   (UPat(Ops.STACK, name="x"), _render_lane_gather),
   # a splat of one lane of a loaded vector (memory_coalescing merged per-row loads, e.g. an HMX epilogue's bias, into one
   # vector load): reload that element as a scalar (then one vsplat) -- the lane splat clang v19 builds with vinserts
@@ -993,7 +1109,7 @@ HVX_LANE_GATHER = getenv("HVX_LANE_GATHER", 1)
 HVX_VEC_OPS = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.AND, Ops.OR, Ops.XOR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.MAX, Ops.CAST}
 # with qfloat (v68+) EXP2 / RECIPROCAL / float FDIV are rendered as vector helpers (_qf_math_helpers) instead of being
 # decomposed, so they re-vectorize too (added while QF_MATH is on, see _vec_ops)
-_QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT}
+_QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT, Ops.LOG2}
 
 def _vec_ops() -> set: return HVX_VEC_OPS | _QF_VEC_OPS if QF_MATH else HVX_VEC_OPS
 
@@ -1007,8 +1123,12 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
   # compare/cast/mul -- stays a scalar constructor: LLVM's Hexagon backend crashes selecting some of those once they're
   # wrapped in a vector op ("Cannot select v2i32 = bitcast (V2Q ...)"), and there's nothing to gain vectorizing them.
   c0 = col[0]
-  if c0._shape != () or depth > 32 or (c0.dtype == dtypes.bool and not _bool_lanes_ok(len(col))): return False
+  if c0._shape != () or depth > (96 if _CMP_SCOPE[0] else 32) or (c0.dtype == dtypes.bool and not _bool_lanes_ok(len(col))): return False
   if all(c is c0 for c in col) or all(c.op is Ops.CONST for c in col): return True
+  # HVX_GATHER_MATH: scalar loads (a strided gather) and lanes of loaded vectors as one lane constructor, so the math over them is
+  # vector code
+  if _CMP_SCOPE[0] and all(c.op is Ops.LOAD or (c.op is Ops.INDEX and len(c.src) == 2 and c.src[0].op is Ops.LOAD and
+                                                  c.src[0]._shape is not None and _lane(c.src[1]) is not None) for c in col): return True
   if c0.op is Ops.INDEX and len(c0.src) == 2 and c0.src[0]._shape is not None and len(c0.src[0]._shape) == 1:
     # consecutive lanes of one vector, or of several vectors one after another (a row loaded as two 64-byte halves):
     # the vector operand is then that lane constructor, which clang lowers to shuffles
@@ -1017,6 +1137,7 @@ def _vec_column_ok(col:tuple[UOp, ...], depth:int=0) -> bool:
     if None in lanes: return False
     # any constant lanes of up to 8 equal-width vectors (_lane_gather: rendered as shuffles)
     if HVX_LANE_GATHER and _lane_gather(col) is not None: return True
+    if _CMP_SCOPE[0]: return True  # (HVX_GATHER_MATH) any constant lanes: a lane constructor
     return all(b is not a or lb == la + 1 for (a, la), (b, lb) in zip(((c.src[0], l) for c, l in zip(col, lanes)),
                                                                        ((c.src[0], l) for c, l in zip(col[1:], lanes[1:]))))
   if (c0.op in _vec_ops() or _cmp_vec_op(c0, len(col))) and \
@@ -1056,7 +1177,50 @@ def hvx_revectorize(x:UOp) -> UOp|None:
   if not _vec_column_ok(srcs): return None
   return UOp(s0.op, s0.dtype, tuple(UOp.stack(*[s.src[j] for s in srcs]) for j in range(len(s0.src))), s0.arg)
 
-pm_hvx_revectorize = PatternMatcher([(UPat(Ops.STACK, name="x"), hvx_revectorize)])
+# HVX_GATHER_MATH (heuristic.py upcasts such kernels' rows through gathers): a kernel whose lanes are stored strided (the reference-
+# point update's 3 of 10 columns) has no vector store, so nothing above starts the re-vectorization -- devectorization leaves a
+# GROUP of per-lane scalar STOREs. Their values become the lanes of one STACK, rebuilt into vector ops here with compares and
+# selects included (clip, the splat selects of the masked loads; _CMP_SCOPE), each store a lane of it. The loads are lane
+# constructors of scalar loads (_vec_column_ok)
+def _lane_of_named(x:UOp) -> bool:
+  # a lane of hvx_group_stores' named vector: INDEX(CUSTOM "{0}" of a vector value, lane)
+  return x.op is Ops.INDEX and len(x.src) == 2 and (v:=x.src[0]).op is Ops.CUSTOM and v.arg == "{0}" and len(v.src) == 1
+def _gather_stores(stores) -> dict[UOp, UOp]|None:
+  # the stores' lanes (a scalar store's value, a vector store's STACK lanes) as one vector computation -> {store: new store}
+  owners, lanes = [], []  # (a GROUP lists a vector store once per lane)
+  for s in dict.fromkeys(stores):
+    if s.op is not Ops.STORE or len(s.src) != 2 or not _is32((v:=s.src[1]).dtype): continue
+    if v._shape == () and not _lane_of_named(v): owners.append((s, len(lanes), 0))
+    elif v.op is Ops.STACK and v._shape is not None and len(v._shape) == 1 and all(x._shape == () and not _lane_of_named(x) for x in v.src):
+      owners.append((s, len(lanes), len(v.src)))
+    else: continue
+    lanes += [v] if v._shape == () else list(v.src)
+  if not 16 <= len(lanes) <= 128 or not _hvx_chunkable(len(lanes)) or len({l.dtype for l in lanes}) != 1: return None
+  # (only the kernels heuristic.py upcast for it: transcendental-heavy lanes, not e.g. a transposing copy's stores)
+  from tinygrad.codegen.opt import heuristic
+  if sum(u.op in (Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT) for u in lanes[0].toposort()) < heuristic.HVX_GATHER_MATH: return None
+  _CMP_SCOPE[0] = True
+  try:
+    if not _vec_column_ok(vals:=tuple(lanes)): return None
+    stack = graph_rewrite(UOp.stack(*vals), pm_hvx_revectorize, name="hvx gather math")
+  finally: _CMP_SCOPE[0] = False
+  # (a CUSTOM names the vector once -- an inlined form, like the splat select's CUSTOMI, would be repeated in every store; its
+  # lane INDEX renders as v[i], see dsp_string; a vector store's lanes, consecutive, as one shuffle: _lane_slice)
+  vec = UOp(Ops.CUSTOM, vals[0].dtype, (stack,), "{0}")
+  def lane(i:int) -> UOp: return UOp(Ops.INDEX, vals[0].dtype, (vec, UOp.const(i, dtypes.int)))
+  return {s: s.replace(src=(s.src[0], lane(i) if k == 0 else UOp.stack(*[lane(j) for j in range(i, i + k)]))) for s, i, k in owners}
+
+def hvx_group_stores(g:UOp) -> UOp|None:
+  if not _gather_math() or (new:=_gather_stores(g.src)) is None: return None
+  return g.replace(src=tuple(new.get(s, s) for s in g.src))
+
+def hvx_end_store(e:UOp) -> UOp|None:
+  # a kernel with one (vector) store has no GROUP: its END holds the store
+  if not _gather_math() or (new:=_gather_stores(e.src[:1])) is None: return None
+  return e.replace(src=(new[e.src[0]], *e.src[1:]))
+
+pm_hvx_revectorize = PatternMatcher([(UPat(Ops.STACK, name="x"), hvx_revectorize), (UPat(Ops.GROUP, name="g"), hvx_group_stores),
+                                     (UPat(Ops.END, src=(UPat(Ops.STORE),), allow_any_len=True, name="e"), hvx_end_store)])
 
 # HMX=1 adds the V69 HMX (fp16) tensor core in front of the HVX vrmpy ones
 def _dsp_tcs(): return (tc.hexagon_hmx + tc.hexagon_hmx_i8 if getenv("HMX") else []) + tc.hexagon_v65
@@ -3071,10 +3235,10 @@ class DSPRenderer(ClangRenderer):
   # divide (LLVM scalarizes a vector one), and a lane stack whose top op is a division would keep the whole expression, EXP2s
   # included, scalar
   qf_code_for_op = {Ops.EXP2: lambda x,dtype: f"__TG_EXP2({x})", Ops.RECIPROCAL: lambda x,dtype: f"__TG_RECIP({x})",
-                    Ops.SQRT: lambda x,dtype: f"__TG_SQRT({x})",
+                    Ops.SQRT: lambda x,dtype: f"__TG_SQRT({x})", Ops.LOG2: lambda x,dtype: f"__TG_LOG2({x})",
                     Ops.FDIV: lambda a,b,dtype: f"({a}*__TG_RECIP({b}))" if dtype == dtypes.float32 else f"({a}/{b})"}
   extra_matcher = (ClangRenderer.extra_matcher + pm_hvx_revectorize) if getenv("HVX_REVEC", 1) else ClangRenderer.extra_matcher
-  qf_matcher = PatternMatcher([(UPat((Ops.EXP2, Ops.RECIPROCAL, Ops.SQRT), name="x"), _qf_math_half)])
+  qf_matcher = PatternMatcher([(UPat((Ops.EXP2, Ops.RECIPROCAL, Ops.SQRT, Ops.LOG2), name="x"), _qf_math_half)])
 
   def __init__(self, target:Target):
     self.target, self.compiler, self.tensor_cores = target, DSPCompiler(), _dsp_tcs()
@@ -3082,7 +3246,9 @@ class DSPRenderer(ClangRenderer):
 
   def _qf_math_on(self):
     # the qfloat exp2 / reciprocal helpers: EXP2 / RECIPROCAL stay ops (not decomposed) and render as the helpers
-    if QF_MATH: self.code_for_op, self.extra_matcher = {**type(self).code_for_op, **self.qf_code_for_op}, self.qf_matcher + type(self).extra_matcher
+    if QF_MATH:
+      qf = {k:v for k,v in self.qf_code_for_op.items() if k is not Ops.LOG2 or HVX_QF_LOG2}
+      self.code_for_op, self.extra_matcher = {**type(self).code_for_op, **qf}, self.qf_matcher + type(self).extra_matcher
 
   # HMX_ACC=0 keeps the plain per-K-block tile op (C round trip, 2 KB values) for comparison
   hmx_acc = bool(getenv("HMX_ACC", 1))
@@ -3091,6 +3257,10 @@ class DSPRenderer(ClangRenderer):
     if self.hmx_acc: uops, self._hmx_acc = _hmx_acc_rewrite(uops)
     uops = _transpose_groups(self, _hoist_splat_recip(uops))
     self._l2 = _l2_plan(uops)
+    # (vector compares exist only where re-vectorization made them: render them as such, see _CMP_SCOPE)
+    _CMP_SCOPE[0] = any(u.op in _CMP and u.dtype == dtypes.bool and u._shape is not None and u.max_numel() > 1 for u in uops)
+    # (an HVX_GATHER_MATH kernel: its stores' lanes were rebuilt into one named vector, _gather_stores)
+    self._gathers, self._gm_kernel = {}, any(u.op is Ops.CUSTOM and u.arg == "{0}" and len(u.src) == 1 for u in uops)
     # _lane_window: uop positions and (position, buffer) of every store
     self._pos = {u:i for i,u in enumerate(uops)}
     self._stores = [(i, _hmx_param(u.src[0])) for i,u in enumerate(uops) if u.op is Ops.STORE]
@@ -3098,8 +3268,8 @@ class DSPRenderer(ClangRenderer):
     for u in uops:
       for s in u.src: self._users.setdefault(s, []).append(u)
     self._scopes = [i for i,u in enumerate(uops) if u.op in (Ops.RANGE, Ops.END, Ops.IF, Ops.ENDIF)]
-    src = self.render_kernel(*self._render(uops), uops)
-    return src
+    try: return self.render_kernel(*self._render(uops), uops)
+    finally: _CMP_SCOPE[0] = False
 
   # V6_vrmpyub/V6_vrmpybusv (HVX): D(int32x32) = C(int32x32) + dot4(A(u8x4 broadcast scalar), B(u8x128, 32
   # groups of 4)) in one instruction -- no warp/lane cooperation needed (tensor_cores' threads=1), unlike
@@ -3145,7 +3315,12 @@ class DSPRenderer(ClangRenderer):
     elif qm: prefix += [h for h in qm if not h.startswith(("typedef float __hvx_f", "static inline __hvx_f __hvx_mulsf"))]
     prefix += _hf_exp2_helpers(uops, lambda dt, n: self._render_dtype(dt, n, AddrSpace.REG))
     prefix += _cmp_helpers(uops)
+    if any(_scalar_h2f(u) for u in uops): prefix.append(_H2F)
     prefix += [_transpose_helper(t, n) for t, n in sorted(getattr(self, '_tr_types', ()))]
+    if getattr(self, "_gathers", None):
+      prefix += ["typedef float __tg_gv __attribute__((ext_vector_type(32)));",
+                 "typedef float __tg_gvu __attribute__((ext_vector_type(32), aligned(4)));"]
+      prefix += [_gather_helper(n, rel, *v) for (n, rel), v in self._gathers.items()]
     if getattr(self, '_hmx_acc', False): prefix.append(_HMX_ACC_HELPERS)
     if getattr(self, '_l2', None): prefix.append(_L2BOX)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_qadd_chunk(") for u in uops): prefix.append(_HMX_QADD_HELPERS)
