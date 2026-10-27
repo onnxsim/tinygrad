@@ -1812,6 +1812,30 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       # makes the accumulate conditional and moves the term's whole computation (location, taps, weights) into it
       # (codegen GATED_REDUCE). BEVFormer's cameras see 19% of the (camera, query) pairs
       offv = off.permute(2, 0, 1, 3, 4) if NO > 1 else off[:, :, 0].reshape(1, Q, M, P, 2)                      # (NV|1, Q, M, P, 2)
+      if getenv("MSDA_DIRECT", 1):
+        # the taps straight from value's channel-last rows (no copy into GridSample's layout), at pixel x = ref.x W + off.x - 0.5
+        # (no division per point: off / (W, H) was a reciprocal each), the result already (Q, M, D)
+        rp = refp.reshape(NVR, Q, 1, P, 2)
+        x = rp[..., 0] * W + offv[..., 0] - 0.5                                                                   # (NV, Q, M, P)
+        y = rp[..., 1] * H + offv[..., 1] - 0.5
+        x, y = x.expand(NV, Q, M, P), y.expand(NV, Q, M, P)
+        flat = value.reshape(-1).contiguous()
+        x0, y0 = x.floor(), y.floor()
+        fx, fy = x - x0, y - y0
+        base = (Tensor.arange(NV, dtype=dtypes.int32) * (H * W)).reshape(NV, 1, 1, 1)
+        hcol = (Tensor.arange(M, dtype=dtypes.int32) * D).reshape(1, 1, M, 1, 1)
+        s = None
+        for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+          xt, yt = x0 + dx, y0 + dy
+          ok = (xt >= 0) & (xt < W) & (yt >= 0) & (yt < H)
+          w = ok.where((fx if dx else 1 - fx) * (fy if dy else 1 - fy), 0.0)
+          row = ok.where(base + yt.cast(dtypes.int32) * W + xt.cast(dtypes.int32), 0)
+          el = row.unsqueeze(-1) * C + hcol + Tensor.arange(D, dtype=dtypes.int32).reshape(1, 1, 1, 1, D)       # (NV, Q, M, P, D)
+          tap = Tensor(flat.uop.index(el.reshape(-1).uop)).reshape(NV, Q, M, P, D) * w.unsqueeze(-1).cast(value.dtype)
+          s = tap if s is None else s + tap
+        a = (attw.permute(2, 0, 1, 3) if NO > 1 else attw[:, :, 0].reshape(1, Q, M, P)).unsqueeze(-1)
+        tot = (vis != 0).reshape(NV, Q, 1, 1, 1).where(cast(Tensor, s) * a, 0.0).sum((0, 3))                    # (Q, M, D)
+        return tot.reshape(Q, C) / vis.cast(value.dtype).sum(0).maximum(1.0).reshape(Q, 1)
       loc = refp.reshape(NVR, Q, 1, P, 2) + offv / wh                                                            # (NV, Q, M, P, 2)
       loc = loc.expand(NV, Q, M, P, 2)
       X = value.reshape(NV, H * W, M, D).permute(0, 2, 3, 1).reshape(NV * M, D, H, W)
