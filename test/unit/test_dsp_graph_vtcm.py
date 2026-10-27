@@ -80,6 +80,22 @@ class TestVtcmPlacement(unittest.TestCase):
     order = list(dict.fromkeys(i for _, _, ids, *_ in calls for i in ids))
     self.assertGreaterEqual(regs[order.index(id(s))], 0)
 
+  def test_gathered_param_priority(self):
+    # two regions live over the same calls, room for one: the one a kernel gathers from (/* vtcm-gathered */, from the renderer)
+    # wins over a plain one read as often
+    x, w, y = FakeBuf(16384), FakeBuf(16384), FakeBuf(16384)
+    a, b = FakeBuf(32768), FakeBuf(32768)
+    bufs = {id(t): [t, t.nbytes, None] for t in (x, w, y, a, b)}
+    hmx, e = kern("h", [VEC, VEC], hmx=True), kern("e", [VEC])
+    gath = kern("g", [VEC, VEC]).replace("/* DSP boilerplate", "/* vtcm-gathered: 1 */ /* DSP boilerplate")
+    calls = [("h", hmx, [id(a), id(x), id(w)], {0}, 0), ("e", e, [id(b), id(x)], {0}, 0),
+             ("g", gath, [id(y), id(a), id(b)], {0}, 0)]
+    h = self.emit(calls, bufs, x, y, 40)
+    regs = [int(v) for v in re.search(r"G_REG_VTCM\[G_NREG\] = \{([^}]*)\}", h).group(1).split(",")]
+    order = list(dict.fromkeys(i for _, _, ids, *_ in calls for i in ids))
+    self.assertGreaterEqual(regs[order.index(id(a))], 0)   # (unmarked, b takes the room)
+    self.assertEqual(regs[order.index(id(b))], -1)
+
   def test_raw_tile_alignment_and_prefetch(self):
     # a raw-tile buffer (1024 k + 1000 fp16 elements, written all but its marker tail) goes to a 2 KB boundary, where the HMX reads
     # and writes it in place; the kernels' software prefetches of parameters placed in VTCM become no-ops

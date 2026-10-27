@@ -166,11 +166,14 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     weight: dict[int, int] = {}
     for n, (_, src, ids, outs, _) in enumerate(calls):
       declared = re.search(r"/\* vtcm-params: ([\d,]+) \*/", src)
+      # (and a generated kernel's gathered parameters, which the renderer lists: from DDR every gathered row is a cache miss)
+      gathered = re.search(r"/\* vtcm-gathered: ([\d,]+) \*/", src)
+      heavy = {int(x) for d in (declared, gathered) if d for x in d.group(1).split(",")}
       for j, b in enumerate(ids):
         r = rid[id(base[b])]
         uses.setdefault(r, []).append(n)
         # a parameter a hand kernel declares (MSDA's value maps) is gathered from many times per call: worth 16 plain uses
-        weight[r] = weight.get(r, 0) + (16 if declared and j in {int(x) for x in declared.group(1).split(",")} else 1)
+        weight[r] = weight.get(r, 0) + (16 if j in heavy else 1)
         # (a raw-tile buffer's marker tail is never written)
         if j in outs and views[b].offset == 0 and views[b].nbytes in (base[b].nbytes, base[b].nbytes - 2000 * (base[b].nbytes % 2048 == 2000)):
           whole.add(r)

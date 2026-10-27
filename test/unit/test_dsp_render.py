@@ -191,6 +191,13 @@ class TestDSPHalf(unittest.TestCase):
     self.assertIn("float32 val", inside)                    # the term's loads moved in
     self.assertRegex(inside, r"\*\(\(float32\*\)\(\(buf0\+0\)\)\) = ")
 
+  def test_gathered_params_marked(self):
+    # a load at an address computed from a loaded value (rows gathered by index) marks its parameter for the graph emitter's VTCM
+    # priority (/* vtcm-gathered: j */): from DDR every gathered row is a cache miss (the generated MSDA's value rows)
+    rows, idx = Tensor.empty(1000 * 32), Tensor.empty(64, dtype=dtypes.int32)
+    el = (idx.reshape(64, 1) * 32 + Tensor.arange(32, dtype=dtypes.int32).reshape(1, 32)).reshape(-1)
+    self.assertIn("/* vtcm-gathered: 1 */", dsp_source(Tensor(rows.uop.index(el.uop)).reshape(64, 32) * 2))
+
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True

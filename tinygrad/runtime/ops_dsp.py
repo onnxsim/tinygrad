@@ -2942,6 +2942,11 @@ class DSPRenderer(ClangRenderer):
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_attn") for u in uops): prefix.append(_attn_helpers(True))
     elif any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__attn_sm_vtcm(") for u in uops): prefix.append(_attn_helpers(False))
+    # the parameters this kernel gathers from (an address computed from a loaded value): the graph emitter gives them VTCM first,
+    # as it does a hand kernel's declared ones -- from DDR each gathered row is a cache miss (the generated MSDA's value rows)
+    if (gs:=sorted({p.arg.slot for u in uops if u.op is Ops.LOAD and u.src and u.src[0].op in (Ops.INDEX, Ops.SHRINK) and _gathered(u.src[0])
+                    for p in [u.src[0].src[0]] if p.op is Ops.PARAM and getattr(p.arg, "slot", -1) >= 0})):
+      prefix.append(f"/* vtcm-gathered: {','.join(map(str, gs))} */")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
