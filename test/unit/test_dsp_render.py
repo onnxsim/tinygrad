@@ -164,6 +164,21 @@ class TestDSPHalf(unittest.TestCase):
     finally: R.has_threads, R.pool_threads, R.global_max = old
     self.assertIn("void r_2_15_64_450(", src)
 
+  def test_scalar_kernel_threads(self):
+    # a sigmoid over a 2-wide slice of 900 rows (the decoder's reference points) stays scalar (its rows gather); it does a vector's
+    # work per element, so it takes the thread pool (one thread before: 0.15-0.3 ms per call on the V69)
+    R = ops_dsp.MockDSPRenderer
+    attrs = ("has_threads", "pool_threads", "global_max", "thread_min_elems", "thread_work_weighted")
+    old = {a: R.__dict__.get(a) for a in attrs}
+    R.has_threads, R.pool_threads, R.global_max = True, 4, property(lambda self: (32, 0, 0))
+    R.thread_min_elems, R.thread_work_weighted = 16 << 10, True
+    try: src = dsp_source((Tensor.empty(900, 10)[:, :2] + Tensor.empty(900, 2)).sigmoid())
+    finally:
+      for a, v in old.items():
+        if v is None: delattr(R, a)
+        else: setattr(R, a, v)
+    self.assertIn("void E_225_2_4(", src)
+
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
   def setUp(self): self.prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True

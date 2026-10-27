@@ -446,7 +446,9 @@ def apply_threads(k:Scheduler) -> Scheduler:
   if k.ren.has_threads and k.ren.global_max is not None:
     pool = getattr(k.ren, "pool_threads", k.ren.global_max[0])
     if getattr(k.ren, "thread_work_weighted", False):
-      w = _work_per_elem(k)
+      # (a kernel left scalar or a few lanes wide does a vector's work per element: the decoder's reference-point sigmoid /
+      # inverse sigmoid, 1800 values of ~70 dependent scalar ops, ran on one thread for 0.15-0.3 ms -- HVX_SCALAR_THREAD_WEIGHT)
+      w = _work_per_elem(k) * (max(1, 32 // max(1, k.upcast_size())) if getenv("HVX_SCALAR_THREAD_WEIGHT", 1) else 1)
       def few(t:int) -> bool: return resolve(prod(k.full_shape) * w // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
     else:
       def few(t:int) -> bool: return resolve(prod(k.full_shape) // getattr(k.ren, "thread_min_elems", 128 << 10) < t)
