@@ -1189,7 +1189,7 @@ _QF_VEC_OPS = {Ops.EXP2, Ops.RECIPROCAL, Ops.FDIV, Ops.SQRT, Ops.LOG2}
 def _vec_ops() -> set: return HVX_VEC_OPS | _QF_VEC_OPS if QF_MATH else HVX_VEC_OPS
 # HVX_REVEC_BITCAST=1: a same-width bitcast (float32 <-> int32 lanes) re-vectorizes too -- the generated MSDA's row index goes
 # float -> int through the mantissa (MSDA_STAGE builds it as a vector table)
-def _revec_bitcast() -> bool: return bool(getenv("HVX_REVEC_BITCAST", 0))
+def _revec_bitcast() -> bool: return bool(getenv("HVX_REVEC_BITCAST", 1))
 def _vec_bitcast(u:UOp) -> bool:
   return _revec_bitcast() and u.op is Ops.BITCAST and u.dtype.itemsize == u.src[0].dtype.itemsize == 4
 

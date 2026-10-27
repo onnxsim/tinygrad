@@ -1810,7 +1810,12 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     Q, M, NO, P, _ = off.shape
     NVR, R = ref.shape[0], ref.shape[2]
     assert S == H * W and C % M == 0 and NO in (1, NV) and NVR in (1, NV), f"MSDA: inconsistent shapes {value.shape} {ref.shape} {off.shape}"
-    if str(value.device).startswith("DSP") and getenv("HAND_MSDA", 1):
+    # HAND_MSDA=-1 (the default): the hand kernel below MSDA_GEN_MIN_Q queries, the generated one through register tables
+    # (MSDA_STAGE=2) from there -- BEVFormer's encoder (2500 queries) generated: enc1 11.4 -> 9.6, enc3 34.6 -> 29.5 ms on the V69;
+    # its decoder (900) stays hand (generated 23.5 -> 25.3 ms)
+    hand = getenv("HAND_MSDA", -1)
+    if hand < 0: hand = int(Q < getenv("MSDA_GEN_MIN_Q", 2048))
+    if str(value.device).startswith("DSP") and hand:
       # MSDA_SPLIT_MAPS=1: the plain mean over several maps (BEVFormer's two-frame temporal attention) as one call per map, so a
       # map's values (2.56 MB) fit the graph's VTCM arena: the calls got faster (6.5 -> 4.7 ms per encoder layer on the V69) but
       # the per-map copies of the interleaved offsets / weights cost more (9.7 ms over 3 layers)
@@ -1823,7 +1828,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
     refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
     wh = Tensor([float(W), float(H)], dtype=value.dtype)
-    if getenv("MSDA_STAGE", 0): return _msda_staged(value, refp, off, attw, vis, H, W)
+    if getenv("MSDA_STAGE", 2 if str(value.device).startswith("DSP") else 0): return _msda_staged(value, refp, off, attw, vis, H, W)
     if vis is not None and getenv("MSDA_GATED", 1):
       # with a visibility mask: every map in one GridSample (maps x heads as its batch) and each point's term as
       # where(visible, term, 0), summed over maps and points -- the gate depends on (map, query) only, so the code generator
@@ -1936,7 +1941,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # MSDA_STAGE=2: the heads in the table too, built once per (map, query) for all heads (their accumulators upcast): the tap axis
     # outermost, a loop around (heads x points) lanes (STAGE_LANES)
     def staged(t:Tensor, n:int) -> Tensor:
-      if getenv("MSDA_STAGE", 1) < 2: return t.stage(n)
+      if getenv("MSDA_STAGE", 2) < 2: return t.stage(n)
       lead, tap = t.ndim - n - 1, t.ndim - 2                                         # the head axis, the tap axis
       order = list(range(lead)) + [tap, lead] + [a for a in range(lead + 1, t.ndim) if a != tap]
       return t.permute(order).stage(n + 1).permute(argsort(order))
