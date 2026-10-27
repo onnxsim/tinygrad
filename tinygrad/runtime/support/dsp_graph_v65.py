@@ -73,8 +73,9 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
   body = src.split("/* DSP boilerplate */")[0]
   m = re.search(rf"\bdata{j}_\d+\b", body)
   if m is None: return False
-  # a hand kernel can declare the parameters it reads and writes only as whole HVX vectors (/* vtcm-params: 1,2 */ in its call)
-  if (d := re.search(r"/\* vtcm-params: ([\d,]+) \*/", body)) is not None and j in {int(x) for x in d.group(1).split(",")}: return True
+  # a hand kernel can declare the parameters it reads and writes only as whole HVX vectors (/* vtcm-params: 1,2 */ in its call,
+  # gathered from: weighted as such; /* vtcm-access: 0,2 */, streamed)
+  if j in _listed(body, "vtcm-params") | _listed(body, "vtcm-access"): return True
   name, hmx, seen = m.group(0), "__hmx_" in body, False
   for o in re.finditer(rf"\b{name}\b", body):
     pre = body[max(0, o.start() - 48):o.start()]
@@ -88,6 +89,10 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
 def _listed(src:str, tag:str) -> set[int]:
   """the parameter indices a kernel's source lists in a /* tag: 1,2 */ comment (the renderer's or a hand kernel's call)"""
   return {int(x) for d in re.findall(rf"/\* {tag}: ([\d,]+) \*/", src) for x in d.split(",")}
+
+def _resident(src:str) -> dict[int, int]:
+  """a kernel's /* vtcm-resident: j=p,... */ (the renderer's, from Tensor.empty(..., resident=p), or a hand kernel's call)"""
+  return {int(j): int(p) for d in re.findall(r"/\* vtcm-resident: ([\d=,-]+) \*/", src) for j, p in (x.split("=") for x in d.split(","))}
 
 def _core_param(src:str, nbufs:int) -> int:
   """the position of a threaded kernel's core id (its `const int` parameter) among its parameters (default: after the buffers)"""
@@ -169,7 +174,15 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     narrow: set[int] = set()
     weight: dict[int, int] = {}
     rawt: set[int] = set()
+    # residency the model asked for, per region (any kernel's listing; a refusal, < 0, wins): > 0 exempts the region from the
+    # one-whole-write rule (the model vouches for its writes covering what is read: a Tensor.empty is undefined until written,
+    # in VTCM as in DDR), places it before the unhinted ones, higher first, and keeps it from being displaced by them
+    res: dict[int, int] = {}
     for n, (_, src, ids, outs, _) in enumerate(calls):
+      for j, p in _resident(src).items():
+        if j >= len(ids): continue
+        r = rid[id(base[ids[j]])]
+        res[r] = min(res.get(r, 0), p) if p < 0 or res.get(r, 0) < 0 else max(res.get(r, 0), p)
       declared = re.search(r"/\* vtcm-params: ([\d,]+) \*/", src)
       # (and a generated kernel's gathered parameters, which the renderer lists: from DDR every gathered row is a cache miss)
       gathered = re.search(r"/\* vtcm-gathered: ([\d,]+) \*/", src)
@@ -183,8 +196,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
         if j in _listed(src, "hmx-tile"): rawt.add(r)
         if not _vtcm_access_ok(src, j): narrow.add(r)
     pinned = {rid[i] for i in in_ids} | {rid[out_id]}
-    cand = [r for r in uses if r in whole and r not in narrow and r not in pinned and id(regions[r]) not in blob_off and
-            _rnd(regions[r].nbytes) <= vkb * 1024]
+    cand = [r for r in uses if (r in whole or res.get(r, 0) > 0) and res.get(r, 0) >= 0 and r not in narrow and r not in pinned and
+            id(regions[r]) not in blob_off and _rnd(regions[r].nbytes) <= vkb * 1024]
     vplaced: dict[int, tuple[int, int, int, int]] = {}  # region -> (offset, size, first call, last call)
     # raw-tile buffers (ops_dsp HMX_TILE, listed by the renderer: /* hmx-tile: j */) at 2 KB: the HMX reads and writes them in place
     def align(r:int) -> int: return 2048 if r in rawt else ALIGN
@@ -199,8 +212,8 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
     # most uses per byte-call of VTCM held first: a small buffer read twice 200 calls apart holds its bytes the whole time
     # declared hand-kernel parameters first (their gathers gain the most), then the rest by uses per byte-call held
     # raw-tile buffers before everything (the HMX reads them in place only from VTCM; from DDR each tile is copied in)
-    for r in sorted(cand, key=lambda r: (align(r) != 2048, weight[r] < 16, -weight[r] / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)),
-                                         uses[r][0])):
+    for r in sorted(cand, key=lambda r: (align(r) != 2048, -res.get(r, 0), weight[r] < 16,
+                                         -weight[r] / (regions[r].nbytes * (uses[r][-1] - uses[r][0] + 1)), uses[r][0])):
       size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
       if (off := fit(size, f, l, al=align(r))) is not None: vplaced[r] = (off, size, f, l)
     # then each region left out, most traffic (uses x bytes) first, may take the place of overlapping ones that carry less in all:
@@ -214,13 +227,29 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       for off in sorted({0} | {-(-(o + sz) // align(r)) * align(r) for o, sz, _, _ in over.values()}):
         if off + size > vkb * 1024: break
         hit = [x for x, (o, sz, _, _) in over.items() if o < off + size and off < o + sz]
+        if any(res.get(x, 0) > res.get(r, 0) for x in hit): continue  # (a requested residency yields only to a higher one)
         cost = sum(map(traffic, hit))
-        if cost < traffic(r) and (best is None or cost < best[0]): best = (cost, off, hit)
+        if (cost < traffic(r) or res.get(r, 0) > max((res.get(x, 0) for x in hit), default=0)) and (best is None or cost < best[0]):
+          best = (cost, off, hit)
       if best is not None:
         for x in best[2]: del vplaced[x]
         vplaced[r] = (best[1], size, f, l)
+    # then the regions still out where they now fit: an eviction can free room over calls the evicting region doesn't use, and a
+    # region the evicted one had crowded out was already passed over (BEVFormer's decoder: each layer's 1.2 MB value projection
+    # output, room for it after the eviction pass but left in DDR. Refilled: decoder 27.0 -> 26.7, enc1 13.5 -> 13.2 ms on the V69)
+    if os.environ.get("DSP_GRAPH_VTCM_REFILL", "1") != "0":
+      for r in sorted((r for r in cand if r not in vplaced), key=lambda r: -traffic(r)):
+        size, f, l = _rnd(regions[r].nbytes), uses[r][0], uses[r][-1]
+        if (off := fit(size, f, l, al=align(r))) is not None: vplaced[r] = (off, size, f, l)
     if (dbg := os.environ.get("DSP_GRAPH_VTCM_DEBUG")):
-      for r in map(int, dbg.split(",")):
+      # (DSP_GRAPH_VTCM_DEBUG=top: the candidates left out, most traffic first)
+      if dbg == "top":
+        dbg = ",".join(str(r) for r in sorted((r for r in cand if r not in vplaced), key=lambda r: -traffic(r))[:12])
+        # (and the regions only the one-whole-write rule keeps out: what a residency request, which lifts it, could place)
+        nw = sorted((r for r in uses if r not in whole and r not in narrow and r not in pinned and id(regions[r]) not in blob_off),
+                    key=lambda r: -traffic(r))[:12]
+        print("vtcm not whole:", " ".join(f"R{r}:{regions[r].nbytes // 1024}K:{uses[r][:4]}:n={len(uses[r])}:t={traffic(r)}" for r in nw))
+      for r in map(int, filter(None, dbg.split(","))):
         f, l = uses[r][0], uses[r][-1]
         print(f"vtcm R{r}: cand={r in cand} whole={r in whole} narrow={r in narrow} placed={vplaced.get(r)} uses={uses[r]} traffic={traffic(r)}")
         for x, v in sorted(vplaced.items(), key=lambda kv: kv[1][0]):

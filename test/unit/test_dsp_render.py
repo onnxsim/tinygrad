@@ -372,7 +372,8 @@ class TestDSPHmx(unittest.TestCase):
     # LD) view is only how it indexes them. The product goes out tile by tile at its raw place, (column tile x row tiles + row
     # tile) x 1024, and a raw B operand is read in place, its K panel being consecutive tiles
     hm = tc.hexagon_hmx + tc.hexagon_v65
-    sb = Tensor.empty(64, 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
+    st = Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half)
+    sb = Tensor.empty(64, 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE).assign(st)
     src = dsp_source(sb, hm)
     self.assertIn("/* hmx-tile: 0 */", src)   # listed for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
     kernel = src.split("__attribute__((noinline)) void", 1)[1]
@@ -397,6 +398,13 @@ class TestDSPHmx(unittest.TestCase):
     self.assertRegex(kernel, r"__hmx_rawb\+\(Lidx\d\)\*2048\+2048, 2\);")
     self.assertIn("__hmx_pend(2, _p, _q);", kernel)
     self.assertIn("__hmx_pend(1, _p, 0);" if ops_dsp.HMX_DEFER else "__hmx_store();", kernel)
+
+  def test_resident_listing(self):
+    # a buffer made with Tensor.empty(..., resident=p) is listed for the graph emitter in every kernel that touches it
+    a = Tensor.empty(64, 32, resident=2).assign(Tensor.empty(64, 32) + 1)
+    self.assertIn("/* vtcm-resident: 0=2 */", dsp_source(a))
+    self.assertIn("/* vtcm-resident: 1=2 */", dsp_source(a * 2))
+    self.assertNotIn("vtcm-resident", dsp_source(Tensor.empty(64, 32) * 2))
 
   def test_raw_lin(self):
     # a raw output tile's place from its first row's index: 32 LD a + 32 b -> (b row tiles + a) 1024, per loop

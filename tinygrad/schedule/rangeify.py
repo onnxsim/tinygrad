@@ -486,7 +486,8 @@ def debuf(ctx:LocalAddBufferContext, buf:UOp):
   # Variables (ALU buffers with a value range) are scalar symbolic values, not real buffers: they become ALU params with no slot
   if buf.is_variable: return buf.replace(op=Ops.PARAM)
   param = UOp(Ops.PARAM, src=(UOp.const(prod(buf.max_shape)),),
-              arg=ParamArg(ctx.dg, buf.dtype, addrspace=buf.addrspace, device=buf.device, layout=buf.layout))
+              arg=ParamArg(ctx.dg, buf.dtype, addrspace=buf.addrspace, device=buf.device, layout=buf.layout,
+                            resident=buf.resident))
   ret = param.reshape(buf.max_shape)
   # if the buffer has symbolic shape, shrink the max-sized view to the actual shape
   if buf.max_shape != buf.shape: ret = ret.shrink(tuple((0, s) for s in buf.shape))

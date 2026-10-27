@@ -1877,7 +1877,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     return (per_map * vf).sum(0) / vf.sum(0).maximum(1.0)
 
   def _msda_dsp(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:
-    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
+    from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, GroupOp
     NV, S, C = value.shape
     Q, M, NO, P, _ = off.shape
     NVR, R = ref.shape[0], ref.shape[2]
@@ -1885,8 +1885,25 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # the kernel reads value / loc / attw / out as whole aligned buffers from their first byte (its HVX body wants 128-byte
     # alignment), so each input is assigned into a buffer of its own: a slice of a realized buffer can stay a view, and the call
     # would get its base pointer
-    def own(t:Tensor, dt) -> Tensor: return Tensor.empty(*t.shape, dtype=dt, device=t.device).assign(t.cast(dt))
-    ins = [own(value, dtypes.float32), own(off, dtypes.float32), own(ref, dtypes.float32), own(attw, dtypes.float32)]
+    def own(t:Tensor, dt, res:int=0) -> Tensor:
+      # (unless t already is such a buffer: a reshape of a whole buffer, or of a computed CONTIGUOUS -- one of a view could be
+      # elided to that view -- of dtype dt. The decoder's value maps and offsets were copied, the maps VTCM to VTCM: 2.5 MB more
+      # at the arena's peak, other buffers out of it. Without the copies: decoder 27.7 -> 27.0, enc1 13.6 -> 13.5 ms on the V69)
+      u = t.uop
+      while u.op is Ops.RESHAPE: u = u.src[0]
+      if getenv("MSDA_OWN_SKIP", 1) and t.dtype == dt and u._shape is not None and prod(u.shape) == t.numel():
+        if u.op is Ops.BUFFER: return t
+        if u.op is Ops.CONTIGUOUS:
+          v = u.src[0]
+          while v.op in GroupOp.Movement: v = v.src[0]
+          if v.op not in (Ops.BUFFER, Ops.CONTIGUOUS, Ops.AFTER): return t
+      return Tensor.empty(*t.shape, dtype=dt, device=t.device, resident=res).assign(t.cast(dt))
+    # MSDA_VTCM_IO: the output, locations and weights (read and written as whole HVX vectors) may go to VTCM (1: as the emitter
+    # judges; 2: asked for, Tensor.empty(..., resident=1)). Asked for, the decoder's calls went 542 -> 537 us (they're prefetched)
+    # but the encoders' value maps lost their place: enc1 13.5 -> 17.7, enc3 40.0 -> 51.8 ms on the V69
+    io = getenv("MSDA_VTCM_IO", 0)
+    res = 1 if io >= 2 else 0
+    ins = [own(value, dtypes.float32), own(off, dtypes.float32, res), own(ref, dtypes.float32), own(attw, dtypes.float32, res)]
     if vis is not None: ins.append(own(vis, dtypes.uint8))
     consts = f"{NV}, {S}, {H}, {W}, {M}, {C // M}, {P}, {Q}, {NO}, {NVR}, {R}"
     def kern(Y, *bufs):
@@ -1895,9 +1912,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       vis_arg = "{5}" if vis is not None else "0"
       cu = UOp(Ops.CUSTOM, dtypes.void, srcs,
                # (the value maps, parameter 1, are read as whole 128-byte rows: the graph emitter may put them in VTCM)
-               arg=f"/* vtcm-params: 1 */ __msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
+               arg=f"/* vtcm-params: 1 */ {'/* vtcm-access: 0,2,4 */ ' if io else ''}"
+                   f"__msda_call({{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {vis_arg}, {{{len(srcs) - 1}}}, {nt}, {consts});")
       return cu.end(t).sink(arg=KernelInfo(name=f"msda_{NV}x{Q}x{M}x{P}", opts_to_apply=()))
-    y = Tensor.empty(Q, C, dtype=dtypes.float32, device=value.device)
+    y = Tensor.empty(Q, C, dtype=dtypes.float32, device=value.device, resident=res)
     return Tensor.custom_kernel(y, *ins, fxn=kern)[0]
 
   def Compress(inp:Tensor, condition:list[bool], axis:int|None=None):

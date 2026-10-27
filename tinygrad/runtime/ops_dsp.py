@@ -2956,6 +2956,9 @@ class DSPRenderer(ClangRenderer):
     # the raw-tile parameters, for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
     if (rs:=sorted({u.arg.slot for u in uops if u.op is Ops.PARAM and u.layout == HMX_TILE})):
       prefix.append(f"/* hmx-tile: {','.join(map(str, rs))} */")
+    # the parameters whose buffers the model asked to keep on chip (Tensor.empty(..., resident=p)): the emitter's VTCM priorities
+    if (rp:=sorted({(u.arg.slot, u.resident) for u in uops if u.op is Ops.PARAM and u.resident and u.arg.slot >= 0})):
+      prefix.append(f"/* vtcm-resident: {','.join(f'{j}={p}' for j, p in rp)} */")
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
   # register arrays get HVX alignment: memory_coalescing merges their accesses into vector loads/stores (see coalesce.py),
