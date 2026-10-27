@@ -7,7 +7,7 @@ from tinygrad.uop.ops import graph_rewrite, sint, AxisType, BottomUpGate, rewrit
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.helpers import prod, getenv, dedup, all_int, DEBUG, SPLIT_REDUCEOP, DEBUG_RANGEIFY, VIZ, MAX_KERNEL_BUFFERS, SPEC
-from tinygrad.helpers import PCONTIG, FLOAT16, OPENPILOT_HACKS, argsort, partition, get_single_element
+from tinygrad.helpers import PCONTIG, FLOAT16, OPENPILOT_HACKS, argsort, partition, get_single_element, ContextVar
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.codegen.opt import Opt
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, apply_movement_op
@@ -567,6 +567,84 @@ def split_store(x:UOp) -> UOp|None:
   # create the Kernel. NOTE: buffers can be on different devices here now, they are compiled to SDMA copies later by schedule
   return ret.sink(arg=KernelInfo(opts_to_apply=lctx.opts)).call(*lctx.map.values())
 
+# MULTIOUT: multi-output kernels. An elementwise kernel B that reads a buffer X only where it stores (Y[e] = f(X[e], ...), e.g. the
+# fp16 copy of a LayerNorm's output that a GEMM_FP16 projection takes while the residual reads the fp32 one) becomes a second STORE
+# of X's producer A, when A is elementwise too and its ranges cover the same elements in the same order: X[e] is A's value in
+# registers, one DDR read and one launch fewer. The kernel's SINK is then END(GROUP(STORE X, STORE Y), ranges)
+MULTIOUT = ContextVar("MULTIOUT", 0)
+
+def _plain_end(after:UOp) -> tuple[UOp, UOp, UOp]|None:
+  """after = AFTER(buf, END(STORE(INDEX(buf, idx), val), ranges)), all ranges closed, no reduce or custom code in val -> (END, idx, val)"""
+  if len(after.src) != 2 or (e:=after.src[1]).op is not Ops.END or (st:=e.src[0]).op is not Ops.STORE: return None
+  if (ix:=st.src[0]).op is not Ops.INDEX or len(ix.src) != 2 or ix.src[0] is not after.src[0] or after.addrspace != AddrSpace.GLOBAL: return None
+  if e.ranges or not all(r.op is Ops.RANGE for r in e.src[1:]): return None
+  # and no masked values (WHERE: padding): the masked select of the extra store's cast went lane by lane on the DSP (BEVFormer's
+  # attention operands, E_2_960_4_32 + its fp16 copy: 5.6 ms per call on the V69; an encoder pad 67 us -> 8.2 ms)
+  if any(u.op in {Ops.REDUCE, Ops.CUSTOM, Ops.CUSTOMI, Ops.STAGE, Ops.CALL, Ops.WHERE}
+         for u in st.src[1].toposort(gate=lambda u: u.op is not Ops.AFTER)): return None
+  return e, ix.src[1], st.src[1]
+
+def _unit_reads(ea:UOp, ia:UOp, v:UOp) -> bool:
+  """every read in v (and A's value) moves by 0 or 1 element along the range A stores at unit stride: no transposing reads. Merged
+  into a transposing copy (BEVFormer's attention operands, the block-transposed Q^T / V^T), the fp16 store went 32 lanes wide:
+  E_2_30_4_32_32 0.04 -> 0.54 ms per call on the V69"""
+  def stride(idx:UOp, r:UOp) -> int|None:
+    t = UOp.variable("_mo_t", 0, r.vmax, r.dtype)
+    d = (idx.substitute({r: t + 1}) - idx.substitute({r: t})).simplify()
+    return d.arg if d.op is Ops.CONST else None
+  if (inner := next((r for r in ea.src[1:] if stride(ia, r) == 1), None)) is None: return False
+  reads = [u for x in (ea.src[0].src[1], v) for u in x.toposort(gate=lambda u: u.op is not Ops.AFTER) if u.op is Ops.INDEX and len(u.src) == 2]
+  return all(stride(u.src[1], inner) in (0, 1) for u in reads)
+
+def merge_outputs(tsink:UOp) -> UOp:
+  for _ in range(4):
+    afters = [u for u in tsink.toposort() if u.op is Ops.AFTER]
+    plain = {u: p for u in afters if (p:=_plain_end(u)) is not None}
+    merged: dict[UOp, list[tuple[UOp, UOp]]] = {}  # producer AFTER -> [(consumer AFTER, its STORE in the producer's ranges)]
+    consumers = set()
+    for yb, (eb, ib, vb) in plain.items():
+      reads = [u for u in vb.toposort(gate=lambda u: u.op is not Ops.AFTER) if u.op is Ops.INDEX and u.src[0].op is Ops.AFTER]
+      for xa in dedup(r.src[0] for r in reads):
+        if xa not in plain or xa in consumers or yb in merged or xa is yb: continue
+        ea, ia, va = plain[xa]
+        if any(r.src[0] is xa and (len(r.src) != 2 or r.src[1] is not ib) for r in reads): continue
+        if len(eb.src) != len(ea.src) or any(a.src[0] is not b.src[0] for a, b in zip(ea.src[1:], eb.src[1:])): continue
+        sub = dict(zip(eb.src[1:], ea.src[1:]))
+        if ib.substitute(sub).simplify() is not ia.simplify(): continue
+        # B's other inputs (and the earlier state of a buffer it stores into part of) must not come from A's output: a cycle
+        if any(ea in u.toposort() for u in [*(r.src[0] for r in reads if r.src[0] is not xa), yb.src[0]] if u.op is Ops.AFTER): continue
+        vb2 = vb.substitute({**{r: va for r in reads if r.src[0] is xa}, **sub})
+        if not _unit_reads(ea, ia, vb2): continue
+        merged.setdefault(xa, []).append((yb, eb.src[0].src[0].replace(src=(yb.src[0], ia)).store(vb2)))
+        consumers.add(yb)
+        break
+    # a producer that is itself merged into another this round waits for the next
+    merged = {xa: v for xa, v in merged.items() if xa not in consumers}
+    if not merged: return tsink
+    subs: dict[UOp, UOp] = {}
+    for xa, outs in merged.items():
+      ea = plain[xa][0]
+      end = UOp.group(ea.src[0], *[st for _, st in outs]).end(*ea.src[1:])
+      # the ENDs, not the AFTERs: a store into part of a buffer is also joined into its later states (AFTER(buf, END, END))
+      subs[ea] = end
+      for yb, _ in outs: subs[yb.src[1]] = end
+    tsink = tsink.substitute(subs)
+    # A's own store (the GROUP's first) is dead when the merged consumers were its only readers (an fp32 copy that only its fp16
+    # cast read): no AFTER of it is read any more. That decides it for an internal buffer; a realized tensor's buffer is in the SINK
+    # either way, and MULTIOUT=2 (a whole-program compile, dsp_graph_onnx: only the final output is read back, and no kernel ever
+    # read that) drops those too. BEVFormer: the FFN's fp32 pre-ReLU output (decoder 900 x 512, encoder 2500 x 512 floats)
+    nodes = tsink.toposort()
+    read = {s for u in nodes if u is not tsink for s in u.src if s.op is Ops.AFTER}
+    dead = {}
+    for e in nodes:
+      if e.op is not Ops.END or e.src[0].op is not Ops.GROUP: continue
+      if (b:=(sts:=e.src[0].src)[0].src[0].src[0]).op not in {Ops.BUFFER, Ops.PARAM}: continue
+      if (b.op is Ops.BUFFER or MULTIOUT >= 2) and not any(u.src[0] is b and e in u.src[1:] for u in read):
+        dead[e] = UOp.group(*sts[1:]).end(*e.src[1:])
+    if dead: tsink = tsink.substitute(dead)
+    if DEBUG >= 2: print(f"MULTIOUT: {sum(len(v) for v in merged.values())} stores merged into {len(merged)} kernels, {len(dead)} dead stores")
+  return tsink
+
 split_kernels = PatternMatcher([
   (UPat((Ops.STORE, Ops.END), name="x"), split_store),
 ])
@@ -613,6 +691,7 @@ def get_kernel_graph(sink:UOp) -> UOp:
   slots = [x.arg.slot for x in tsink.toposort() if x.op is Ops.BUFFER and isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL]
   paramarg_start: int = max([-1]+slots) + 1
   tsink = graph_rewrite(tsink, pm_add_buffers+pm_add_param_range_tags, ctx=itertools.count(paramarg_start), bottom_up=True, name="stage to store")
+  if MULTIOUT: tsink = merge_outputs(tsink)
   tsink = graph_rewrite(tsink, split_kernels, bottom_up=True, name="split kernels")
   tsink = graph_rewrite(tsink, pm_no_indexing_calls, name="remove indexing from call args")
 

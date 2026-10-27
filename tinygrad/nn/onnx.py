@@ -377,6 +377,7 @@ def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
 # (fp32 result, padded fp16 product, M, N, A, B unpadded, fp32 A, B)
 _fp16_out: dict[int, tuple[Tensor, Tensor, int, int, Tensor, Tensor, Tensor, Tensor]] = {}
 _fp16_in: dict[int, tuple[Tensor, Tensor]] = {}
+_a16_rows: dict[tuple[UOp, int], Tensor] = {}  # GEMM_FP16 A operands stored into a row-padded buffer (MULTIOUT): (source, rows) -> it
 # softmax(q @ k^T) results that P @ V can instead compute as one fused HMX attention call (_hmx_attn_dsp): q, k^T fp16 operands
 _attn_in: dict[int, tuple[Tensor, Tensor, Tensor, int, int, Tensor, Tensor]] = {}  # (+ the fp32 q, k^T the product took)
 # realized transposed copies (TRANSPOSE_CONTIGUOUS) -> the transposing view each copies: a consumer that builds its own layout
@@ -1115,7 +1116,18 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # 129 ms on the V69). A row pad (the Gemms' M) or a narrow one is generated, as fast as the hand copy (hexagon-sim). The
     # fused attention (_hmx_attn_dsp) takes k^T unpadded, so BEVFormer has none of the first kind left
     dsp = str(a.device).startswith("DSP")
-    def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
+    from tinygrad.schedule.rangeify import MULTIOUT
+    def pad16(t:Tensor, rows:int, cols:int, junk_rows=False) -> Tensor:
+      # MULTIOUT (A operands, row padding only): the fp16 copy stored straight into the first rows of the padded buffer, the
+      # padding rows left unwritten -- each output row of the product reads only its own row of A, and the rows past M are sliced
+      # off (the softmax and P @ V that take a padded product keep to rows too). The copy is then a store the producer of t (a
+      # LayerNorm, a bias add) can make itself (schedule/rangeify.py merge_outputs): no cast and no pad kernel
+      # (one per source: the empty buffer isn't deduplicated like a computed copy, and BEVFormer's q and k projections share an A)
+      if junk_rows and dsp and rows and not cols and MULTIOUT:
+        if (out := _a16_rows.get((t.uop, rows))) is None:
+          out = _a16_rows[(t.uop, rows)] = Tensor.empty(*t.shape[:-2], t.shape[-2] + rows, t.shape[-1], dtype=dtypes.half, device=t.device)
+          out[..., :t.shape[-2], :].assign(t.half())
+        return out
       t = t.half().contiguous()
       if not (rows or cols): return t
       if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
@@ -1128,7 +1140,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     if dsp and (ent := _attn_in.get(id(a))) is not None and ent[0] is a and N == 32 and getenv("HMX_ATTN", 3):
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
-    else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
+    else: a16 = pad16(a, _hmx_pad_rows(M), r32(K), junk_rows=True)
     bh = b.half().contiguous()
     b16 = pad16(bh, r32(K), r32(N))
     y = a16.matmul(b16, dtype=dtypes.half).contiguous()

@@ -180,6 +180,10 @@ def main() -> None:
   # by tinygrad's memory planner: its aliasing of unrelated tensors made calls depend on each other (a copy of BEVFormer's
   # camera value maps couldn't move past a reuse of its source region) and kept the maps out of VTCM. Scratch: 108 -> 37 MB
   os.environ.setdefault("NO_MEMORY_PLANNER", "1")
+  # multi-output kernels (schedule/rangeify.py merge_outputs): a producer also stores the fp16, row-padded copy its GEMM_FP16 consumers
+  # take (nn/onnx.py pad16), instead of a cast and a pad kernel re-reading its output; 2: a store no kernel reads is dropped (only
+  # the final output is read back). BEVFormer-tiny on the V69: decoder 27.6 -> 26.5, enc1 13.7 -> 12.0, enc3 40.3 -> 36.9 ms
+  os.environ.setdefault("MULTIOUT", "2")
   os.environ.setdefault("DSP_GRAPH_REUSE", "1")
   if os.environ.get("HMX"):
     os.environ.setdefault("DSP_GRAPH_VTCM_KB", str(max(0, int(os.environ.get("DSP_VTCM_TOTAL_KB", "8192")) - int(os.environ.get("HMX_VTCM_KB", "256")) - 72)))
