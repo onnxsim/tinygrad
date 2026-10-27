@@ -235,6 +235,9 @@ static inline HVX_Vector msda_lanevec(const int32_t* t, int k, HVX_Vector epat) 
   return r;
 }
 
+/* the one-window form (msda_taps_hvx): one level of at least 2 x 2, fp32 values */
+static inline int msda_win(const msda_args_t* A) { return A->vdtype != MSDA_U8 && A->L == 1 && A->W[0] >= 2 && A->H[0] >= 2; }
+
 /* One iteration's points -> 4 taps each: to[t][g] byte offsets into the value maps, tw[t][g] weights
  * (fp32 value: IEEE bits; uint8 value: Q15 integers). */
 static void msda_taps_hvx(const msda_args_t* A, const msda_lanes_t* LN, int q, const int* vmap, float inv,
@@ -297,6 +300,24 @@ static void msda_taps_hvx(const msda_args_t* A, const msda_lanes_t* LN, int q, c
     const HVX_Vector xa = Q6_Vw_vadd_VwVw(Q6_Vw_vmax_VwVw(x0, zero), ST);
     const HVX_Vector xb = Q6_Vw_vadd_VwVw(Q6_Vw_vmin_VwVw(Q6_Vw_vadd_VwVw(x0, i_1), WM1), ST);
     const HVX_Vector base = Q6_Vw_vadd_VwVw(vb, LN->base[j]);
+    if (msda_win(A)) {
+      /* one 2 x 2 window inside the map, [bx, bx + 1] x [by, by + 1]: its rows are o, o + C, o + W C, o + (W + 1) C, so the
+         table holds one offset per point. A corner outside the map has weight 0 already; the window shifts in by one there
+         (x0 = -1: column 0 is x0 + 1's; x0 = W - 1: column 1 is x0's) */
+      const HVX_Vector bx = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(x0, zero), Q6_Vw_vsub_VwVw(WM1, i_1));
+      const HVX_Vector by = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(y0, zero), Q6_Vw_vsub_VwVw(HM1, i_1));
+      const HVX_VectorPred xl = Q6_Q_vcmp_gt_VwVw(bx, x0), xr = Q6_Q_vcmp_gt_VwVw(x0, bx);
+      const HVX_VectorPred yl = Q6_Q_vcmp_gt_VwVw(by, y0), yr = Q6_Q_vcmp_gt_VwVw(y0, by);
+      const HVX_Vector cx0 = Q6_V_vmux_QVV(xl, wx1, Q6_V_vmux_QVV(xr, zero, wx0)), cx1 = Q6_V_vmux_QVV(xl, zero, Q6_V_vmux_QVV(xr, wx0, wx1));
+      const HVX_Vector cy0 = Q6_V_vmux_QVV(yl, wy1, Q6_V_vmux_QVV(yr, zero, wy0)), cy1 = Q6_V_vmux_QVV(yl, zero, Q6_V_vmux_QVV(yr, wy0, wy1));
+      const HVX_Vector row = Q6_Vw_vadd_VwVw(Q6_Vh_vmpyi_VhVh(by, WI), Q6_Vw_vadd_VwVw(bx, ST));
+      ((HVX_Vector*)to[0])[j] = Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(row, c4h), base);
+      ((HVX_Vector*)tw[0])[j] = msda_sf(Q6_Vqf32_vmpy_VsfVsf(cy0, cx0));
+      ((HVX_Vector*)tw[1])[j] = msda_sf(Q6_Vqf32_vmpy_VsfVsf(cy0, cx1));
+      ((HVX_Vector*)tw[2])[j] = msda_sf(Q6_Vqf32_vmpy_VsfVsf(cy1, cx0));
+      ((HVX_Vector*)tw[3])[j] = msda_sf(Q6_Vqf32_vmpy_VsfVsf(cy1, cx1));
+      continue;
+    }
     ((HVX_Vector*)to[0])[j] = Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(Q6_Vw_vadd_VwVw(ya, xa), c4h), base);
     ((HVX_Vector*)to[1])[j] = Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(Q6_Vw_vadd_VwVw(ya, xb), c4h), base);
     ((HVX_Vector*)to[2])[j] = Q6_Vw_vadd_VwVw(Q6_Vw_vmpyi_VwRh(Q6_Vw_vadd_VwVw(yb, xa), c4h), base);
@@ -322,18 +343,35 @@ static void msda_taps_hvx(const msda_args_t* A, const msda_lanes_t* LN, int q, c
  * (NO = 1) one iteration per visible map, else one covering every map. Software-pipelined by one
  * item: item i + 1's taps are built (HVX stores) before item i's multiply-accumulate, which
  * dcfetches them into L1 after its first head so the scalar tap reads don't miss. */
+/* the offsets and weights of the queries 8 to 15 ahead into L2, offsets on every 8th query and weights 4 queries later: one
+   l2fetch box each (a second one issued while one is in flight replaces it). From DDR they were half the decoder's call */
+#define MSDA_PF_AHEAD 8
+static inline void msda_l2box(const void* p, unsigned bytes) {
+  const unsigned lines = (bytes + 127) / 128;
+  if (lines) __builtin_HEXAGON_Y5_l2fetch((void*)p, (128ull << 32) | (128ull << 16) | (lines < 65535 ? lines : 65535));
+}
+static inline void msda_pf(const msda_args_t* A, const msda_lanes_t* LN, int q, int q0, int q1) {
+  const int k = (q - q0) % MSDA_PF_AHEAD, qa = q + MSDA_PF_AHEAD, n = q1 - qa < MSDA_PF_AHEAD ? q1 - qa : MSDA_PF_AHEAD;
+  if (n <= 0 || (k != 0 && k != MSDA_PF_AHEAD / 2)) return;
+  const long pts = (long)LN->npv * 32;
+  if (k == 0) msda_l2box(A->loc + (long)qa * pts * 2, (unsigned)(n * pts * 2 * sizeof(float)));
+  else msda_l2box(A->attw + (long)qa * pts, (unsigned)(n * pts * sizeof(float)));
+}
+
 static void msda_run_hvx(const msda_args_t* A, const msda_lanes_t* LN, int q0, int q1) {
   const int NV = A->NV, Q = A->Q, NO = A->NO, M = A->M, per_head = NO * A->L * A->P, np = M * per_head;
   int32_t to[2][4][MSDA_VPTS] __attribute__((aligned(128)));
   int32_t tw[2][4][MSDA_VPTS] __attribute__((aligned(128)));
   HVX_Vector part[MSDA_HVX_MAX_M];
-  const int u8 = A->vdtype == MSDA_U8, LP = A->L * A->P;
+  const int u8 = A->vdtype == MSDA_U8, LP = A->L * A->P, win = msda_win(A);
+  const int C4 = A->M * A->D * 4, WC4 = A->W[0] * C4;
   const char* vbase = u8 ? (const char*)A->value_u8 : (const char*)A->value;
   int bmap[MSDA_MAX_NV];
   int cq = q0, ck = 0, cn = 0, cmaps[MSDA_MAX_NV];
   float cinv = 1.0f;
 #define MSDA_ITEM_START()                                          \
   do {                                                             \
+    msda_pf(A, LN, cq, q0, q1);                                    \
     cn = 0;                                                        \
     for (int v = 0; v < NV; v++)                                   \
       if (!A->vis || A->vis[(long)v * Q + cq]) cmaps[cn++] = v;    \
@@ -383,12 +421,46 @@ static void msda_run_hvx(const msda_args_t* A, const msda_lanes_t* LN, int q0, i
         const int32_t *w0 = tw[buf][0], *w1 = tw[buf][1], *w2 = tw[buf][2], *w3 = tw[buf][3];
         if (!u8) {
           HVX_Vector a0 = part[h], a1 = Q6_V_vzero(), a2 = Q6_V_vzero(), a3 = Q6_V_vzero();
-          for (int g = h * per_head; g < (h + 1) * per_head; g++) {
-            MSDA_TAP(a0, vbase + o0[g], w0[g]);
-            MSDA_TAP(a1, vbase + o1[g], w1[g]);
-            MSDA_TAP(a2, vbase + o2[g], w2[g]);
-            MSDA_TAP(a3, vbase + o3[g], w3[g]);
-          }
+          if (win && !(per_head & 1))
+            /* the one-window tables (msda_win): an offset per point, the other three taps' rows a column / a row away */
+            for (int g = h * per_head; g < (h + 1) * per_head; g += 2) {
+              const long long p0 = *(const long long*)(o0 + g);
+              const long long q0 = *(const long long*)(w0 + g), q1 = *(const long long*)(w1 + g);
+              const long long q2 = *(const long long*)(w2 + g), q3 = *(const long long*)(w3 + g);
+              const char *r0 = vbase + (int)p0, *s0 = vbase + (int)(p0 >> 32);
+              MSDA_TAP(a0, r0, (int)q0);
+              MSDA_TAP(a1, r0 + C4, (int)q1);
+              MSDA_TAP(a2, r0 + WC4, (int)q2);
+              MSDA_TAP(a3, r0 + WC4 + C4, (int)q3);
+              MSDA_TAP(a0, s0, (int)(q0 >> 32));
+              MSDA_TAP(a1, s0 + C4, (int)(q1 >> 32));
+              MSDA_TAP(a2, s0 + WC4, (int)(q2 >> 32));
+              MSDA_TAP(a3, s0 + WC4 + C4, (int)(q3 >> 32));
+            }
+          else if (!(per_head & 1))
+            /* two points' offsets and weights per 64-bit load: the tables are HVX-written, and every scalar read of them
+               costs (hexagon-sim, BEVFormer's TSA / SCA shapes: 89 -> 82, 97 -> 90 cycles per point) */
+            for (int g = h * per_head; g < (h + 1) * per_head; g += 2) {
+              const long long p0 = *(const long long*)(o0 + g), p1 = *(const long long*)(o1 + g);
+              const long long p2 = *(const long long*)(o2 + g), p3 = *(const long long*)(o3 + g);
+              const long long q0 = *(const long long*)(w0 + g), q1 = *(const long long*)(w1 + g);
+              const long long q2 = *(const long long*)(w2 + g), q3 = *(const long long*)(w3 + g);
+              MSDA_TAP(a0, vbase + (int)p0, (int)q0);
+              MSDA_TAP(a1, vbase + (int)p1, (int)q1);
+              MSDA_TAP(a2, vbase + (int)p2, (int)q2);
+              MSDA_TAP(a3, vbase + (int)p3, (int)q3);
+              MSDA_TAP(a0, vbase + (int)(p0 >> 32), (int)(q0 >> 32));
+              MSDA_TAP(a1, vbase + (int)(p1 >> 32), (int)(q1 >> 32));
+              MSDA_TAP(a2, vbase + (int)(p2 >> 32), (int)(q2 >> 32));
+              MSDA_TAP(a3, vbase + (int)(p3 >> 32), (int)(q3 >> 32));
+            }
+          else
+            for (int g = h * per_head; g < (h + 1) * per_head; g++) {
+              MSDA_TAP(a0, vbase + o0[g], w0[g]);
+              MSDA_TAP(a1, vbase + o1[g], w1[g]);
+              MSDA_TAP(a2, vbase + o2[g], w2[g]);
+              MSDA_TAP(a3, vbase + o3[g], w3[g]);
+            }
           part[h] = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(a0, a1), Q6_Vqf32_vadd_Vqf32Vqf32(a2, a3));
           continue;
         }
