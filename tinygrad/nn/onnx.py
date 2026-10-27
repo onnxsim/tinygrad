@@ -7,7 +7,7 @@ from tinygrad.mixin.op import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, TC_OPT
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, _to_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
-from tinygrad.uop.ops import sint, _broadcast_shape, UOp
+from tinygrad.uop.ops import sint, _broadcast_shape, UOp, Ops
 
 # ***** protobuf definitions ******
 class WireType(enum.IntEnum):
@@ -1118,7 +1118,9 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     def pad16(t:Tensor, rows:int, cols:int) -> Tensor:
       t = t.half().contiguous()
       if not (rows or cols): return t
-      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64)):
+      # (and a matrix of a few rows padded to two tiles, BEVFormer's one-row can_bus MLP: generated, its row select stayed per lane,
+      # 0.68 ms for a 1 x 128 -> 64 x 128 pad on the V69)
+      if dsp and (getenv("HAND_ROWCOPY", 0) or (cols and t.shape[-1] >= 64 and t.shape[-1] % 64) or (rows and t.shape[-2] < 32)):
         return _rowcopy_dsp(t, t.shape[-2] + rows, t.shape[-1] + cols)
       return t.pad(((0, 0),) * (t.ndim - 2) + ((0, rows), (0, cols))).contiguous()
     # P @ V after softmax(q @ k^T) with a head size of 32, on the DSP: generated kernels head by head (HMX_ATTN=3, the default:
@@ -1129,7 +1131,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       return _hmx_attn_dsp(ent[1], ent[2], pad16(b, r32(K), 0), ent[3], ent[4])
     if (ent := _fp16_in.get(id(a))) is not None and ent[0] is a and ent[1].shape[-2:] == (M + _hmx_pad_rows(M), K + r32(K)): a16 = ent[1]
     else: a16 = pad16(a, _hmx_pad_rows(M), r32(K))
-    bh = b.half().contiguous()
+    # a weight the graph rewrite stored in fp16 (examples/dsp_graph_onnx.py fp16_matmul_weights: Cast(fp16 initializer) -> float)
+    # is taken as it is: cast back at run time, every call was a copy kernel (BEVFormer's decoder: 58 of them, ~1 ms)
+    hb = b.uop.src[0] if b.uop.op is Ops.CAST and b.dtype == dtypes.float32 and b.uop.src[0].dtype == dtypes.half else None
+    bh = Tensor(hb, device=b.device) if hb is not None else b.half().contiguous()
     b16 = pad16(bh, r32(K), r32(N))
     y = a16.matmul(b16, dtype=dtypes.half).contiguous()
     if y.shape[-2:] == (M, N): return y.float()
