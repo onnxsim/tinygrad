@@ -47,11 +47,13 @@ add_tags = PatternMatcher([
   # no tag on copies that are assigned via STORE+AFTER — merge COPY tag into AFTER
   (UPat(Ops.AFTER, src=(UPat(), UPat(Ops.STORE, src=(UPat(name="dest"), UPat(Ops.COPY, name="c")))), name="a"),
    lambda a,c,dest: a.replace(src=(a.src[0], a.src[1].replace(src=(dest, c.rtag(())))), tag=a.tag+c.tag) if a.tag and c.tag else None),
-  (UPat((Ops.CONTIGUOUS, Ops.AFTER), name="x"), tag_uop),
+  (UPat((Ops.CONTIGUOUS, Ops.AFTER), name="x"), lambda ctx,x: None if x.staged_axes else tag_uop(ctx, x)),
   (UPat(GroupOp.All, name="x"), lambda ctx,x: tag_uop(ctx,x) if x in ctx.bases else None),
 ])
 
 def replace_contig_with_store_after(u:UOp):
+  # a staged CONTIGUOUS (Tensor.stage) is a register table inside its consumer's kernel, not a buffer
+  if u.staged_axes: return None
   # can't allocate a buffer for a virtual value
   if u.is_virtual: return None
   # if size is 0, remove the contig
@@ -75,6 +77,7 @@ def _make_buffer_view(src:UOp) -> UOp|None:
 
 def contiguous_mops_to_view(ctx:AllocCtx, c:UOp, src:UOp):
   """MOPS(BUFFER) → SHRINK when movement ops collapse to a contiguous range."""
+  if c.staged_axes: return None
   buf = src.base
   while buf.op is Ops.BITCAST: buf = buf.src[0].base
   if buf.op not in {Ops.BUFFER, Ops.UNSHARD}: return None

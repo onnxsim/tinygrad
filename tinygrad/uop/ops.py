@@ -919,6 +919,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   def contiguous_view_offset(self) -> int|None: return None if (view := self.contiguous_view()) is None else view[1]
 
+  @property
+  def staged_axes(self) -> int:
+    """n for a CONTIGUOUS made by .stage(n): its last n axes become a register table computed inside the consumer's kernel, once per
+    iteration of the consumer's ranges on the other axes (two loop nests joined by an on-chip buffer), not a buffer of its own"""
+    a = self.arg
+    return a[1] if self.op is Ops.CONTIGUOUS and isinstance(a, tuple) and len(a) == 2 and a[0] == "stage" else 0
+
   def has_buffer_identity(self, after_ok=False):
     """Check if this UOp has a concrete buffer identity in the graph (RESHAPE/UNSHARD -> BUFFER chain)."""
     # TODO: this is confusing because UOp.variable('v', 0, 1, dtypes.weakfloat) is True for jit to work, but it doesn't have a buffer

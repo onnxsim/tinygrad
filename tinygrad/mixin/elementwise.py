@@ -68,6 +68,15 @@ class ElementwiseMixin(CreationMixin):
     if uop.op is Ops.CONTIGUOUS or self.device is None or uop.has_buffer_identity(): return self._wrap_uop(uop)
     return self._wrap_uop(uop.alu(Ops.CONTIGUOUS, **kwargs))
 
+  def stage(self, n:int) -> Self:
+    """
+    Computes the last n axes into a register table inside the consumer's kernel, once per iteration of the consumer's loops over the
+    other axes: two loop nests joined by an on-chip buffer (like GPU shared memory), each with its own vectorization. The table's
+    innermost axes are vector lanes (up to STAGE_LANES, 128), the rest loops around them; keep it small (a few HVX registers).
+    """
+    assert 0 < n <= len(self.shape), f"stage: {n} axes of a {len(self.shape)}-d tensor"
+    return self._wrap_uop(self._uop.alu(Ops.CONTIGUOUS, arg=("stage", n)))
+
   def contiguous_backward(self) -> Self:
     """
     Inserts a contiguous operation in the backward pass.

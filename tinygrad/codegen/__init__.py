@@ -1,7 +1,8 @@
 from dataclasses import replace, dataclass
 import itertools, functools
+from typing import Iterator
 from tinygrad.helpers import getenv, DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
-from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic, prod
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
 from tinygrad.uop.render import pyrender
@@ -293,6 +294,36 @@ pm_add_local_buffers = PatternMatcher([
   (UPat(Ops.STAGE, name="x"), add_local_buffer),
 ])+pm_mops
 
+STAGE_SLOT = 1 << 16  # register tables' (Tensor.stage) buffer slots start here
+def _staged_buf(u:UOp) -> bool:
+  while u.op in (Ops.SHRINK, Ops.INDEX, Ops.CAST, Ops.AFTER): u = u.src[0]
+  return u.op is Ops.BUFFER and u.addrspace is AddrSpace.REG and u.arg.slot >= STAGE_SLOT
+
+def add_reg_stage(ctx:tuple[Iterator[int], dict], idx:UOp, x:UOp):
+  # a register table (Tensor.stage) before the expander: its loops, fully upcast, become vector stores, and the reduces see a STORE /
+  # END (their accumulators open outside it), not a STAGE. Slots apart from the accumulators' (ReduceContext.acc_num). The consumer's
+  # upcast / unrolled ranges the table depends on (a vectorized output axis) are lanes, not loops: one table per lane of them
+  if x.arg.addrspace is not AddrSpace.REG: return None
+  if x not in ctx[1]:
+    own = sorted(UOp.sink(*x.src[1:]).ranges, key=lambda r: r.arg)
+    ext = sorted([r for r in x.src[0].ranges if r not in own and r.arg[-1] in (AxisType.UPCAST, AxisType.UNROLL)], key=lambda r: r.arg)
+    n, lane = prod(x.max_shape), UOp.const(0, dtypes.weakint)
+    for r in ext: lane = lane * r.src[0] + r
+    buf = UOp.placeholder((n * prod([r.src[0].arg for r in ext]),), x.dtype, slot=next(ctx[0]), addrspace=AddrSpace.REG)
+    # its innermost axes upcast up to STAGE_LANES (128) lanes, the rest loops around them: what doesn't depend on those loops is
+    # computed once, outside (the generated MSDA's floors per point, not per tap: 256 lanes in one go spilled HVX registers; the
+    # decoder's 4 x 32 in one go: 0.58 -> 0.50 ms a call vs as a loop around 32 lanes)
+    zero = {r:r.const_like(0) for r in own}
+    def stride(r:UOp) -> int: return x.src[1].substitute({**zero, r:r.const_like(1)}).simplify().arg
+    up, lanes = {}, 1
+    for r in sorted(own, key=stride):
+      if lanes * r.src[0].arg > getenv("STAGE_LANES", 128) and lanes > 1: break
+      up[r], lanes = r.replace(arg=r.arg[:-1]+(AxisType.UPCAST,)), lanes * r.src[0].arg
+    ctx[1][x] = (buf.after(buf.index(lane * n + x.src[1]).store(x.src[0]).end(*own).substitute(up)), lane * n)
+  st, base = ctx[1][x]
+  return idx.replace(src=(st, base + idx.src[1])+idx.src[2:])
+pm_add_reg_stages = PatternMatcher([(UPat(Ops.INDEX, src=(UPat(Ops.STAGE, name="x"),), allow_any_len=True, name="idx"), add_reg_stage)])
+
 # float ALUs need a float operand
 # make that cast explicit before the decomps, which expand SIN/LOG2/EXP2 into float polynomials and assert a float operand
 pm_cast_float_alu = PatternMatcher([
@@ -361,6 +392,10 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # ** expander (expand_rewrite) **
   # reduce_unparented: a REDUCE whose src folded to a CONST (e.g. x*0) has no parented ranges, collapse it before the expander
   sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_reduce_unparented, name="postopt symbolic")
+
+  # register tables (Tensor.stage) to stores before the expander
+  if any(u.op is Ops.STAGE and u.arg.addrspace is AddrSpace.REG for u in sink.backward_slice):
+    sink = graph_rewrite(sink, pm_add_reg_stages, ctx=(itertools.count(STAGE_SLOT), {}), name="add register stages")
 
   # expand
   sink = graph_rewrite(sink, expander2, ctx=build_range_map(sink, ren.target.device == "DSP"), name="expander")
@@ -462,11 +497,7 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
     newlst.extend(ret[1])
   return newlst
 
-_SINKABLE = GroupOp.ALU | {Ops.LOAD, Ops.CAST, Ops.BITCAST, Ops.INDEX, Ops.STACK, Ops.SHRINK, Ops.CUSTOMI}
-def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
-  """move the values only an IF block uses into it: from the IF's own scope (after the innermost RANGE / IF still open at it), pure
-  ops and loads -- a load only when no store lies between it and the IF. The IF of a gated store (GATED_REDUCE) then skips its
-  value's whole computation, not just the store"""
+def merge_ifs(lst:list[UOp]) -> list[UOp]:
   # adjacent blocks under the same gate become one (a gated vector store split into per-lane stores: one IF each)
   merged, alias = [], {}
   for u in lst:
@@ -474,11 +505,18 @@ def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
       alias[u] = merged.pop().src[0]
       continue
     merged.append(u)
-  if alias:
-    def opener(i:UOp) -> UOp:
-      while i in alias: i = alias[i]
-      return i
-    lst = [UOp(Ops.ENDIF, src=(opener(u.src[0]),)) if u.op is Ops.ENDIF else u for u in merged]
+  if not alias: return lst
+  def opener(i:UOp) -> UOp:
+    while i in alias: i = alias[i]
+    return i
+  return [UOp(Ops.ENDIF, src=(opener(u.src[0]),)) if u.op is Ops.ENDIF else u for u in merged]
+
+_SINKABLE = GroupOp.ALU | {Ops.LOAD, Ops.CAST, Ops.BITCAST, Ops.INDEX, Ops.STACK, Ops.SHRINK, Ops.CUSTOMI}
+def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
+  """move the values only an IF block uses into it: from the IF's own scope (after the innermost RANGE / IF still open at it), pure
+  ops and loads -- a load only when no store lies between it and the IF. The IF of a gated store (GATED_REDUCE) then skips its
+  value's whole computation, not just the store"""
+  lst = merge_ifs(lst)
   users: dict[UOp, list[UOp]] = {}
   for u in lst:
     for x in u.src: users.setdefault(x, []).append(u)
@@ -502,8 +540,29 @@ def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
       inside = set(out[i + 1:j])
       move: list[int] = []
       store_after = False
-      for k in range(i - 1, s, -1):
+      k = i
+      while (k:=k - 1) > s:
         u = out[k]
+        # a register table (Tensor.stage) only read inside: its stores move in too (and are no barrier to moving loads), and so does
+        # the loop that builds it (a table's loop axes: STAGE_LANES) when it does nothing else
+        if u.op in (Ops.STORE, Ops.AFTER) and _staged_buf(u.src[0]) and users.get(u) and all(x in inside for x in users[u]):
+          move.append(k)
+          inside.add(u)
+          continue
+        if u.op is Ops.END:
+          r0, depth = k - 1, 0
+          while not (out[r0].op is Ops.RANGE and depth == 0):
+            depth += out[r0].op is Ops.END
+            depth -= out[r0].op is Ops.RANGE
+            r0 -= 1
+          blk = out[r0:k + 1]
+          if r0 > s and any(x.op is Ops.STORE for x in blk) and \
+             all(x.op is not Ops.IF and (x.op is not Ops.STORE or _staged_buf(x.src[0])) for x in blk) and \
+             all(y in inside or y in blk for x in blk for y in users.get(x, [])):
+            move += range(r0, k + 1)
+            inside.update(blk)
+            k = r0
+            continue
         if u.op is Ops.STORE: store_after = True
         if u.op not in _SINKABLE or (u.op is Ops.LOAD and store_after) or not users.get(u): continue
         if all(x in inside for x in users[u]):
@@ -519,10 +578,44 @@ def sink_into_ifs(lst:list[UOp]) -> list[UOp]:
     if not moved_any: break
   return lst
 
+def _block_end(lst:list[UOp], i:int) -> int:
+  # the index of the END / ENDIF closing the RANGE / IF at i
+  j, depth = i + 1, 0
+  while not (lst[j].op in (Ops.END, Ops.ENDIF) and depth == 0):
+    depth += lst[j].op in (Ops.IF, Ops.RANGE)
+    depth -= lst[j].op in (Ops.ENDIF, Ops.END)
+    j += 1
+  return j
+
+def hoist_ifs(lst:list[UOp]) -> list[UOp]:
+  """an IF whose gate is known before the loop around it, in a loop that does nothing outside the IF (no store, no inner block),
+  goes around the loop: a gated reduce over a register table (Tensor.stage) then skips the whole table walk, and sink_into_ifs can
+  move the table's computation in too"""
+  lst = merge_ifs(lst)
+  for _ in range(len(lst)):
+    pos = {u:k for k,u in enumerate(lst)}
+    for i,u in enumerate(lst):
+      if u.op is not Ops.IF: continue
+      j, a, depth = _block_end(lst, i), i - 1, 0
+      while a >= 0 and not (lst[a].op in (Ops.RANGE, Ops.IF) and depth == 0):
+        depth += lst[a].op in (Ops.END, Ops.ENDIF)
+        depth -= lst[a].op in (Ops.RANGE, Ops.IF)
+        a -= 1
+      if a < 0 or lst[a].op is not Ops.RANGE or pos.get(u.src[0], len(lst)) >= a: continue
+      e = _block_end(lst, a)
+      if any(x.op in (Ops.STORE, Ops.RANGE, Ops.IF, Ops.END, Ops.ENDIF) for x in lst[a+1:i] + lst[j+1:e]): continue
+      lst = lst[:a] + [u] + lst[a:i] + lst[i+1:j] + lst[j+1:e+1] + [lst[j]] + lst[e+1:]
+      break
+    else: break
+  return lst
+
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
   if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
   lst = line_rewrite(linearize(sink), pm_linearize_cleanups)
-  if getenv("GATED_REDUCE", 1) and any(u.op is Ops.IF for u in lst): lst = sink_into_ifs(lst)
+  if getenv("GATED_REDUCE", 1) and any(u.op is Ops.IF for u in lst):
+    # (IF_HOIST=1 for any kernel; on by itself in one with register tables)
+    if getenv("IF_HOIST", 0) or any(u.op is Ops.BUFFER and _staged_buf(u) for u in lst): lst = hoist_ifs(lst)
+    lst = sink_into_ifs(lst)
   # isa renderers need to allocate registers
   if isinstance(ctx, ISARenderer):
     if ctx.pre_regalloc_matcher is not None: lst = line_rewrite(lst, ctx.pre_regalloc_matcher, PreRegAllocContext())

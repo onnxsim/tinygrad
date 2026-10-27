@@ -1823,6 +1823,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # grid_sample form, map by map: value map v as (M, D, H, W), grid (M, Q, P, 2) = 2 * (ref + off / (W, H)) - 1
     refp = Tensor.stack(*[ref[:, :, p % R] for p in range(P)], dim=2)                                          # (NVR, Q, P, 2)
     wh = Tensor([float(W), float(H)], dtype=value.dtype)
+    if getenv("MSDA_STAGE", 0): return _msda_staged(value, refp, off, attw, vis, H, W)
     if vis is not None and getenv("MSDA_GATED", 1):
       # with a visibility mask: every map in one GridSample (maps x heads as its batch) and each point's term as
       # where(visible, term, 0), summed over maps and points -- the gate depends on (map, query) only, so the code generator
@@ -1892,6 +1893,58 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     if vis is None: return per_map.mean(0)
     vf = vis.cast(value.dtype).reshape(NV, Q, 1)
     return (per_map * vf).sum(0) / vf.sum(0).maximum(1.0)
+
+  def _msda_staged(value:Tensor, refp:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:
+    # the hand kernel's structure from one kernel, two loop nests joined by register tables (Tensor.stage): per (map, query, head) the
+    # 4 taps x P points' element offsets and weights as vectors (lanes = taps x points), then per tap a scalar read of both and a
+    # channel-vector multiply-add of its value row. The address math without compares / selects (no vector form here), and every
+    # integer decision (floor, bounds, row) in int lanes: qf32 float math is off by an ulp at times (an "integer" 8 came out 8.000001,
+    # hexagon-sim), which moved rows when they were floats (MSDA_ARITH's form staged: FAIL on the phone, enc1 cos 0.993)
+    NV, S, C = value.shape
+    Q, M, NO, P, _ = off.shape
+    NVR, D = refp.shape[0], C // M
+    offv = off.permute(2, 0, 1, 3, 4) if NO > 1 else off[:, :, 0].reshape(1, Q, M, P, 2)                        # (NV|1, Q, M, P, 2)
+    rp = refp.reshape(NVR, Q, 1, 1, P, 2)
+    x = rp[..., 0] * W + offv[..., 0].reshape(-1, Q, M, 1, P) - 0.5                                             # (NV, Q, M, 1, P)
+    y = rp[..., 1] * H + offv[..., 1].reshape(-1, Q, M, 1, P) - 0.5
+    def flr(t:Tensor) -> tuple[Tensor, Tensor]:
+      # (floor as int32, t - floor): an integer n near t from the bits of t + 1.5 2^23 (as vectors forced to IEEE sf first: a qf32
+      # sum isn't rounded; the rounding may be one off), its fraction t - n, and n - 1 where that is negative -- the sign bit. The OR is
+      # a no-op (that exponent is already set) the simplifier can't see, so the bitcasts don't fold away
+      bits = (t + 12582912.0).bitcast(dtypes.int32)
+      f = t - ((bits | 0x4B000000).bitcast(t.dtype) - 12582912.0)
+      neg = f.bitcast(dtypes.uint32) >> 31
+      return bits - 0x4B400000 - neg.bitcast(dtypes.int32), f + (neg * 0x3F800000).bitcast(t.dtype)
+    (x0, fx), (y0, fy) = flr(x), flr(y)
+    # tap t = (dx, dy) = (t & 1, t >> 1) on its own axis: one expression for all four, so the taps are lanes too
+    tx, ty = Tensor([0, 1, 0, 1], dtype=dtypes.int32).reshape(1, 1, 1, 4, 1), Tensor([0, 0, 1, 1], dtype=dtypes.int32).reshape(1, 1, 1, 4, 1)
+    txf, tyf = Tensor([0.0, 1.0, 0.0, 1.0], dtype=x.dtype).reshape(1, 1, 1, 4, 1), Tensor([0.0, 0.0, 1.0, 1.0], dtype=x.dtype).reshape(1, 1, 1, 4, 1)
+    xt, yt = x0 + tx, y0 + ty                                                                                   # (NV, Q, M, 4, P) int
+    # inside both bounds: 0 / 1 in int, to 0.0 / 1.0 through the bits
+    ok = (xt + 1).maximum(0).minimum(1) * (W - xt).maximum(0).minimum(1) * (yt + 1).maximum(0).minimum(1) * (H - yt).maximum(0).minimum(1)
+    a = (attw.permute(2, 0, 1, 3) if NO > 1 else attw[:, :, 0].reshape(1, Q, M, P)).reshape(-1, Q, M, 1, P)
+    w = ((1 - txf) + (2 * txf - 1) * fx) * ((1 - tyf) + (2 * tyf - 1) * fy) * (ok * 0x3F800000).bitcast(x.dtype) * a.cast(x.dtype)
+    row = yt.maximum(0).minimum(H - 1) * W + xt.maximum(0).minimum(W - 1) + (Tensor.arange(NV, dtype=dtypes.int32) * (H * W)).reshape(NV, 1, 1, 1, 1)
+    el = row * M + Tensor.arange(M, dtype=dtypes.int32).reshape(1, 1, M, 1, 1)      # (NV, Q, M, 4, P): in rows of D (aligned loads)
+    el, w = el.expand(NV, Q, M, 4, P), w.expand(NV, Q, M, 4, P)
+    flat = value.reshape(-1).contiguous()
+    def taps(el:Tensor, w:Tensor) -> Tensor:
+      rows = Tensor(flat.uop.index((el.unsqueeze(-1) * D + Tensor.arange(D, dtype=dtypes.int32)).reshape(-1).uop)).reshape(*el.shape, D)
+      return rows * w.unsqueeze(-1).cast(value.dtype)
+    # without a mask every map is summed: the maps go in the table too (BEVFormer's temporal attention: 2 maps x 4 taps x 4 points,
+    # one vector)
+    # MSDA_STAGE=2: the heads in the table too, built once per (map, query) for all heads (their accumulators upcast): the tap axis
+    # outermost, a loop around (heads x points) lanes (STAGE_LANES)
+    def staged(t:Tensor, n:int) -> Tensor:
+      if getenv("MSDA_STAGE", 1) < 2: return t.stage(n)
+      lead, tap = t.ndim - n - 1, t.ndim - 2                                         # the head axis, the tap axis
+      order = list(range(lead)) + [tap, lead] + [a for a in range(lead + 1, t.ndim) if a != tap]
+      return t.permute(order).stage(n + 1).permute(argsort(order))
+    if vis is None:
+      el, w = el.permute(1, 2, 0, 3, 4), w.permute(1, 2, 0, 3, 4)                                                # (Q, M, NV, 4, P)
+      return taps(staged(el, 3), staged(w, 3)).sum((2, 3, 4)).reshape(Q, C) * (1.0 / NV)
+    tot = (vis != 0).reshape(NV, Q, 1, 1, 1, 1).where(taps(staged(el, 2), staged(w, 2)), 0.0).sum((0, 3, 4))      # (Q, M, D)
+    return tot.reshape(Q, C) / vis.cast(value.dtype).sum(0).maximum(1.0).reshape(Q, 1)
 
   def _msda_dsp(value:Tensor, ref:Tensor, off:Tensor, attw:Tensor, vis:Tensor|None, H:int, W:int) -> Tensor:
     from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, GroupOp

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math, itertools
 from typing import cast
+from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags
 from tinygrad.uop.ops import axis_letters, axis_colors, axis_to_pos
 from tinygrad.device import Buffer
@@ -33,13 +34,21 @@ class Scheduler:
     self.ast, self.ren = ast, ren
     self.dont_use_locals = self.ast.arg.dont_use_locals if self.ast.arg is not None else False
     self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
-    self.opt_range = count(start=max([x.arg[0] for x in self.rngs], default=0)+1)
+    self.opt_range = count(start=max([x.arg[0] for x in self.rngs] + [x.arg[0] for x in self.staged_rngs], default=0)+1)
 
   @property
   def rngs(self):
     # always in order by axistype. void RANGEs are loops, not opt axes. the DEVICE axis is launched, not an opt axis
+    # a register table's loops (Tensor.stage) are its own, upcast whole when it is added (codegen add_reg_stage)
+    staged = self.staged_rngs
     return sorted([u for u in self.ast.backward_slice if u.op is Ops.RANGE and u.dtype is not dtypes.void and u.vmax > 0
-                   and u.arg[-1] is not AxisType.DEVICE], key=lambda x: (axis_to_pos[x.arg[-1]],) + x.arg[0:-1])
+                   and u.arg[-1] is not AxisType.DEVICE and u not in staged], key=lambda x: (axis_to_pos[x.arg[-1]],) + x.arg[0:-1])
+  @property
+  def staged_rngs(self) -> set[UOp]:
+    if getattr(self, "_staged", (None,))[0] is not self.ast:
+      self._staged = (self.ast, {r for u in self.ast.backward_slice if u.op is Ops.STAGE and u.arg.addrspace is AddrSpace.REG
+                                 for r in UOp.sink(*u.src[1:]).ranges})
+    return self._staged[1]
   @property
   def shape_len(self) -> int: return len(self.rngs)
   @property
@@ -375,6 +384,6 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
-    if not any(u.op is Ops.STAGE for u in ast.backward_slice):
+    if not any(u.op is Ops.STAGE and u.arg.addrspace is not AddrSpace.REG for u in ast.backward_slice):
       k = hand_coded_optimizations(k)
   return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
