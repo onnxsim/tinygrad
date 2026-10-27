@@ -78,7 +78,7 @@ def _vtcm_access_ok(src:str, j:int) -> bool:
   name, hmx, seen = m.group(0), "__hmx_" in body, False
   for o in re.finditer(rf"\b{name}\b", body):
     pre = body[max(0, o.start() - 48):o.start()]
-    if pre.endswith("align_value(128))) ") or pre.endswith("(char*)("): continue  # the parameter, a prefetch
+    if pre.endswith(("align_value(128))) ", "(char*)(", "__tg_l2box((const char*)(")): continue  # the parameter, a prefetch
     seen = True
     if (v := _VEC_ACCESS.search(pre)) is not None:
       if _ELEM.get(v.group(1), 0) * int(v.group(2)) < 128: return False
@@ -238,8 +238,10 @@ def emit(outdir, calls, bufs, inputs:list, output, state:list|None=None) -> dict
       text = re.sub(rf"\bvoid\s+{re.escape(m.group(1))}\(", f"void {kn}(", body, count=1)
       if vg.get(src): text = vg[src].replace("kK", kn)
       if vset:
-        for j in vset: text = re.sub(rf"__builtin_HEXAGON_Y2_dcfetch\(\(char\*\)(\(?)data{j}_", rf"__tg_nofetch((char*)\1data{j}_", text)
-        text = "#define __tg_nofetch(p) ((void)0)\n" + text
+        for j in vset:
+          text = re.sub(rf"__builtin_HEXAGON_Y2_dcfetch\(\(char\*\)(\(?)data{j}_", rf"__tg_nofetch((char*)\1data{j}_", text)
+          text = text.replace(f"__tg_l2box((const char*)(data{j}_", f"__tg_nobox((const char*)(data{j}_")  # L2 stream boxes too
+        text = "#define __tg_nofetch(p) ((void)0)\n#define __tg_nobox(...) ((void)0)\n" + text
       (o / f"{kn}.c").write_text(text)
     args = ", ".join(f"R[{rid[id(base[b])]}]+{views[b].offset}" for b in ids)
     if vg.get(src):
