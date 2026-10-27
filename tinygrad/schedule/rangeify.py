@@ -580,8 +580,8 @@ def _plain_end(after:UOp) -> tuple[UOp, UOp, UOp]|None:
   if e.ranges or not all(r.op is Ops.RANGE for r in e.src[1:]): return None
   # and no masked values (WHERE: padding): the masked select of the extra store's cast went lane by lane on the DSP (BEVFormer's
   # attention operands, E_2_960_4_32 + its fp16 copy: 5.6 ms per call on the V69; an encoder pad 67 us -> 8.2 ms)
-  if any(u.op in {Ops.REDUCE, Ops.CUSTOM, Ops.CUSTOMI, Ops.STAGE, Ops.CALL, Ops.WHERE}
-         for u in st.src[1].toposort(gate=lambda u: u.op is not Ops.AFTER)): return None
+  if any(u.op in {Ops.REDUCE, Ops.CUSTOM, Ops.CUSTOMI, Ops.STAGE, Ops.CALL, Ops.WHERE} or (u.op is Ops.INDEX and u.src[0].device != after.device)
+         for u in st.src[1].toposort(gate=lambda u: u.op is not Ops.AFTER)): return None  # (a copy from another device is a store too)
   return e, ix.src[1], st.src[1]
 
 def _unit_reads(ea:UOp, ia:UOp, v:UOp) -> bool:

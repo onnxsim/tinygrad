@@ -80,6 +80,13 @@ class TestMultiOutput(unittest.TestCase):
       np.testing.assert_allclose(w.numpy(), (np.pad(self.xn, ((0, 0), (0, 4))) + 1) * 2, rtol=1e-5)
       np.testing.assert_allclose(h.numpy(), (self.xn.T * 2).astype(np.float16), rtol=1e-3)
 
+  def test_copy_not_a_producer(self):
+    # a copy from another device (NPY -> CPU) is a store too: a consumer merged into it read across devices
+    with Context(MULTIOUT=1, SCACHE=0):
+      k = Tensor(self.xn[0]) + Tensor(self.xn[1])
+      _kernels(k)
+      np.testing.assert_allclose(k.numpy(), self.xn[0] + self.xn[1])
+
 class TestMultiOutputDSPRender(unittest.TestCase):
   def test_cast_store_stays_vectorized(self):
     # a LayerNorm-style producer with its fp16 copy merged in (BEVFormer's GEMM_FP16 A operands): both stores whole HVX vectors
