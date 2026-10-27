@@ -342,8 +342,9 @@ class TestDSPHmx(unittest.TestCase):
     sb[:64 * 96].reshape(64, 96).assign(Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half))
     kernel = dsp_source(sb, hm).split("__attribute__((noinline)) void", 1)[1]
     # (row tile Lidx1, column tile Lidx2 of 2 x 3: the place linear in the loops, the VTCM test once per call)
-    self.assertIn("__hmx_rawo = __hmx_vt(data0_7144, 12288u);", kernel)
-    self.assertIn("__hmx_store_rawo((__fp16*)data0_7144 + 0+(Lidx1)*1024+(Lidx2)*2048);", kernel)
+    self.assertIn("const int __hmx_rv = __hmx_vt(data0_7144, 12288u);", kernel)
+    self.assertIn("__hmx_store_rawv((__fp16*)data0_7144 + 0+(Lidx1)*1024+(Lidx2)*2048, __hmx_rv);", kernel)
+    self.assertEqual(kernel.count("__hmx_begin();"), 1)  # once per call, not per output tile
     self.assertNotIn("__hmx_out2(", kernel)
     eb = Tensor.empty(64 * 96 + 1000, dtype=dtypes.half)
     pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb[:64 * 96].reshape(64, 96), dtype=dtypes.half)
@@ -354,6 +355,12 @@ class TestDSPHmx(unittest.TestCase):
     # A (one row of tiles, packed on the first output tile) L2-prefetched there; the output tile converted after the next one's
     # load pair (HMX_DEFER)
     self.assertRegex(kernel, r"if \(\(Ridx0\)==0\) __hmx_prefetch_rows\(")
+    # two N tiles: computed as a pair from adjacent K panels and converted to full rows together (HMX_OUTPAIR_RAW)
+    eb = Tensor.empty(64 * 128 + 1000, dtype=dtypes.half)
+    pv = Tensor.empty(64, 64, dtype=dtypes.half).matmul(eb[:64 * 128].reshape(64, 128), dtype=dtypes.half)
+    kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
+    self.assertRegex(kernel, r"__hmx_rawb\+\(Lidx\d\)\*2048\+2048, 2\);")
+    self.assertIn("__hmx_pend(2, _p, _q);", kernel)
     self.assertIn("__hmx_pend(1, _p, 0);" if ops_dsp.HMX_DEFER else "__hmx_store();", kernel)
 
   def test_raw_lin(self):
