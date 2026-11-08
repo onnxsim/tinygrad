@@ -478,9 +478,11 @@ def build(outdir, skel_arch:str="v68", kernel_arch:str="v65") -> tuple[pathlib.P
   run([str(sdk / "ipc/fastrpc/qaic/Ubuntu/qaic"), "-I", str(sdk / "incs"), "-I", str(sdk / "incs/stddef"), "tg_graph.idl"])
   hc = [str(tc / "bin/hexagon-clang"), "-c", "-O2", "-fPIC", f"-mcpu=hexagon{skel_arch}"]
   run([*hc, *inc, "-o", "skel_rpc.o", "tg_graph_skel.c"])
+  # hidden: each program's own k<n> and tg_graph_open/load/run/close must not be exported. Two programs loaded into one worker
+  # otherwise share those names and the loader binds calls to whichever was loaded first (outputs of the first corrupted)
   run([*hc, f"-mhvx={skel_arch}", "-mhvx-length=128b", *(["-mhmx"] if hmx else []), "-Wno-deprecated-non-prototype", *inc, *qurt,
-       "-o", "impl.o", "skel.c"])
-  ks = [k[:-2] + ".c" for k in (compile_kernels(o, kernel_arch, cc=str(tc / "bin/hexagon-clang"), extra=("-mhmx",) if hmx else ())
+       "-fvisibility=hidden", "-o", "impl.o", "skel.c"])
+  ks = [k[:-2] + ".c" for k in (compile_kernels(o, kernel_arch, cc=str(tc / "bin/hexagon-clang"), extra=(*(("-mhmx",) if hmx else ()), "-fvisibility=hidden"))
                                 if new_arch else compile_kernels(o, kernel_arch))]
   lib = tc / f"target/hexagon/lib/{skel_arch}/G0"
   run([str(tc / "bin/hexagon-link"), "-Bdynamic", "-shared", "-export-dynamic", "-o", "tg_graph.so", "skel_rpc.o", "impl.o",
