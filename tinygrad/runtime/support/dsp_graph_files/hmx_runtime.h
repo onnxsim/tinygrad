@@ -37,6 +37,12 @@ static inline int hmx_rt_power(void* client_ctx, int turbo) {
     d.dcvs_v2.dcvs_params.max_corner = HAP_DCVS_VCORNER_TURBO;
   }
   rc |= HAP_power_set(client_ctx, &d);
+  if (turbo) {
+    /* the DSP core corner alone leaves the DDR/bus clock to DCVS: some runs then took ~30% longer in the latency-bound kernels
+     * (activation-sized HVX loops 10-100x, the HMX GEMMs 4x) at the same 1.4 GHz core clock */
+    rc |= HAP_power_set_bus_corner(client_ctx, HAP_DCVS_VCORNER_TURBO, HAP_DCVS_VCORNER_TURBO, HAP_DCVS_VCORNER_TURBO);
+    rc |= HAP_power_set_sleep_latency(client_ctx, 100);
+  }
   HAP_power_request_t x = {0};
   x.type = HAP_power_set_HMX;
   x.hmx.power_up = 1;
