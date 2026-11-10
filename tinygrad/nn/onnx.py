@@ -250,13 +250,19 @@ class OnnxPBParser:
     assert isinstance(data, Tensor) and data.dtype == dtypes.uint8, data
     if dtype != storage_dtype:
       # promoted on the host, so the device graph holds float32 weights and has no conversion kernel
-      data = Tensor(data.bitcast(storage_dtype).numpy().astype(_to_np_dtype(dtype))).reshape(shape).to(Device.DEFAULT)
-    else: data = data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
+      host = Tensor(data.bitcast(storage_dtype).numpy().astype(_to_np_dtype(dtype))).reshape(shape)
+    else: host = data.bitcast(dtype).reshape(shape)
+    data = host.to(Device.DEFAULT)
     # const folding
     if shape == ():
       if data.dtype == dtypes.float16 and sys.version_info < (3, 12): data = data.cast(dtypes.float32)
       data = Tensor(data.item(), dtype=dtype).reshape(shape)
+      host = Tensor(data.numpy(), device="CPU").realize()
     obj["parsed_tensor"] = data
+    if getenv("ONNX_Q4_HMX"):
+      # the values on the host, as numpy, read now: the int4 lowering (_q4_hmx_gemm) reads constants during the DSP compile's
+      # capture, where a device or lazy tensor's numpy() reads zeros
+      obj["host_tensor"] = host.to("CPU").realize().numpy()
     return obj
 
   def _parse_AttributeProto(self) -> dict:
@@ -368,6 +374,40 @@ required_input_python_consts: dict[str, tuple[int, ...]] = {
   **{optim: (1,) for optim in ("Adam", "Adagrad", "Momentum")}
 }
 
+def pack_int4_hmx(q, s, group:int=128):
+  """int4 codes q (K, N) in -8..7 and fp16 group scales s (K / group, N) -> (codes uint8 (N/32, K/32, 512), sc fp16 (N/32,
+  K/group, 64)): the tile-major layout of test/external/dsp/hand/q4/hmx_q4.h (tile (nb, kb): byte j holds the code of halfword
+  128 (j/128) + (j%2 ? 64 : 0) + (j%128)/2 in its low nibble and of that + 512 in its high nibble; sc lane h = scale of column
+  32 nb + h/2 in group g)"""
+  import numpy as np
+  q, s = np.asarray(q, np.int64), np.asarray(s, np.float16)
+  K, N = q.shape
+  assert group == 128 and K % group == 0 and N % 32 == 0 and s.shape == (K // group, N), "the HMX int4 path takes 128-row groups"
+  nt, kt, ng = N // 32, K // 32, K // group
+  t = (q + 8).reshape(kt, 32, nt, 32).transpose(2, 0, 1, 3).reshape(nt, kt, 32, 32)  # [nb, kb, k, c]
+  idx = 64 * (np.arange(32)[:, None] // 2) + 2 * np.arange(32)[None, :] + np.arange(32)[:, None] % 2  # HMX halfword of (k, c)
+  tl = np.zeros((nt, kt, 1024), np.int64)
+  tl[:, :, idx] = t
+  j = np.arange(512)
+  m, b = j // 128, j % 128
+  hl = 128 * m + np.where(b % 2 == 0, b // 2, 64 + b // 2)
+  codes = ((tl[:, :, hl] & 15) | ((tl[:, :, hl + 512] & 15) << 4)).astype(np.uint8)
+  sc = np.repeat(s.reshape(ng, nt, 32).transpose(1, 0, 2), 2, axis=-1).astype(np.float16)  # [nb, g, h] = s[g, 32 nb + h // 2]
+  return codes, sc
+
+def _matmul_q4(a16:Tensor, codes:Tensor, sc:Tensor) -> Tensor:
+  """a16 (M, K) fp16 @ the int4 weight (codes, sc from pack_int4_hmx) -> (M, N) fp16 on the DSP's HMX: the group-wise
+  hand kernel (test/external/dsp/hand/q4/hmx_q4.h). M <= 32, K <= 10240, K % 128 == 0, N % 32 == 0."""
+  from tinygrad.uop.ops import UOp, Ops, KernelInfo
+  (M, K), N = a16.shape, codes.shape[0] * 32
+  assert M <= 32 and K <= 10240 and K % 128 == 0 and N % 32 == 0 and a16.dtype == dtypes.half
+  def ptr(x): return x.flatten().index(UOp.const(0, dtypes.int))
+  def kern(C, A, Cd, S):
+    cu = UOp(Ops.CUSTOM, dtypes.void, (ptr(C), ptr(A), ptr(Cd), ptr(S)),
+             arg=f"__hmx_q4_gemm((__fp16*){{0}}, (const __fp16*){{1}}, (const unsigned char*){{2}}, (const __fp16*){{3}}, {M}, {K}, {N});")
+    return cu.sink(arg=KernelInfo(name=f"hmx_q4_{M}x{K}x{N}", opts_to_apply=()))
+  return Tensor.custom_kernel(Tensor.empty(M, N, dtype=dtypes.half, device=a16.device), a16, codes, sc, fxn=kern)[0]
+
 def _to_python_const(t:Tensor) -> list[ConstType]|ConstType|bytes:
   return t.data().tobytes() if t.dtype == dtypes.uint8 else t.tolist()
 
@@ -415,6 +455,7 @@ class OnnxRunner:
     self.is_training = any(n['parsed_node'].opset_id.domain in {Domain.AI_ONNX_TRAINING, Domain.AI_ONNX_PREVIEW_TRAINING} for n in graph["node"])
     self.graph_name = graph["name"] if is_subgraph else ""
     self.graph_values = {"": None, **{i["name"]: i["parsed_tensor"] for i in graph["initializer"]}}
+    self.const_host = {i["name"]: i["host_tensor"] for i in graph["initializer"] if "host_tensor" in i}
     self.graph_inputs = {i["name"]: i["parsed_type"] for i in graph["input"] if i["name"] not in self.graph_values}
     self.graph_outputs = tuple(o["name"] for o in graph["output"])
     self.graph_nodes = tuple(n["parsed_node"] for n in graph["node"])
@@ -608,6 +649,55 @@ class OnnxRunner:
     # its own buffer: fused into a consumer's padding, the gather's index load lost the pad mask (a phone TLB miss, qemu passed)
     return plan[1][self.graph_values[plan[2]].cast(dtypes.int32)].contiguous()
 
+  def _q4_hmx_gemm(self, node, inps, opts) -> Tensor|None:
+    """ONNX_Q4_HMX=1 (on the DSP): MatMul whose B is the grouped int4 weight of plamo3_onnx._qconst4_grouped (Mul of
+    Reshape(Sub(Cast(Reshape(Concat(Unsqueeze(Mod(x, 16)), Unsqueeze(Div(x, 16)))))))) with x = Cast(packed codes), 128-row
+    groups, and a float A of at most 32 rows: the group-wise HMX kernel (_matmul_q4). Anything else keeps the generic MatMul."""
+    import numpy as np
+    if not isinstance(inps[0], Tensor) or not str(inps[0].device).startswith("DSP") or not dtypes.is_float(inps[0].dtype): return None
+    if not hasattr(self, "_producers"): self._producers, self._qconv_w = {o:n for n in self.graph_nodes for o in n.outputs}, {}
+    key = ("q4", node.outputs[0])
+    if key not in self._qconv_w:
+      self._qconv_w[key] = None
+      P, nm = self._producers.get, lambda n, *ops: n is not None and n.op in ops
+      def chain(name, *ops):  # the producer of name, if it is one of ops
+        n = P(name); return n if nm(n, *ops) else None
+      def const(name):
+        # the host values: a device tensor's numpy() reads zeros while the DSP compile captures the graph
+        if name in self.const_host: return self.const_host[name]
+        return None
+      r = chain(node.inputs[1], "Reshape")
+      m = chain(r.inputs[0], "Mul") if r else None
+      if m is None or not any(x in self.const_names for x in m.inputs): return None
+      sc_name = next(x for x in m.inputs if x in self.const_names); mul_in = next(x for x in m.inputs if x != sc_name)
+      s = const(sc_name)
+      g2 = chain(mul_in, "Reshape"); sub = chain(g2.inputs[0], "Sub") if g2 else None
+      if sub is None or len(sub.inputs) != 2 or const(sub.inputs[1]) is None or float(const(sub.inputs[1]).reshape(-1)[0]) != 8.0: return None
+      cast = chain(sub.inputs[0], "Cast"); rs = chain(cast.inputs[0], "Reshape") if cast else None
+      cc = chain(rs.inputs[0], "Concat") if rs else None
+      if cc is None or len(cc.inputs) != 2: return None
+      un = [chain(i, "Unsqueeze") for i in cc.inputs]
+      if any(u is None for u in un): return None
+      # the first Unsqueeze is the low nibble (Mod by 16), the second the high one (Div by 16); both read one Cast of the codes
+      mod_n, div_n = chain(un[0].inputs[0], "Mod"), chain(un[1].inputs[0], "Div")
+      if mod_n is None or div_n is None or mod_n.inputs[0] != div_n.inputs[0]: return None
+      x_name = mod_n.inputs[0]
+      if chain(x_name, "Cast") is None: return None
+      packed = const(chain(x_name, "Cast").inputs[0])
+      if packed is None or packed.ndim != 2 or s is None or s.ndim != 3 or s.shape[1] != 1: return None
+      K2, N = packed.shape; K = 2 * K2; groups = s.shape[0]
+      if K // groups != 128 or N % 32 or K > 10240 or K % 128: return None
+      q = np.empty((K, N), np.int64)
+      q[0::2] = (packed.astype(np.int64) % 16) - 8
+      q[1::2] = (packed.astype(np.int64) // 16) - 8
+      codes, sc = pack_int4_hmx(q, s.reshape(groups, N).astype(np.float16))
+      self._qconv_w[key] = (Tensor(codes, device=inps[0].device).realize(), Tensor(sc, device=inps[0].device).realize())
+    if (plan:=self._qconv_w[key]) is None: return None
+    K = inps[0].shape[-1]
+    if inps[0].numel() // K > 32: return None
+    y = _matmul_q4(inps[0].reshape(-1, K).half().contiguous(), plan[0], plan[1])
+    return y.float().reshape(*inps[0].shape[:-1], -1)
+
   def _qdq_int_gemm(self, node, inps, opts) -> Tensor|None:
     """ONNX_QDQ_INT_GEMM=1: Gemm (alpha = beta = 1, transA = 0) / MatMul with B = DequantizeLinear(int8/int16 constant, per output
     channel, zero point 0, at least ONNX_QDQ_INT_GEMM_MIN elements) and a float A (a head) as integer vrmpy passes, A quantized to
@@ -724,6 +814,7 @@ class OnnxRunner:
         elif node.op == "QuantizeLinear" and getenv("ONNX_QDQ_LUT") and (qc:=self._qdq_lut(node)) is not None: ret = qc
         elif node.op in ("Gelu", "Sigmoid", "Tanh") and getenv("ONNX_QDQ_LUT") and (qc:=self._dq_unary_lut(node)) is not None: ret = qc
         elif node.op in ("Gemm", "MatMul") and getenv("ONNX_QDQ_INT_GEMM") and (qc:=self._qdq_int_gemm(node, inps, opts)) is not None: ret = qc
+        elif node.op == "MatMul" and getenv("ONNX_Q4_HMX") and (qc:=self._q4_hmx_gemm(node, inps, opts)) is not None: ret = qc
         else: ret = self._select_op(node.op, node.opset_id)(*inps, **opts)
         ret = ret if isinstance(ret, tuple) else (ret,)
         if debug >= 2: print("\toutputs:\n" + "\n".join(f"\t\t{x} - {o!r}" for x,o in zip(node.outputs, ret)))
