@@ -92,6 +92,39 @@ static inline void __q4_expand_tile(__fp16* dst, const unsigned char* src, HVX_V
     *(HVX_Vector*)(hi + 64) = Q6_V_hi_W(ph);
   }
 }
+/* 4 weight tiles of one group (2 KB of codes) in one pass: all 16 code vectors are loaded first, then the nibble splits
+ * and vlut16s, so the independent chains overlap (the one-tile loop of __q4_expand_tile was ~2x slower on V69). */
+static inline void __q4_expand4(__fp16* W, const unsigned char* src, HVX_Vector lut) {
+  const HVX_Vector m4 = Q6_Vb_vsplat_R(0x0F);
+  HVX_Vector v0 = *(const __q4_uvec*)(src + 0),    v1 = *(const __q4_uvec*)(src + 128),  v2 = *(const __q4_uvec*)(src + 256),  v3 = *(const __q4_uvec*)(src + 384);
+  HVX_Vector v4 = *(const __q4_uvec*)(src + 512),  v5 = *(const __q4_uvec*)(src + 640),  v6 = *(const __q4_uvec*)(src + 768),  v7 = *(const __q4_uvec*)(src + 896);
+  HVX_Vector v8 = *(const __q4_uvec*)(src + 1024), v9 = *(const __q4_uvec*)(src + 1152), va = *(const __q4_uvec*)(src + 1280), vb = *(const __q4_uvec*)(src + 1408);
+  HVX_Vector vc = *(const __q4_uvec*)(src + 1536), vd = *(const __q4_uvec*)(src + 1664), ve = *(const __q4_uvec*)(src + 1792), vf = *(const __q4_uvec*)(src + 1920);
+  HVX_VectorPair p0 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v0, m4), lut, 0), q0 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v0, 4), m4), lut, 0);
+  HVX_VectorPair p1 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v1, m4), lut, 0), q1 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v1, 4), m4), lut, 0);
+  HVX_VectorPair p2 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v2, m4), lut, 0), q2 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v2, 4), m4), lut, 0);
+  HVX_VectorPair p3 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v3, m4), lut, 0), q3 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v3, 4), m4), lut, 0);
+  HVX_VectorPair p4 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v4, m4), lut, 0), q4 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v4, 4), m4), lut, 0);
+  HVX_VectorPair p5 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v5, m4), lut, 0), q5 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v5, 4), m4), lut, 0);
+  HVX_VectorPair p6 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v6, m4), lut, 0), q6 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v6, 4), m4), lut, 0);
+  HVX_VectorPair p7 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v7, m4), lut, 0), q7 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v7, 4), m4), lut, 0);
+  HVX_VectorPair p8 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v8, m4), lut, 0), q8 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v8, 4), m4), lut, 0);
+  HVX_VectorPair p9 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(v9, m4), lut, 0), q9 = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(v9, 4), m4), lut, 0);
+  HVX_VectorPair pa = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(va, m4), lut, 0), qa = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(va, 4), m4), lut, 0);
+  HVX_VectorPair pb = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(vb, m4), lut, 0), qb = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(vb, 4), m4), lut, 0);
+  HVX_VectorPair pc = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(vc, m4), lut, 0), qc = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(vc, 4), m4), lut, 0);
+  HVX_VectorPair pd = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(vd, m4), lut, 0), qd = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(vd, 4), m4), lut, 0);
+  HVX_VectorPair pe = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(ve, m4), lut, 0), qe = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(ve, 4), m4), lut, 0);
+  HVX_VectorPair pf = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(vf, m4), lut, 0), qf = Q6_Wh_vlut16_VbVhR(Q6_V_vand_VV(Q6_Vub_vlsr_VubR(vf, 4), m4), lut, 0);
+#define __Q4_ST(T, m, P, Q) { __fp16* lo = (T) + 128 * (m); __fp16* hi = (T) + 512 + 128 * (m); \
+    *(HVX_Vector*)lo = Q6_V_lo_W(P); *(HVX_Vector*)(lo + 64) = Q6_V_hi_W(P); \
+    *(HVX_Vector*)hi = Q6_V_lo_W(Q); *(HVX_Vector*)(hi + 64) = Q6_V_hi_W(Q); }
+  __Q4_ST(W, 0, p0, q0) __Q4_ST(W, 1, p1, q1) __Q4_ST(W, 2, p2, q2) __Q4_ST(W, 3, p3, q3)
+  __Q4_ST(W + 1024, 0, p4, q4) __Q4_ST(W + 1024, 1, p5, q5) __Q4_ST(W + 1024, 2, p6, q6) __Q4_ST(W + 1024, 3, p7, q7)
+  __Q4_ST(W + 2048, 0, p8, q8) __Q4_ST(W + 2048, 1, p9, q9) __Q4_ST(W + 2048, 2, pa, qa) __Q4_ST(W + 2048, 3, pb, qb)
+  __Q4_ST(W + 3072, 0, pc, qc) __Q4_ST(W + 3072, 1, pd, qd) __Q4_ST(W + 3072, 2, pe, qe) __Q4_ST(W + 3072, 3, pf, qf)
+#undef __Q4_ST
+}
 /* Groups of 4 K tiles: expand the 4 weight tiles into VTCM, one HMX MAC gives the group's fp16 partial tile, stored to its
  * own VTCM slot. After the K loop the slots are multiplied by their group scales and summed, two passes of 8 output vectors
  * with the 16 qf32 accumulators in registers (an array would be kept in memory and serialize the loop). The codes (2 KB) and
@@ -119,7 +152,7 @@ static void __hmx_q4_gemm(__fp16* C, const __fp16* A, const unsigned char* codes
         __q4_prefetch(codes + (G + __Q4_PF) * 2048, 2048);
         __q4_prefetch(sc + (G + __Q4_PF) * 64, 128);
       }
-      for (int j = 0; j < 4; j++) __q4_expand_tile(W + 1024 * j, codes + ((size_t)nb * kt + 4 * g + j) * 512, lut);
+      __q4_expand4(W, codes + ((size_t)nb * kt + 4 * g) * 512, lut);
       __q4_set_table(tbl);
       __q4_mac(At + 4 * g * 1024, W, 4);
       __q4_store(PS + (size_t)g * 1024);
