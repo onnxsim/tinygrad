@@ -56,11 +56,14 @@ static inline void __q4_mac(const void* a, const void* w, int ktiles) {
 }
 static inline void __q4_store(void* c) { __asm__ volatile("mxmem(%0,%1):after.hf = acc" ::"r"(c), "r"(0) : "memory"); }
 #endif
-/* A (M, K) fp16 row-major -> the K/32 activation tiles at out (tile j at out + 1024 j halfwords), rows >= M zero */
+/* A (M, K) fp16 row-major -> the K/32 activation tiles at out (tile j at out + 1024 j halfwords), rows >= M zero.
+ * The next row pair is prefetched while this one packs (the rows are read from DDR once, 2 KB per tile row). */
 static inline void __q4_pack_a(const uint16_t* A, int M, int K, uint16_t* out) {
   int kt = K / 32;
   HVX_Vector z = Q6_V_vzero();
   for (int p = 0; p < 16; p++) {
+    if (2 * p + 2 < M) __q4_prefetch(A + (size_t)(2 * p + 2) * K, (size_t)K * 2);
+    if (2 * p + 3 < M) __q4_prefetch(A + (size_t)(2 * p + 3) * K, (size_t)K * 2);
     int r0 = 2 * p, r1 = r0 + 1;
     const uint16_t* a0 = r0 < M ? A + (size_t)r0 * K : NULL;
     const uint16_t* a1 = r1 < M ? A + (size_t)r1 * K : NULL;
@@ -89,41 +92,72 @@ static inline void __q4_expand_tile(__fp16* dst, const unsigned char* src, HVX_V
     *(HVX_Vector*)(hi + 64) = Q6_V_hi_W(ph);
   }
 }
+/* Groups of 4 K tiles: expand the 4 weight tiles into VTCM, one HMX MAC gives the group's fp16 partial tile, stored to its
+ * own VTCM slot. After the K loop the slots are multiplied by their group scales and summed, two passes of 8 output vectors
+ * with the 16 qf32 accumulators in registers (an array would be kept in memory and serialize the loop). The codes (2 KB) and
+ * scales (128 B) of a group are prefetched __Q4_PF groups ahead; the stream is contiguous across column blocks. Summation
+ * order per output element is the same as the per-group loop, so the result is bit-identical to it. */
+#define __Q4_PF 16
 static void __hmx_q4_gemm(__fp16* C, const __fp16* A, const unsigned char* codes, const __fp16* sc, int M, int K, int N) {
   unsigned char* vt = __q4_vtcm();
   __fp16* tbl = (__fp16*)(vt + 0);
-  __fp16* P = (__fp16*)(vt + 2048);
   __fp16* W = (__fp16*)(vt + 4096);
+  __fp16* PS = (__fp16*)(vt + 16384);                                 /* K/128 partial tiles, 2 KB each */
+  __fp16* OUT = (__fp16*)(vt + 16384 + (size_t)(K / 128) * 2048);     /* the 16 output vectors of a column block */
   __fp16* At = (__fp16*)(vt + 262144);
   const int kt = K / 32, ng = K / 128, nt = N / 32;
+  const size_t total_groups = (size_t)nt * ng;
   for (int j = 0; j < 64; j++) ((unsigned*)tbl)[j] = 0;  /* zero bias */
   __q4_pack_a((const uint16_t*)A, M, K, (uint16_t*)At);
   unsigned short lv[64] __attribute__((aligned(128)));
   for (int i = 0; i < 64; i++) lv[i] = (i % 2 == 0 && i / 2 < 16) ? __q4_lut_bits[i / 2] : 0;
   HVX_Vector lut = *(HVX_Vector*)lv;
-  /* the codes stream from DDR (a column block is ng * 4 * 512 bytes, contiguous): prefetched two blocks ahead */
-  __q4_prefetch(codes, (size_t)2 * kt * 512 < (size_t)nt * kt * 512 ? (size_t)2 * kt * 512 : (size_t)nt * kt * 512);
   for (int nb = 0; nb < nt; nb++) {
-    if (nb + 2 < nt) __q4_prefetch(codes + (size_t)(nb + 2) * kt * 512, (size_t)kt * 512);
-    HVX_Vector acc[32];
-    for (int v = 0; v < 32; v++) acc[v] = Q6_V_vzero();
     for (int g = 0; g < ng; g++) {
+      size_t G = (size_t)nb * ng + g;
+      if (G + __Q4_PF < total_groups) {
+        __q4_prefetch(codes + (G + __Q4_PF) * 2048, 2048);
+        __q4_prefetch(sc + (G + __Q4_PF) * 64, 128);
+      }
       for (int j = 0; j < 4; j++) __q4_expand_tile(W + 1024 * j, codes + ((size_t)nb * kt + 4 * g + j) * 512, lut);
-      HVX_Vector s = *(const HVX_Vector*)(sc + ((size_t)nb * ng + g) * 64);
       __q4_set_table(tbl);
       __q4_mac(At + 4 * g * 1024, W, 4);
-      __q4_store(P);
-      for (int v = 0; v < 16; v++) {
-        HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(((const HVX_Vector*)P)[v], s);
-        acc[2 * v] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[2 * v], Q6_V_lo_W(w));
-        acc[2 * v + 1] = Q6_Vqf32_vadd_Vqf32Vqf32(acc[2 * v + 1], Q6_V_hi_W(w));
-      }
+      __q4_store(PS + (size_t)g * 1024);
     }
-    for (int v = 0; v < 16; v++) ((HVX_Vector*)P)[v] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(acc[2 * v + 1], acc[2 * v]));
-    /* P is the interleaved output tile (row 2v + h%2, column h/2 of this block): deal its even and odd halfwords into the two
-     * rows of the pair (vdeal), then copy each row's 32 columns as 16 aligned 32-bit words (C rows start 4-byte aligned) */
+    for (int hf = 0; hf < 2; hf++) {
+    HVX_Vector a0l = Q6_V_vzero(), a0h = Q6_V_vzero();
+    HVX_Vector a1l = Q6_V_vzero(), a1h = Q6_V_vzero();
+    HVX_Vector a2l = Q6_V_vzero(), a2h = Q6_V_vzero();
+    HVX_Vector a3l = Q6_V_vzero(), a3h = Q6_V_vzero();
+    HVX_Vector a4l = Q6_V_vzero(), a4h = Q6_V_vzero();
+    HVX_Vector a5l = Q6_V_vzero(), a5h = Q6_V_vzero();
+    HVX_Vector a6l = Q6_V_vzero(), a6h = Q6_V_vzero();
+    HVX_Vector a7l = Q6_V_vzero(), a7h = Q6_V_vzero();
+      for (int g = 0; g < ng; g++) {
+        HVX_Vector s = *(const HVX_Vector*)(sc + ((size_t)nb * ng + g) * 64);
+        const HVX_Vector* pg = (const HVX_Vector*)(PS + (size_t)g * 1024) + 8 * hf;
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[0], s); a0l = Q6_Vqf32_vadd_Vqf32Vqf32(a0l, Q6_V_lo_W(w)); a0h = Q6_Vqf32_vadd_Vqf32Vqf32(a0h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[1], s); a1l = Q6_Vqf32_vadd_Vqf32Vqf32(a1l, Q6_V_lo_W(w)); a1h = Q6_Vqf32_vadd_Vqf32Vqf32(a1h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[2], s); a2l = Q6_Vqf32_vadd_Vqf32Vqf32(a2l, Q6_V_lo_W(w)); a2h = Q6_Vqf32_vadd_Vqf32Vqf32(a2h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[3], s); a3l = Q6_Vqf32_vadd_Vqf32Vqf32(a3l, Q6_V_lo_W(w)); a3h = Q6_Vqf32_vadd_Vqf32Vqf32(a3h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[4], s); a4l = Q6_Vqf32_vadd_Vqf32Vqf32(a4l, Q6_V_lo_W(w)); a4h = Q6_Vqf32_vadd_Vqf32Vqf32(a4h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[5], s); a5l = Q6_Vqf32_vadd_Vqf32Vqf32(a5l, Q6_V_lo_W(w)); a5h = Q6_Vqf32_vadd_Vqf32Vqf32(a5h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[6], s); a6l = Q6_Vqf32_vadd_Vqf32Vqf32(a6l, Q6_V_lo_W(w)); a6h = Q6_Vqf32_vadd_Vqf32Vqf32(a6h, Q6_V_hi_W(w)); }
+      { HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(pg[7], s); a7l = Q6_Vqf32_vadd_Vqf32Vqf32(a7l, Q6_V_lo_W(w)); a7h = Q6_Vqf32_vadd_Vqf32Vqf32(a7h, Q6_V_hi_W(w)); }
+      }
+    ((HVX_Vector*)OUT)[8 * hf + 0] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a0h, a0l));
+    ((HVX_Vector*)OUT)[8 * hf + 1] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a1h, a1l));
+    ((HVX_Vector*)OUT)[8 * hf + 2] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a2h, a2l));
+    ((HVX_Vector*)OUT)[8 * hf + 3] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a3h, a3l));
+    ((HVX_Vector*)OUT)[8 * hf + 4] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a4h, a4l));
+    ((HVX_Vector*)OUT)[8 * hf + 5] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a5h, a5l));
+    ((HVX_Vector*)OUT)[8 * hf + 6] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a6h, a6l));
+    ((HVX_Vector*)OUT)[8 * hf + 7] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(a7h, a7l));
+    }
+    /* OUT vector v holds rows 2v (even halfwords) and 2v+1 (odd) of this column block, interleaved. vdeal splits them into
+     * the two rows; each row's 32 columns go out as 16 aligned 32-bit words (C rows start 4-byte aligned) */
     for (int v = 0; v < 16; v++) {
-      HVX_Vector x = ((const HVX_Vector*)P)[v];
+      HVX_Vector x = ((const HVX_Vector*)OUT)[v];
       HVX_VectorPair d = Q6_W_vdeal_VVR(x, x, -2);
       unsigned short t0[64] __attribute__((aligned(128))), t1[64] __attribute__((aligned(128)));
       *(HVX_Vector*)t0 = Q6_V_lo_W(d);
