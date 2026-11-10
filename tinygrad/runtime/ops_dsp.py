@@ -1169,6 +1169,9 @@ def _attn_helpers(hmx:bool) -> str:
   # the pool's softmax call gets attn_softmax.h only (a kernel mentioning the HMX runs under its lock, off the pool)
   d = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "attn"
   return (d / "attn_softmax.h").read_text() + ((d / "hmx_attn.h").read_text() if hmx else "")
+def _q4_helpers() -> str:
+  # nn/onnx.py _matmul_q4: the group-wise int4 HMX GEMM (test/external/dsp/hand/q4/hmx_q4.h, self-contained)
+  return (pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "q4" / "hmx_q4.h").read_text()
 def _msda_helpers() -> str:
   hdr = pathlib.Path(__file__).resolve().parents[2] / "test" / "external" / "dsp" / "hand" / "msda" / "msda_kernel.h"
   return hdr.read_text() + _MSDA_CALL
@@ -3440,6 +3443,7 @@ class DSPRenderer(ClangRenderer):
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__rowcopy(") for u in uops): prefix.append(_ROWCOPY)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_h16(") for u in uops): prefix.append(_SOFTMAX_H16)
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__softmax_grp(") for u in uops): prefix.append(_SOFTMAX_GRP)
+    if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_q4_gemm(") for u in uops): prefix.append(_q4_helpers())
     if any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__hmx_attn") for u in uops): prefix.append(_attn_helpers(True))
     elif any(u.op is Ops.CUSTOM and isinstance(u.arg, str) and u.arg.startswith("__attn_sm_vtcm(") for u in uops): prefix.append(_attn_helpers(False))
     # the parameters this kernel gathers from (an address computed from a loaded value): the graph emitter gives them VTCM first,
