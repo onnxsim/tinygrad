@@ -74,6 +74,17 @@ class TestMainOnnxOps(TestOnnxOps):
     expected = x.pad((pads[3], pads[7], pads[2], pads[6], pads[1], pads[5], pads[0], pads[4]), value=0)
     self.assertEqual(out.tolist(), expected.tolist())
 
+  def test_gridsample_bilinear_zeros(self):
+    # 2-D bilinear with zero padding (the only GridSample mode supported), grid points past the edges included
+    rng = np.random.default_rng(0)
+    grid = rng.uniform(-1.3, 1.3, (2, 6, 4, 2)).astype(np.float32)
+    grid[0, 0, :3] = [[-1, -1], [1, 1], [0, 0]]
+    for align_corners in (0, 1):
+      with self.subTest(align_corners=align_corners):
+        inputs = {"X": rng.standard_normal((2, 5, 7, 9)).astype(np.float32), "grid": grid}
+        self.helper_test_single_op("GridSample", inputs, {"align_corners": align_corners, "mode": "linear", "padding_mode": "zeros"},
+                                   ["Y"], rtol=1e-5, atol=1e-6)
+
   def test_gather(self):
     # test const negative indices
     inputs = {

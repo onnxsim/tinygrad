@@ -1,6 +1,7 @@
 import unittest
+import numpy as np
 from tinygrad import Tensor, dtypes
-from tinygrad.helpers import Target, Context
+from tinygrad.helpers import Target, Context, getenv
 from tinygrad.codegen import to_program
 from tinygrad.runtime import ops_dsp
 from tinygrad.runtime.ops_dsp import MockDSPRenderer
@@ -38,6 +39,23 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((a.float() * b.float()).sum(axis=0))
     self.assertIn("float128", src)
 
+  def test_upcast_odd_width(self):
+    # HVX_UPCAST_ODD: an axis no power-of-two vector width divides (attention's 900 keys) takes its largest divisor up to the lane
+    # budget (100: three HVX vectors and a 4-lane tail), not a 4-lane upcast -- only where every buffer reads it at unit stride
+    from tinygrad.codegen.opt import heuristic
+    old = heuristic.HVX_UPCAST_ODD
+    try:
+      heuristic.HVX_UPCAST_ODD = 1
+      src = dsp_source(Tensor.empty(1800, 900).softmax(-1))     # the row reduction keeps the 900 axis apart
+    finally: heuristic.HVX_UPCAST_ODD = old
+    self.assertIn("E_1800_9_100", src)
+
+  def test_odd_width_qf_helpers_are_vector(self):
+    # an odd-width (100-lane) qfloat exp is the 32-lane vector helper on padded registers, not 100 scalar calls
+    out = ops_dsp._hvx_chunked(100, lambda c: f"__tg_exp2_v({c})", ["x"])
+    self.assertEqual(out.count("__tg_exp2_v("), 4)
+    self.assertIn(",".join(map(str, range(100))) + ")", out)
+
   def test_gathered_row_loads_whole(self):
     # a row gather (a loaded row index * 256 + lane) whose rows are split into two 128-lane chunks: lane 0's index renders
     # as row + chunk and the other lanes' as (chunk + row) + k, the same sum in another order. memory_coalescing keyed its
@@ -50,6 +68,13 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((g * ok.cast(dtypes.float32).reshape(6, 16, 1)).sum(0))
     self.assertNotRegex(src, r"\bfloat(64|32|16|8|4)_u\b", "a gathered row was split into narrower unaligned loads")
     self.assertIn("float128", src)
+
+  def test_splat_where_fp16(self):
+    # a row pad of fp16 (BEVFormer's can-bus row padded to 64 rows for the HMX): the select's condition is the row, one scalar for
+    # all 128 lanes, so it is one whole-vector select; per lane it was 128 scalar fp16 selects per row (0.68 ms on the V69)
+    src = dsp_source(Tensor.empty(1, 128, dtype=dtypes.half).pad(((0, 63), (0, 0))).contiguous())
+    self.assertIn("((Lidx0<1)?val0:", src)
+    self.assertNotIn("val0[1]", src)
 
   def test_revec_cmp_floor_cast_where(self):
     # HVX_REVEC_CMP: floor (TRUNC + compare + select), float -> int32 and a bounds-gated select become vector code (the integer
@@ -77,6 +102,21 @@ class TestDSPRender(unittest.TestCase):
     finally: ops_dsp.HVX_REVEC_CMP = old
     self.assertNotIn("__hvx_m32 _m", src)
 
+  def test_splat_scalar_keeps_float_weights_scalar(self):
+    # HVX_SPLAT_SCALAR: a splat of one scalar float op (the generated MSDA's bilinear tap weight, broadcast over a head's 32
+    # channels) stays that scalar op + one vsplat instead of a vector op on splatted operands
+    from tinygrad.uop.ops import UOp
+    buf = UOp.placeholder((4,), dtypes.float32, 0)
+    a, b = buf.index(UOp.const(0, dtypes.int32)).load(), buf.index(UOp.const(1, dtypes.int32)).load()
+    x = UOp.stack(*[a * b + a] * 32)
+    old = ops_dsp.HVX_SPLAT_SCALAR
+    try:
+      ops_dsp.HVX_SPLAT_SCALAR = 0
+      self.assertIsNotNone(ops_dsp.hvx_revectorize(x))
+      ops_dsp.HVX_SPLAT_SCALAR = 1
+      self.assertIsNone(ops_dsp.hvx_revectorize(x))
+    finally: ops_dsp.HVX_SPLAT_SCALAR = old
+
   def test_strided_reduce_prefetches_rows_ahead(self):
     # a reduction down the rows of a row-major (512, 1024) half matrix: the load moves 2 KB per reduce step, so it prefetches
     # HVX_PREFETCH_STRIDES (4) rows ahead, not HVX_PREFETCH bytes (one row)
@@ -87,6 +127,98 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source(Tensor.empty(4096, dtype=dtypes.int32) + Tensor.empty(4096, dtype=dtypes.int32))
     self.assertRegex(src, r"\*\(\(int128\*\)\(\(data1_4096\+alu0\)\)\)\)\+\(")  # one int128 + int128 (loads rendered inline)
     self.assertNotIn("val0[1]", src)  # no per-lane constructor
+
+  def test_float_depthwise_conv_upcast_fits_hvx_vector(self):
+    # v65 has 128-byte HVX vectors. A 64-lane f32 upcast creates an invalid 256-byte vector and
+    # miscomputes depthwise Conv; the heuristic must cap this reduction at 32 f32 lanes.
+    x = Tensor.empty(1, 64, 64, 128)
+    w = Tensor.empty(64, 1, 3, 3, dtype=dtypes.float16)
+    b = Tensor.empty(64, dtype=dtypes.float16)
+    with Context(DSP_V65_HW=1): src = dsp_source(x.conv2d(w, b, stride=2, groups=64, padding=1))
+    self.assertNotIn("float64", src)
+    self.assertNotIn("float128", src)
+
+  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
+  def test_float_depthwise_conv_matches_cpu(self):
+    rng = np.random.default_rng(7)
+    x = rng.normal(0, 2, (1, 64, 64, 128)).astype(np.float32)
+    w = rng.normal(0, 0.15, (64, 1, 3, 3)).astype(np.float16)
+    b = rng.normal(0, 0.15, (64,)).astype(np.float16)
+    with Context(PARALLEL=0, DSP_V65_HW=1):
+      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP"),
+                                             stride=2, groups=64, padding=1).numpy()
+      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU"),
+                                             stride=2, groups=64, padding=1).numpy()
+    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
+
+  @unittest.skipUnless(getenv("MOCKDSP"), "requires MOCKDSP=1")
+  def test_float_1x1_conv_matches_cpu(self):
+    rng = np.random.default_rng(123)
+    x = rng.normal(size=(1, 64, 32, 64)).astype(np.float32)
+    w = rng.normal(size=(64, 64, 1, 1)).astype(np.float16)
+    b = rng.normal(size=(64,)).astype(np.float16)
+    with Context(PARALLEL=0, DSP_V65_HW=1):
+      dsp = Tensor(x, device="DSP").conv2d(Tensor(w, device="DSP"), Tensor(b, device="DSP")).numpy()
+      cpu = Tensor(x, device="CPU").conv2d(Tensor(w, device="CPU"), Tensor(b, device="CPU")).numpy()
+    np.testing.assert_allclose(dsp, cpu, atol=1e-4, rtol=1e-4)
+
+class TestDSPHalf(unittest.TestCase):
+  # __fp16 is storage-only on Hexagon and clang miscompiles it (vector converts become uitofp of the bits), so half is
+  # emulated: fp16 bits in memory, float32 math, no __fp16 anywhere in the kernel source
+  def test_half_is_emulated(self):
+    x = Tensor.empty(256, dtype=dtypes.half)
+    with Context(DSP_V65_HW=1): src = dsp_source((x.sigmoid() * x).cast(dtypes.half))
+    self.assertNotIn("__fp16", src)
+    self.assertIn("float", src)
+
+  def test_fp16_exp_four_vectors(self):
+    # an fp16 exp2 (the qf16 polynomial, ~20 dependent ops per vector) runs four vectors' chains at once: 128 lanes, then 2 more
+    # (HVX_EW_EXP_LANES=256; the attention's exp over raw tiles 117 -> 74 us per head on the V69)
+    x, m = Tensor.empty(30, 30, 1024, dtype=dtypes.half), Tensor.empty(30, 1, 1024, dtype=dtypes.half)
+    self.assertRegex(dsp_source((x - m).exp2()), r"void E_\w*_128_2\(")
+
+  def test_thread_balance_slices(self):
+    # 30 rows of vectors on a pool of 4: 15 slices over the 4 threads (94%), not 3 threads (75%) -- HVX_THREAD_BALANCE
+    R = ops_dsp.MockDSPRenderer
+    old = R.has_threads, R.pool_threads, R.global_max
+    R.has_threads, R.pool_threads, R.global_max = True, 4, property(lambda self: (32, 0, 0))
+    try: src = dsp_source(Tensor.empty(30, 450, 64, dtype=dtypes.half).max(1))
+    finally: R.has_threads, R.pool_threads, R.global_max = old
+    self.assertIn("void r_2_15_64_450(", src)
+
+  def test_scalar_kernel_threads(self):
+    # a sigmoid over a 2-wide slice of 900 rows (the decoder's reference points) stays scalar (its rows gather); it does a vector's
+    # work per element, so it takes the thread pool (one thread before: 0.15-0.3 ms per call on the V69)
+    R = ops_dsp.MockDSPRenderer
+    attrs = ("has_threads", "pool_threads", "global_max", "thread_min_elems", "thread_work_weighted")
+    old = {a: R.__dict__.get(a) for a in attrs}
+    R.has_threads, R.pool_threads, R.global_max = True, 4, property(lambda self: (32, 0, 0))
+    R.thread_min_elems, R.thread_work_weighted = 16 << 10, True
+    try: src = dsp_source((Tensor.empty(900, 10)[:, :2] + Tensor.empty(900, 2)).sigmoid())
+    finally:
+      for a, v in old.items():
+        if v is None: delattr(R, a)
+        else: setattr(R, a, v)
+    self.assertIn("void E_225_2_4(", src)
+
+  def test_gated_reduce(self):
+    # a sum over a loop of where(mask, term, 0) with the mask per loop step (BEVFormer's per-(camera, query) visibility): the
+    # accumulate is conditional and the term's loads and math are inside the if (codegen GATED_REDUCE, sink_into_ifs), its
+    # accumulate one vector add
+    m, a = Tensor.empty(6, 100, dtype=dtypes.uint8), Tensor.empty(6, 100, 8, 32)
+    k = dsp_source((m != 0).reshape(6, 100, 1, 1).where(a * a + a, 0.0).sum((0, 2))).split("/* DSP boilerplate")[0]
+    body = k.split("for (int Ridx0 = 0; Ridx0 < 6; Ridx0++) {", 1)[1]
+    self.assertRegex(body.lstrip(), r"^unsigned char val0 = [^;]*;\s*if \(\(val0!=")
+    inside = body.split("if ((val0!=", 1)[1]
+    self.assertIn("float32 val", inside)                    # the term's loads moved in
+    self.assertRegex(inside, r"\*\(\(float32\*\)\(\(buf0\+0\)\)\) = ")
+
+  def test_gathered_params_marked(self):
+    # a load at an address computed from a loaded value (rows gathered by index) marks its parameter for the graph emitter's VTCM
+    # priority (/* vtcm-gathered: j */): from DDR every gathered row is a cache miss (the generated MSDA's value rows)
+    rows, idx = Tensor.empty(1000 * 32), Tensor.empty(64, dtype=dtypes.int32)
+    el = (idx.reshape(64, 1) * 32 + Tensor.arange(32, dtype=dtypes.int32).reshape(1, 32)).reshape(-1)
+    self.assertIn("/* vtcm-gathered: 1 */", dsp_source(Tensor(rows.uop.index(el.uop)).reshape(64, 32) * 2))
 
 class TestDSPQfloat(unittest.TestCase):
   # HVX_ARCH>=v68 turns on qfloat lowering; flip the module flag directly so this runs without a v68 toolchain
@@ -100,6 +232,11 @@ class TestDSPQfloat(unittest.TestCase):
     src = dsp_source((a - b) * (c + d))
     self.assertIn("__hvx_mul_f", src)
     self.assertIn('__asm__("" : "+v"', src)
+
+  def test_widened_half_times_constant_is_renormalized(self):
+    # half widened to float is qf32 in LLVM's hands, so even a multiply by a constant goes through the sf barrier helper (a
+    # MatMul -> scale -> head transpose: the scale fused into the fp16 product's cast back was cos 0.007 on the V69 phone)
+    self.assertIn("__hvx_mul_f", dsp_source(Tensor.empty(4096, dtype=dtypes.half).float() * 0.25))
 
   def test_plain_arithmetic_is_left_to_llvm(self):
     # a multiply with a loaded operand, and adds of products, are accurate as LLVM lowers them: no helper
@@ -160,6 +297,131 @@ class TestDSPQfMath(unittest.TestCase):
     ops_dsp.QF_MATH = False
     self.assertNotIn("__TG_EXP2", dsp_source(Tensor.empty(2048).exp()))
 
+  def test_log_is_a_vector_helper(self):
+    # LOG2 is the conversion-free helper, not xlog2's compare chain (scalar on v69: float <-> int both ways)
+    src = dsp_source(Tensor.empty(4096).log())
+    self.assertIn("__TG_LOG2(", src)
+    self.assertIn("__tg_log2_v(", src)
+    self.assertNotIn("__builtin_inff()", src.split("noinline")[-1], "a special case of xlog2 is still in the kernel")
+
+  def test_scalar_helpers_exact_on_host(self):
+    # the scalar log2 against numpy (1 ulp-level), and the inline half -> float cast bit-exact for all 65536 halves, built with the
+    # host compiler (the vector forms need HVX: checked on the phone)
+    import shutil, subprocess, tempfile, pathlib, os
+    cc = (os.environ.get("CC") or "clang").split()[0]
+    if shutil.which(cc) is None: self.skipTest("no host C compiler")
+    pre = [l for l in dsp_source(Tensor.empty(64).log()).splitlines() if l.startswith("static inline float __tg_")]
+    xs = np.concatenate([np.geomspace(1e-38, 1e38, 20000, dtype=np.float32), np.linspace(0.5, 2, 20001, dtype=np.float32),
+                         np.array([1e-40, 3e-39, 0, -0.0, -1, np.inf, np.nan], dtype=np.float32)])
+    c = "\n".join(["#include <stdio.h>", *pre, ops_dsp._H2F, "int main(void) { float x; unsigned short u;",
+      " while (scanf(\"%a\", &x) == 1) printf(\"%a\\n\", __tg_log2_s(x));",
+      " for (unsigned i = 0; i < 65536; i++) { u = i; float f = __tg_h2f(u); unsigned b; __builtin_memcpy(&b, &f, 4); printf(\"%u\\n\", b); }",
+      " return 0; }"])
+    with tempfile.TemporaryDirectory() as d:
+      (pathlib.Path(d) / "t.c").write_text(c)
+      subprocess.run([cc, "-O2", "-o", f"{d}/t", f"{d}/t.c"], check=True)
+      out = subprocess.run([f"{d}/t"], input="\n".join(float(x).hex() for x in xs), capture_output=True, text=True, check=True).stdout.split()
+    got = np.array([float.fromhex(v) if "nan" not in v and "inf" not in v else float(v) for v in out[:len(xs)]], dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"): ref = np.log2(xs.astype(np.float64)).astype(np.float32)
+    np.testing.assert_allclose(got, ref, rtol=3e-7, atol=3e-7)
+    h2f = np.array(out[len(xs):], dtype=np.uint64).astype(np.uint32)
+    ref16 = np.arange(65536, dtype=np.uint16).view(np.float16).astype(np.float32).view(np.uint32)
+    ok = (h2f == ref16) | (np.isnan(h2f.view(np.float32)) & np.isnan(ref16.view(np.float32)))
+    self.assertTrue(ok.all(), f"{(~ok).sum()} halves widened wrong")
+
+  def test_scalar_half_to_float_is_inline(self):
+    # a scalar half -> float cast is the inline bit widening, not clang's __extendhfsf2 call (the decoder's fp16 GEMM rows of 10
+    # widened for the bias add: 70-85 -> 39-49 us a call on the V69)
+    prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
+    try: src = dsp_source(Tensor.empty(10, dtype=dtypes.half).float() + Tensor.empty(10))
+    finally: ops_dsp.HVX_QFLOAT = prev
+    self.assertIn("__tg_h2f(__builtin_bit_cast(unsigned short, val", src)
+
+  def test_gather_math_rows_are_lanes(self):
+    # HVX_GATHER_MATH: the decoder's reference-point update (inverse sigmoid of 3 columns of a 900 x 10 regression, + sigmoid):
+    # 30 rows as the lanes through stride-10 / stride-3 gathers, the clip's compare + select as int masks, the strided stores
+    # lanes of one named vector. Off, it stays one scalar statement per value
+    from tinygrad.codegen.opt import heuristic
+    def graph(n):
+      reg, ref = Tensor.empty(n, 10), Tensor.empty(n, 3)
+      x = ref.clip(0, 1)
+      return (reg[:, 0:3] + (x.maximum(1e-5) / (1 - x).maximum(1e-5)).log()).sigmoid()
+    prev, ops_dsp.HVX_QFLOAT = ops_dsp.HVX_QFLOAT, True
+    old = heuristic.HVX_GATHER_MATH
+    try:
+      heuristic.HVX_GATHER_MATH = 3
+      src = dsp_source(graph(900))
+      heuristic.HVX_GATHER_MATH = 0
+      off = dsp_source(graph(1800))
+    finally: ops_dsp.HVX_QFLOAT, heuristic.HVX_GATHER_MATH = prev, old
+    for frag in ("float30 ", "__tg_log2_v(", "__hvx_m30 _m", "[29];", "static inline float30 __tg_gather30_"): self.assertIn(frag, src)
+    self.assertNotIn("float30 ", off)
+    self.assertFalse(ops_dsp._CMP_SCOPE[0], "the compare scope leaked out of the render")
+
+class TestDSPL2Stream(unittest.TestCase):
+  # HVX_L2STREAM_KB (v68+): an input stream whose per-iteration footprint is one 2-D box gets one l2fetch box per chunk, issued
+  # from a strip-mined outer loop; contiguous whole-vector streams keep their dcfetches
+  def setUp(self): self.prev, ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB = (ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB), True, 16
+  def tearDown(self): ops_dsp.HVX_QFLOAT, ops_dsp.HVX_L2STREAM_KB = self.prev
+
+  def test_subline_rows_strip_mined(self):
+    # row sums of a (900, 32) float matrix read as float4s (BEVFormer's LayerNorm statistics): 128 rows of 128 bytes per chunk,
+    # the first chunk fetching itself and the next, then only the next; the hot loop has no branch
+    src = dsp_source(Tensor.empty(900, 32).sum(1)).split("/* DSP boilerplate")[0]
+    self.assertIn("for (int Lidx1_c = 0; Lidx1_c < 900; Lidx1_c += 128) {", src)
+    self.assertIn("int _o = Lidx1_c ? Lidx1_c+128 : 0, _n = Lidx1_c+256 < 900 ? Lidx1_c+256 : 900; _n -= _o;", src)
+    self.assertRegex(src, r"__tg_l2box\(\(const char\*\)\(data1_28800\+\(\(_o<<5\)\+4\)\)\+-16, 128u, 128, _n\)")
+    self.assertIn("for (int Lidx1 = Lidx1_c; Lidx1 < (Lidx1_c+128 < 900 ? Lidx1_c+128 : 900); Lidx1++) {", src)
+    self.assertIn("}}", src)
+
+  def test_transpose_columns_box(self):
+    # a transpose reads 32 rows per output tile, the next tile 128 bytes on: "cols" boxes of 32 rows at the row stride, and no
+    # dcfetches (theirs were a whole outer step ahead: the attention's transposes 251 -> 169 us per call on the V69)
+    src = dsp_source(Tensor.empty(32, 2048).T.contiguous()).split("/* DSP boilerplate")[0]
+    self.assertRegex(src, r"__tg_l2box\([^;]*, 8192u, _n\*128, 32\)")
+    self.assertNotIn("dcfetch", src)
+
+  def test_contiguous_vectors_keep_dcfetch(self):
+    src = dsp_source(Tensor.empty(900, 256).cast(dtypes.half)).split("/* DSP boilerplate")[0]
+    self.assertNotIn("__tg_l2box(", src)
+    self.assertIn("__builtin_HEXAGON_Y2_dcfetch(", src)
+
+  def test_off(self):
+    ops_dsp.HVX_L2STREAM_KB = 0
+    self.assertNotIn("__tg_l2box(", dsp_source(Tensor.empty(800, 32).sum(1)))
+
+  def test_box_fit(self):
+    self.assertEqual(ops_dsp._l2_box([(0, 64), (512, 640)]), None)                  # rows of different widths
+    self.assertEqual(ops_dsp._l2_box([(1024, 1152), (0, 128), (512, 640)]), (0, 128, 512, 3))
+    self.assertEqual(ops_dsp._l2_box([(0, 16), (16, 32), (32, 128)]), (0, 128, 128, 1))
+
+class TestDSPSplatRecip(unittest.TestCase):
+  # a reciprocal of a splat: one scalar reciprocal, or (a lane of a vector) one vector reciprocal for every lane
+  def setUp(self): self.prev, ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH = (ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH), True, True
+  def tearDown(self): ops_dsp.HVX_QFLOAT, ops_dsp.QF_MATH = self.prev
+
+  def test_scalar_divisor(self):
+    src = dsp_source(Tensor.empty(64, 32) / Tensor.empty(64).reshape(64, 1)).split("/* DSP boilerplate")[0].split("void E_")[1]
+    self.assertIn("((float32)(1.0f/val0))", src)
+    self.assertNotIn("__TG_RECIP(", src)
+
+  def test_lane_divisors_hoisted(self):
+    # x / splat(v[k]) for lanes k of one loaded vector v (the attention's transposed P / row sums): one RECIPROCAL(v), right
+    # after v, and multiplies by splats of its lanes
+    from tinygrad.uop.ops import UOp, Ops
+    seen: list = []
+    orig = ops_dsp._transpose_groups
+    ops_dsp._transpose_groups = lambda ren, uops: seen.append(uops) or orig(ren, uops)
+    try: dsp_source(Tensor.empty(4096) * 3)
+    finally: ops_dsp._transpose_groups = orig
+    v = next(u for u in seen[0] if u.op is Ops.LOAD and u.max_numel() > 1)
+    n = v.max_numel()
+    lanes = [UOp(Ops.INDEX, dtypes.float32, (v, UOp(Ops.CONST, dtypes.int, (), k))) for k in range(3)]
+    divs = [UOp(Ops.FDIV, dtypes.float32, (v, UOp(Ops.STACK, dtypes.float32, (lane,) * n))) for lane in lanes]
+    out = ops_dsp._hoist_splat_recip([v, *divs])
+    self.assertEqual([u.op for u in out], [Ops.LOAD, Ops.RECIPROCAL] + [Ops.INDEX, Ops.STACK, Ops.MUL] * 3)
+    self.assertTrue(all(u.src[0] is out[1] for u in out if u.op is Ops.INDEX))
+
 class TestDSPVrmpyGemv(unittest.TestCase):
   # a W8A8 decode GEMV: one uint8 activation row times int8 weights, int32 accumulation -- exactly vrmpybusv (u8 x s8 dot4)
   K, N = 576, 1536
@@ -205,16 +467,20 @@ class TestDSPHmx(unittest.TestCase):
     self.assertLess(kernel.index("__hmx_begin();"), loop)
     self.assertIn("= __hmx_ca(", kernel)
     self.assertNotIn("__hmx_mac(_a, _b)", kernel)
-    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+    # (B's two N tiles cached by the inner loop: the paired output's two spans, and the single tile's in its two branches)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 4)
     self.assertLess(loop, kernel.index("__hmx_mac_span("))
-    self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store()"))
+    self.assertLess(kernel.index("__hmx_mac_span("), kernel.index("__hmx_store_d(0)" if ops_dsp.HMX_DEFER else "__hmx_store()"))
     # no 2 KB tile values, no per-K accumulator round trip
     self.assertNotIn("__WMMA_32_32_32_half_half(", kernel)
     self.assertNotIn("__fp161024", kernel)
 
   def test_rows_packed_with_hvx(self):
     kernel = self.src(64, 64, 64).split("__attribute__((noinline)) void", 1)[1]
-    self.assertEqual(kernel.count("__hmx_pack2("), 32)  # 16 row pairs of A + 16 of B per K block
+    self.assertEqual(kernel.count("__hmx_pack2("), 16)  # 16 row pairs of B per K block
+    # A's two K blocks together from whole 128-byte row lines (HMX_PACK_K2), its slot sets alternating by row tile (HMX_A_DBL)
+    self.assertEqual(kernel.count("__hmx_pack2x2_blk(_a, _a+1024, "), 1)
+    self.assertIn("_a = __hmx_ca((Lidx1)%2*2+(Ridx0));", kernel)
 
   def test_interchange_and_paired_b(self):
     # N has more tiles than M: the N-tile loop goes outermost, A stays in loop-indexed VTCM slots, and B tiles n, n+1 are
@@ -223,8 +489,9 @@ class TestDSPHmx(unittest.TestCase):
     self.assertLess(kernel.index("for (int Lidx2"), kernel.index("for (int Lidx1"))
     self.assertIn("_a = __hmx_ca((Lidx1)*18+(Ridx0)); if ((Lidx2)==0)", kernel)
     self.assertIn("_b = __hmx_cb((Lidx2)%2*18+(Ridx0)); if ((Lidx1)==0 && (Lidx2)%2==0)", kernel)
-    # uniform row strides: one batched pack of the whole pair (16 row pairs of each tile), not 16 calls
-    self.assertEqual(kernel.count("__hmx_pack2x2_blk("), 1)
+    # uniform row strides: one batched pack of the whole pair (16 row pairs of each tile), not 16 calls -- for B's N tiles and
+    # A's K tiles
+    self.assertEqual(kernel.count("__hmx_pack2x2_blk("), 2)
     # B pairs stream from DDR: the next pair's 128-byte panel is L2-prefetched while this one packs
     self.assertIn("(Lidx2)+2<8 ? ((Lidx2)==0 ? 1 : 2) : 0", kernel)
 
@@ -234,8 +501,75 @@ class TestDSPHmx(unittest.TestCase):
     kernel = self.src(128, 576, 384).split("__attribute__((noinline)) void", 1)[1]
     self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18), 18);", kernel)
     self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)*18), __hmx_cb((Lidx2)%2*18+18), 18);", kernel)  # tile n+1
-    self.assertIn("__hmx_store2()", kernel)
-    self.assertIn("__hmx_outp(", kernel)
+    self.assertIn("__hmx_store_d(1)" if ops_dsp.HMX_DEFER else "__hmx_store2()", kernel)
+    self.assertIn("__hmx_pend(2," if ops_dsp.HMX_DEFER else "__hmx_outp(", kernel)
+
+  def test_output_pairing_inner(self):
+    # every B tile cached and indexed by the inner tile loop (attention's S^T = K Q^T, one K tile, M = N): even inner tiles
+    # compute n and n+1 (B's next slot) and write full 128-byte rows; the first outer pass, which packs B tile n+1 only in
+    # iteration n+1, stores tile by tile
+    kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_mac_span(__hmx_ca((Lidx1)%2*1), __hmx_cb((Lidx2)*1+1), 1);", kernel)  # (A: two slots by row tile)
+    self.assertIn("__hmx_store_d(1)" if ops_dsp.HMX_DEFER else "__hmx_store2()", kernel)
+    self.assertIn("__hmx_pend(2," if ops_dsp.HMX_DEFER else "__hmx_outp(", kernel)
+    self.assertIn("if ((Lidx1)>0) { if ((Lidx2)%2==0 && (Lidx2)+1<30)", kernel)
+
+  def test_raw_tile_buffers(self):
+    # a fp16 buffer in layout hmx_tile holds raw HMX tiles (nn/onnx.py's attention S^T and P): tinygrad's row-major (rows,
+    # LD) view is only how it indexes them. The product goes out tile by tile at its raw place, (column tile x row tiles + row
+    # tile) x 1024, and a raw B operand is read in place, its K panel being consecutive tiles
+    hm = tc.hexagon_hmx + tc.hexagon_v65
+    st = Tensor.empty(64, 32, dtype=dtypes.half).matmul(Tensor.empty(32, 96, dtype=dtypes.half), dtype=dtypes.half)
+    sb = Tensor.empty(64, 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE).assign(st)
+    src = dsp_source(sb, hm)
+    self.assertIn("/* hmx-tile: 0 */", src)   # listed for the graph emitter (2 KB-aligned VTCM placement, pull_raw_tile_readers)
+    kernel = src.split("__attribute__((noinline)) void", 1)[1]
+    # (row tile Lidx1, column tile Lidx2 of 2 x 3: the place linear in the loops, the VTCM test once per call)
+    self.assertIn("const int __hmx_rv = __hmx_vt(data0_6144, 12288u);", kernel)
+    self.assertIn("__hmx_store_rawv((__fp16*)data0_6144 + 0+(Lidx1)*1024+(Lidx2)*2048, __hmx_rv);", kernel)
+    self.assertEqual(kernel.count("__hmx_begin();"), 1)  # once per call, not per output tile
+    self.assertNotIn("__hmx_out2(", kernel)
+    eb = Tensor.empty(64 * 96, dtype=dtypes.half, layout=ops_dsp.HMX_TILE)
+    pv = Tensor.empty(32, 64, dtype=dtypes.half).matmul(eb.reshape(64, 96), dtype=dtypes.half)
+    kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_rawb = (__fp16*)data2_6144;", kernel)
+    self.assertRegex(kernel, r"__hmx_mac_span_raw\(__hmx_ca\(0\), __hmx_rawb\+\(Lidx\d\)\*2048, 2\);")
+    self.assertNotIn("__hmx_pack2(_b", kernel)
+    # A (one row of tiles, packed on the first output tile) L2-prefetched there; the output tile converted after the next one's
+    # load pair (HMX_DEFER)
+    self.assertRegex(kernel, r"if \(\(Ridx0\)==0\) __hmx_prefetch_rows\(")
+    # two N tiles: computed as a pair from adjacent K panels and converted to full rows together (HMX_OUTPAIR_RAW)
+    eb = Tensor.empty(64 * 128, dtype=dtypes.half, layout=ops_dsp.HMX_TILE)
+    pv = Tensor.empty(64, 64, dtype=dtypes.half).matmul(eb.reshape(64, 128), dtype=dtypes.half)
+    kernel = dsp_source(pv, hm).split("__attribute__((noinline)) void", 1)[1]
+    self.assertRegex(kernel, r"__hmx_rawb\+\(Lidx\d\)\*2048\+2048, 2\);")
+    self.assertIn("__hmx_pend(2, _p, _q);", kernel)
+    self.assertIn("__hmx_pend(1, _p, 0);" if ops_dsp.HMX_DEFER else "__hmx_store();", kernel)
+
+  def test_resident_listing(self):
+    # a buffer made with Tensor.empty(..., resident=p) is listed for the graph emitter in every kernel that touches it
+    a = Tensor.empty(64, 32, resident=2).assign(Tensor.empty(64, 32) + 1)
+    self.assertIn("/* vtcm-resident: 0=2 */", dsp_source(a))
+    self.assertIn("/* vtcm-resident: 1=2 */", dsp_source(a * 2))
+    self.assertNotIn("vtcm-resident", dsp_source(Tensor.empty(64, 32) * 2))
+
+  def test_raw_lin(self):
+    # a raw output tile's place from its first row's index: 32 LD a + 32 b -> (b row tiles + a) 1024, per loop
+    from tinygrad.uop.ops import UOp
+    a, b = UOp.range(4, 0), UOp.range(3, 1)
+    i0 = a * (32 * 96) + b * 32
+    base, coef = ops_dsp._hmx_raw_lin(i0, (96, 4), [a, b])
+    self.assertEqual((base, dict(coef)), (0, {a: 1024, b: 4 * 1024}))
+    self.assertIsNone(ops_dsp._hmx_raw_lin(a * (32 * 96) + b * 48, (96, 4), [a, b]))   # b's step not a whole column tile
+    self.assertIsNone(ops_dsp._hmx_raw_lin(a * (32 * 96) + b * 64, (96, 4), [a, b]))   # columns carry into the next row tile
+
+  def test_deferred_output(self):
+    # HMX_DEFER: a paired output tile goes to the free VTCM slot pair and is converted to rows after the next one's load pair
+    self.assertTrue(ops_dsp.HMX_DEFER)
+    kernel = self.src(960, 32, 960).split("__attribute__((noinline)) void", 1)[1]
+    self.assertIn("__hmx_store_d(1);", kernel)
+    self.assertIn("__hmx_pend(2, _p, _q);", kernel)
+    self.assertTrue(kernel.rstrip().endswith("__hmx_flush();\n}") or "__hmx_flush();\n}" in kernel)
 
   def test_large_vtcm_pool(self):
     # HMX_VTCM_KB > 256: A and B share one pool of loop-indexed slots, B after A's from a 32-slot boundary, K panels at a
@@ -245,9 +579,11 @@ class TestDSPHmx(unittest.TestCase):
     ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = 4096, 1792, 128
     try: kernel = self.src(384, 576, 64).split("__attribute__((noinline)) void", 1)[1]
     finally: ops_dsp.HMX_VTCM_KB, ops_dsp._HMX_CA, ops_dsp._HMX_CB = old
-    self.assertIn("_b = __hmx_ca(32+(Lidx2)*32+(Ridx0))", kernel)  # after A (18 slots, rounded to 32), 32 per panel
+    # after A's two slot sets (18 slots each at a window-safe stride of 32), 32 per panel
+    self.assertIn("_a = __hmx_ca((Lidx1)%2*32+(Ridx0))", kernel)
+    self.assertIn("_b = __hmx_ca(64+(Lidx2)*32+(Ridx0))", kernel)
     self.assertNotIn("__hmx_lookup(", kernel)
-    self.assertEqual(kernel.count("__hmx_mac_span("), 1)
+    self.assertEqual(kernel.count("__hmx_mac_span("), 4)  # inner-paired output (test_output_pairing_inner)
 
   def test_epilogue_single_m_tile(self):
     # an epilogue (bias + residual) on an HMX output with a single M tile: the accumulator array follows the output's memory
@@ -275,8 +611,9 @@ class TestDSPHmx(unittest.TestCase):
     kernel = self.src(64, 32, 96).split("__attribute__((noinline)) void", 1)[1]
     self.assertNotIn("for (int Ridx", kernel)
     self.assertEqual(kernel.count("__hmx_begin();"), 1)
-    self.assertLess(kernel.index("__hmx_begin();"), kernel.index("__hmx_store()"))
-    self.assertIn("__hmx_out2(", kernel)
+    st = "__hmx_store_d(0)" if ops_dsp.HMX_DEFER else "__hmx_store()"  # (deferred: rows converted at the next tile / the flush)
+    self.assertLess(kernel.index("__hmx_begin();"), kernel.index(st))
+    self.assertIn("__hmx_pr[0] = " if ops_dsp.HMX_DEFER else "__hmx_out2(", kernel)
     self.assertNotIn("*(__hmx_h128*)", kernel)  # no 128-lane store over 32-element rows
 
   def test_a_panel_prefetch_is_rows(self):

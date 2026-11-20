@@ -25,7 +25,9 @@ ALWAYS_CONTIGUOUS: set[Ops] = {Ops.CONTIGUOUS, Ops.AFTER, Ops.BUFFER,
                       Ops.CONST, Ops.MSELECT, Ops.MSTACK, Ops.PARAM,
                       Ops.LOAD, Ops.CALL, Ops.FUNCTION}
 
-def realize(ctx:IndexingContext, tr:UOp) -> None: ctx.realize_map[tr] = None
+def realize(ctx:IndexingContext, tr:UOp) -> None:
+  # a staged CONTIGUOUS realizes only its staged axes, chosen in run_rangeify
+  if not tr.staged_axes: ctx.realize_map[tr] = None
 
 def realize_srcs(ctx:IndexingContext, rb:UOp) -> None:
   for s in rb.src:
@@ -96,7 +98,8 @@ def create_bufferize_and_index_srcs(ctx:IndexingContext, x:UOp) -> list[UOp]:
       else:
         removable = s.op not in ALWAYS_CONTIGUOUS and s not in ctx.non_removable
         # LOCAL: None in the device assigns it a number later
-        opts = BufferizeOpts(device=s.device, removable=removable) if len(ctx.range_map[s][1]) == len(realized_ranges) else \
+        opts = BufferizeOpts(device=s.device, addrspace=AddrSpace.REG, removable=False) if s.staged_axes else \
+               BufferizeOpts(device=s.device, removable=removable) if len(ctx.range_map[s][1]) == len(realized_ranges) else \
                BufferizeOpts(device=s.device, addrspace=AddrSpace.LOCAL, removable=removable)
         new_src = UOp(Ops.STAGE, src=(new_src,)+closed_ranges, arg=opts)
         if x in ctx.range_map: new_src = new_src.index(*[r for i,r in enumerate(src_rngs) if i in realized_ranges])
@@ -268,6 +271,15 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
 
       # we have to (partially) realize here if there's new ranges
       if len(_realize_axis): rctx.realize_map[x] = _realize_axis
+
+    # a staged CONTIGUOUS (Tensor.stage): new ranges on its last n axes (the table's own loops, closed by its REG STAGE), the
+    # consumer's on the others (the table is rebuilt per iteration of those)
+    if (n:=x.staged_axes):
+      assert len(consumer_rngs), "stage: a staged tensor needs a consumer"
+      ax = sorted(set(rctx.realize_map.get(x) or []) | set(range(len(x.shape) - n, len(x.shape))))
+      out_rngs = tuple(rctx.new_range(s) if i in ax else r for i,(s,r) in enumerate(zip(x.shape, out_rngs)))
+      rctx.realize_map[x] = ax
+      ending_ranges[x] = []
 
     # if this element is a reduce and there's ended ranges, we might have to end some other ranges
     if len(ending_ranges[x]) and x.op in GroupOp.Elementwise.union({Ops.REDUCE}):
