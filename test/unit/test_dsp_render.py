@@ -38,6 +38,45 @@ class TestDSPRender(unittest.TestCase):
     src = dsp_source((a.float() * b.float()).sum(axis=0))
     self.assertIn("float128", src)
 
+  def test_gathered_row_loads_whole(self):
+    # a row gather (a loaded row index * 256 + lane) whose rows are split into two 128-lane chunks: lane 0's index renders
+    # as row + chunk and the other lanes' as (chunk + row) + k, the same sum in another order. memory_coalescing keyed its
+    # groups on the exact UOp, so lane 0 was its own group and the row came out as 1 + 64 + 32 + 16 + 8 + 4 + 1 + 1 + 1
+    # misaligned pieces (BEVFormer's sparse SCA reduce: 8.5 -> 0.7 ms on the phone once it is one load per chunk)
+    rows, idx = Tensor.empty(64 * 256), Tensor.empty(6, 16, dtype=dtypes.int32)
+    ok = idx < 64
+    elems = (idx * ok.cast(dtypes.int32)).reshape(-1, 1) * 256 + Tensor.arange(256, dtype=dtypes.int32).reshape(1, 256)
+    g = Tensor(rows.uop.index(elems.reshape(-1).uop)).reshape(6, 16, 256)
+    src = dsp_source((g * ok.cast(dtypes.float32).reshape(6, 16, 1)).sum(0))
+    self.assertNotRegex(src, r"\bfloat(64|32|16|8|4)_u\b", "a gathered row was split into narrower unaligned loads")
+    self.assertIn("float128", src)
+
+  def test_revec_cmp_floor_cast_where(self):
+    # HVX_REVEC_CMP: floor (TRUNC + compare + select), float -> int32 and a bounds-gated select become vector code (the integer
+    # trunc / f2i helpers and an int-mask bit select) instead of one scalar statement per lane; off, they stay per lane
+    def graph(n):  # a different size per render: the same kernel would come back from the program cache
+      fl = Tensor.empty(n).floor()
+      return ((fl >= 0) & (fl < 25)).where(fl.cast(dtypes.int32) * 8 + 3, 0)
+    old = ops_dsp.HVX_REVEC_CMP
+    try:
+      ops_dsp.HVX_REVEC_CMP = 1
+      src = dsp_source(graph(4096))
+    finally: ops_dsp.HVX_REVEC_CMP = old
+    for helper in ("__hvx_trunc128(", "__hvx_f2i128(", "__hvx_m128 _m"): self.assertIn(helper, src)
+    self.assertNotIn("union{float f;unsigned u;}", src, "a lane still went through the scalar trunc")
+    self.assertIn("union{float f;unsigned u;}", dsp_source(graph(8192)))
+
+  def test_revec_cmp_keeps_splats_scalar(self):
+    # a splat of one scalar compare / select (a per-sample weight broadcast over 32 channel lanes) stays scalar + one splat
+    rows, w = Tensor.empty(64, 32), Tensor.empty(64)
+    out = (rows * ((w >= 0) & (w < 1)).where(w, 0.0).reshape(64, 1)).sum(0)
+    old = ops_dsp.HVX_REVEC_CMP
+    try:
+      ops_dsp.HVX_REVEC_CMP = 1
+      src = dsp_source(out)
+    finally: ops_dsp.HVX_REVEC_CMP = old
+    self.assertNotIn("__hvx_m32 _m", src)
+
   def test_strided_reduce_prefetches_rows_ahead(self):
     # a reduction down the rows of a row-major (512, 1024) half matrix: the load moves 2 KB per reduce step, so it prefetches
     # HVX_PREFETCH_STRIDES (4) rows ahead, not HVX_PREFETCH bytes (one row)

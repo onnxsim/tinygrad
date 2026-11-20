@@ -15,7 +15,7 @@ static unsigned char* rd(const char* dir, const char* nm, long* n) {
   fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
   unsigned char* b = malloc(*n); if (fread(b, 1, *n, f) != (size_t)*n) exit(1); fclose(f); return b;
 }
-#define MAXP 256
+#define MAXP 1024
 int main(int argc, char** argv) {
   if (argc < 3) { fprintf(stderr, "usage: %s uri case_dir [iters [prof]]\n", argv[0]); return 2; }
   int iters = argc > 3 ? atoi(argv[3]) : 10;

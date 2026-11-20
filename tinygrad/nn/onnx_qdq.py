@@ -145,6 +145,13 @@ def into_grid(y:Tensor, H, W, zp, L, Wp=None) -> Tensor:
     vs.assign(Tensor.full(vs.shape, zp, dtype=dtypes.uint8, device=y.device))
   return g
 
+def relayout(t, H, W, Wp_src, Wp_dst, L, zp):
+  """a padded grid (Cb, rows at stride Wp_src, 32) -> the same H x W pixels and ring at stride Wp_dst, L rows (ring = zp)"""
+  Cb = t.shape[0]
+  x = t[:, :(H + 2) * Wp_src].reshape(Cb, H + 2, Wp_src, 32)[:, :, :W + 2]
+  x = x.pad(((0, 0), (0, 0), (0, Wp_dst - (W + 2)), (0, 0)), value=zp).reshape(Cb, (H + 2) * Wp_dst, 32)
+  return x.pad(((0, 0), (0, L - (H + 2) * Wp_dst), (0, 0)), value=zp).contiguous()
+
 def _requant(acc:Tensor, m:Tensor, zy:int) -> Tensor:
   # ORT's output, which the DSP renderer lowers per 32-lane row to its exact integer requantization (lo = zy under a Relu
   # folded into Q is the same clip, since zy = 0 there)
@@ -235,7 +242,12 @@ class QDQGridNet:
         vals[yt.name] = Act(t, Ho, Wo, yt.c, 1, yt.zp)
       elif o["op"] == "add":
         a, b = vals[o["a"].name], vals[o["b"].name]
-        assert (a.H, a.W, a.C, a.Wp) == (b.H, b.W, b.C, b.Wp) and a.t.shape == b.t.shape
+        if (a.H, a.W, a.C) == (b.H, b.W, b.C) and (a.Wp != b.Wp or a.t.shape != b.t.shape):
+          # the two branches laid their grids out differently (a stride-1 conv's grid straight in, or a canonical one):
+          # the second input moves to the first's row stride and row count; its ring keeps its zero point
+          b = Act(relayout(b.t, b.H, b.W, b.Wp, a.Wp, a.t.shape[1], b.zp), b.H, b.W, b.C, 1, b.zp, a.Wp)
+        assert (a.H, a.W, a.C, a.Wp) == (b.H, b.W, b.C, b.Wp) and a.t.shape == b.t.shape, \
+          f"add {yt.name}: a {(a.H, a.W, a.C, a.Wp, a.t.shape)} b {(b.H, b.W, b.C, b.Wp, b.t.shape)}"
         # the pads hold za, zb: they must come out as zy (they are the next conv's padding)
         pz = add_ref(np.array([o["a"].zp], np.uint8), o["a"], np.array([o["b"].zp], np.uint8), o["b"], yt)[0]
         if pz != yt.zp: raise NotImplementedError(f"Add pads: {o['a'].zp} + {o['b'].zp} -> {pz}, not zy {yt.zp}")

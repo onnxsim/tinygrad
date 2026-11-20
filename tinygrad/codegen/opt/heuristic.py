@@ -2,15 +2,27 @@ import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.dtype import dtypes
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
 HVX_UPCAST_CONTIG = getenv("HVX_UPCAST_CONTIG", 1)
+HVX_UPCAST_ELEMWISE = getenv("HVX_UPCAST_ELEMWISE", 0)
 
 def _unit_stride(k:Scheduler, axis:int) -> bool:
   # some buffer's index has this axis's range as a bare term (stride 1): upcasting it gives contiguous vector accesses
   rng = k.rngs[axis]
   return any(c is rng for b in k.bufs for c in b.src[1].get_idx().split_uop(Ops.ADD))
+
+def _every_unit_stride(k:Scheduler, axis:int) -> bool:
+  # every buffer indexed along this axis has its range as a bare term (stride 1), and at least one is: no gathers
+  rng, hit = k.rngs[axis], False
+  for b in k.bufs:
+    idx = b.src[1].get_idx()
+    if rng not in idx.backward_slice: continue
+    if not any(c is rng for c in idx.split_uop(Ops.ADD)): return False
+    hit = True
+  return hit
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
@@ -31,6 +43,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
     2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
   """
+  # under MOCKDSP (v65, no fp16 vector hardware), half-precision vector arithmetic is miscompiled by clang's v65 backend:
+  # keep half kernels scalar (no upcast, no tensor core) so the mock only ever sees scalar fp16 ops, which the
+  # fp16 helpers cover. The device path (real v69 codegen) is unchanged.
+  if k.ren is not None and k.ren.target.device == "DSP" and getenv("MOCKDSP") and \
+     any(b.dtype == dtypes.half for b in k.bufs):
+    return k
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
   if USE_TC > 0 and (len(k.axes_of(AxisType.GROUP_REDUCE, AxisType.REDUCE)) == 1 or (TC_OPT.value >= 1)):
     for axis in range(3):
@@ -165,6 +183,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       k.apply_opt(Opt(OptOps.UPCAST, xb_choices[0][-2], xb_choices[0][-1]))
       upcasted_axis.add(xb_choices[0][-2])
     else: break
+
+  # on the DSP, an elementwise kernel whose small masked axes were upcast above (a stack of taps) keeps that narrow upcast and
+  # nothing else: the loop above only widens axes some buffer broadcasts along, and the "nothing upcasted" fallback below no
+  # longer fires, so a flat per-sample map ran 4 lanes wide. HVX_UPCAST_ELEMWISE widens a unit-stride axis to a 32-lane fp32
+  # vector (up to 128 lanes in all) when every buffer reads it at unit stride
+  if is_dsp and HVX_UPCAST_ELEMWISE and not k.axes_of(AxisType.REDUCE) and k.upcasted and k.upcast_size() < 32:
+    for axis, w in itertools.product(k.upcastable_dims[::-1], (128, 64, 32)):
+      if (w == 32 or k.upcast_size() * w <= 128) and k.full_shape[axis] % w == 0 and _every_unit_stride(k, axis):
+        k.apply_opt(Opt(OptOps.UPCAST, axis, w))
+        break
 
   # on the DSP, a reduction nothing broadcasts into (a per-element dot product like q . k over a small head dim) got no upcast
   # above; the unroll below would then take every "nothing upcasted" case and leave it scalar. Upcast the innermost output

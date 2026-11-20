@@ -11,7 +11,7 @@
 #include "tg_hmx_rpc.h"
 #include "hmx_runtime.h"
 extern unsigned long long HAP_perf_get_time_us(void);
-#define G_NPROF 256
+#define G_NPROF 1024
 /* G_PROF has to be defined before graph.h, which is where the calls are emitted. g_p_last is the
    per-call cursor and is deliberately NOT g_last: g_run's own G_PROF(i) updates it on every call, so
    sharing one variable with the total's start would leave t[0] measuring only the final call. */
